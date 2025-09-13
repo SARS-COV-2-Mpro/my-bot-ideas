@@ -1,39 +1,25 @@
-name: Send Trade Ideas
+name: Ideas Pusher
 on:
   schedule:
-    - cron: "*/10 * * * *"   # every 10 minutes
-  workflow_dispatch: {}      # lets you test manually
+    - cron: "*/5 * * * *"   # every 5 minutes (UTC)
+  workflow_dispatch: {}
+concurrency:
+  group: ideas-pusher
+  cancel-in-progress: false
 jobs:
   push-ideas:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: 20 }
-      - run: npm i node-fetch@3
-      - name: Push Ideas
+        with:
+          node-version: 20
+      - name: Push ideas
         env:
           WORKER_PUSH_URL: ${{ secrets.WORKER_PUSH_URL }}
           PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
-        run: |
-          node -e 'import("node-fetch").then(async({default:fetch})=>{
-            const r = await fetch("https://api.binance.com/api/v3/ticker/24hr");
-            if (!r.ok) { const txt = await r.text(); console.error("Binance API failed:", r.status, txt); process.exit(1); }
-            const all = await r.json();
-            const usdt = all.filter(t => (t.symbol||"").endsWith("USDT"));
-            const liquid = usdt.map(t=>({s:t.symbol.replace("USDT",""), qv:+(t.quoteVolume||0), ch:+(t.priceChangePercent||0)}))
-                               .filter(x=>x.qv>10000000);
-            liquid.sort((a,b)=> (b.qv*0.7+Math.abs(b.ch)*1e6*0.3) - (a.qv*0.7+Math.abs(a.ch)*1e6*0.3));
-            const picks = liquid.slice(0,10).map((x,i)=>({symbol:x.s, side:x.ch>=0?"long":"short", score:60+Math.min(40,Math.abs(x.ch)), rank:i+1, ttl_sec:900}));
-            const ideas = { ts:new Date().toISOString(), mode:"normal", source:"external_pusher", meta:{origin:"gha"}, top_n:picks.length, ideas:picks };
-            const resp = await fetch(process.env.WORKER_PUSH_URL, {
-              method:"POST",
-              headers: {
-                "Content-Type":"application/json",
-                "Authorization": `Bearer ${process.env.PUSH_TOKEN || ""}`
-              },
-              body: JSON.stringify(ideas)
-            });
-            if(!resp.ok){ const txt=await resp.text(); console.error("push failed", resp.status, txt); process.exit(1); }
-            console.log("pushed", picks.length, "ideas");
-          })'
+          TOP_N: "10"
+          MIN_24H_QV: "10000000"
+          TTL_SEC: "900"
+        run: node ideas-pusher.js
