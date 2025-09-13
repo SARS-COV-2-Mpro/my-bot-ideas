@@ -2,7 +2,7 @@ name: Send Trade Ideas
 on:
   schedule:
     - cron: "*/10 * * * *"   # every 10 minutes
-  workflow_dispatch: {}       # lets you test manually
+  workflow_dispatch: {}      # lets you test manually
 jobs:
   push-ideas:
     runs-on: ubuntu-latest
@@ -17,7 +17,9 @@ jobs:
           PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
         run: |
           node -e 'import("node-fetch").then(async({default:fetch})=>{
-            const r = await fetch("https://api.binance.com/api/v3/ticker/24hr"); const all = await r.json();
+            const r = await fetch("https://api.binance.com/api/v3/ticker/24hr");
+            if (!r.ok) { const txt = await r.text(); console.error("Binance API failed:", r.status, txt); process.exit(1); }
+            const all = await r.json();
             const usdt = all.filter(t => (t.symbol||"").endsWith("USDT"));
             const liquid = usdt.map(t=>({s:t.symbol.replace("USDT",""), qv:+(t.quoteVolume||0), ch:+(t.priceChangePercent||0)}))
                                .filter(x=>x.qv>10000000);
@@ -32,6 +34,6 @@ jobs:
               },
               body: JSON.stringify(ideas)
             });
-            if(!resp.ok){ const txt=await resp.text(); console.error("Failed to send ideas", resp.status, txt); process.exit(1); }
-            console.log("Sent", picks.length, "fresh ideas!");
+            if(!resp.ok){ const txt=await resp.text(); console.error("push failed", resp.status, txt); process.exit(1); }
+            console.log("pushed", picks.length, "ideas");
           })'
