@@ -2,7 +2,7 @@ name: Send Trade Ideas ELITE (multi-expert, microstructure, auto-RRR, EV LCB, 3h
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch: {}
 
 jobs:
