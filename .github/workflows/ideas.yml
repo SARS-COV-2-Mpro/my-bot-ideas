@@ -2,7 +2,7 @@ name: Send Trade Ideas ELITE (multi-expert, microstructure, auto-RRR, EV LCB, 3h
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/10 * * * *"
   workflow_dispatch: {}
 
 jobs:
@@ -121,13 +121,20 @@ jobs:
               log("health error", e?.message||e);
             }
 
-            // Base selection (Binance variants)
-            const baseCandidates=[process.env.BINANCE_BASE,"https://api.binance.com","https://api-gcp.binance.com","https://api1.binance.com","https://api2.binance.com","https://api3.binance.com","https://api.binance.us"].filter(Boolean);
+            // ---------- Base selection (force binance.com only) ----------
+            const baseCandidates=[
+              process.env.BINANCE_BASE,
+              "https://api1.binance.com",
+              "https://api-gcp.binance.com",
+              "https://api2.binance.com",
+              "https://api3.binance.com",
+              "https://api.binance.com"
+            ].filter(Boolean);
             let BASE=null, ALL24=null;
             async function pickBaseAnd24hr(){
               for(const b of baseCandidates){
                 try{ const r=await fetchWithTimeout(`${b}/api/v3/ticker/24hr`,{},10000); if(r.ok){ return { base:b, data: await r.json() }; } }catch{}
-              } throw new Error("24hr fetch failed for all bases");
+              } throw new Error("binance.com unreachable (no .us fallback)");
             }
             const api=(path,params={})=>{ const u=new URL(path,BASE); for(const [k,v] of Object.entries(params)){ if(v!==undefined&&v!==null) u.searchParams.set(k,String(v)); } return u.toString(); };
             const fetchK=async(sym,interval,limit,startTime,endTime)=>{ try{ const r=await getJSON(api("/api/v3/klines",{symbol:sym,interval,limit,startTime,endTime})); return Array.isArray(r)?r:null; }catch{return null;} };
@@ -169,7 +176,11 @@ jobs:
 
             try{
               const picked=await pickBaseAnd24hr(); BASE=picked.base; ALL24=picked.data;
-              const isUS=/binance\.us$/i.test(new URL(BASE).host); if(isUS && !process.env.MIN_QV_USD) MIN_QV=3_000_000;
+              // Hard-fail if .us (force binance.com only)
+              const host = new URL(BASE).host;
+              const isUS = /(^|\.)binance\.us$/i.test(host);
+              if (isUS) { throw new Error("binance.com unreachable; refusing .us fallback"); }
+
               log("base", BASE, "MIN_QV", MIN_QV);
 
               if(!todOK){ reason="tod_gate"; throw new Error("time-of-day gate"); }
