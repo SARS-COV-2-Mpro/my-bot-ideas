@@ -11,7 +11,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: 20 }
+        with:
+          node-version: 20
       - name: Push Ideas
         env:
           WORKER_PUSH_URL: ${{ secrets.WORKER_PUSH_URL }}
@@ -74,7 +75,7 @@ jobs:
             const TP_TREND_BASE = 1.00, SL_TREND_BASE = 0.575;
             const TP_MR_BASE    = 0.60, SL_MR_BASE    = 0.55;
 
-            const STABLES = new Set(["USDT","BUSD","USDC","TUSD","FDUSD","DAI","USDP","PAX","USTC"]);
+            const STABLES = new Set(["USDT","BUSD","USDC","TUSD","FDUSD","DAI","USDP","PAX","USTC","USD"]);
             const isLev = (base)=> /(UP|DOWN|BULL|BEAR)$/.test(base) || /([235]L|[235]S)$/.test(base);
             const sectorOf = (base)=>{
               const m = {
@@ -92,11 +93,24 @@ jobs:
               return m[base] || "Other";
             };
 
-            // ---------- Base selection (fix 451) ----------
+            // ---------- Networking helpers ----------
+            const UA = "gh-actions-ideas-bot/1.0 (+https://github.com/)";
+            async function fetchWithTimeout(url, opts={}, ms=12_000) {
+              const ac = new AbortController();
+              const t = setTimeout(()=>ac.abort(), ms);
+              try {
+                return await fetch(url, { ...opts, signal: ac.signal, headers: { "User-Agent": UA, ...(opts.headers||{}) }});
+              } finally { clearTimeout(t); }
+            }
+
+            // ---------- Base selection (fix 451 + resiliency) ----------
             const baseCandidates = [
               process.env.BINANCE_BASE,
               "https://api.binance.com",
+              "https://api-gcp.binance.com",
               "https://api1.binance.com",
+              "https://api2.binance.com",
+              "https://api3.binance.com",
               "https://api.binance.us"
             ].filter(Boolean);
 
@@ -106,10 +120,10 @@ jobs:
               const tried=[];
               for(const b of baseCandidates){
                 try{
-                  const r = await fetch(`${b}/api/v3/ticker/24hr`);
+                  const r = await fetchWithTimeout(`${b}/api/v3/ticker/24hr`);
                   if(r.ok){ const data = await r.json(); return { base:b, data }; }
                   tried.push(`${b}:${r.status}`);
-                }catch(e){ tried.push(`${b}:err:${e?.message||e}`); }
+                }catch(e){ tried.push(`${b}:err:${e?.name||""}:${e?.message||e}`); }
               }
               throw new Error("24hr fetch failed | " + tried.join(", "));
             }
@@ -119,8 +133,10 @@ jobs:
               return u.toString();
             };
             const getJSON = async (path, params={})=>{
-              const r = await fetch(api(path, params));
-              if(!r.ok) return null; return await r.json();
+              try{
+                const r = await fetchWithTimeout(api(path, params));
+                if(!r.ok) return null; return await r.json();
+              }catch{ return null; }
             };
             const fetchK = async (sym, interval, limit, startTime, endTime)=>{
               const k = await getJSON("/api/v3/klines", { symbol:sym, interval, limit, startTime, endTime });
@@ -133,18 +149,21 @@ jobs:
               const init = { v:"10/10-autoRRR-3h", cooldown:{}, pending:[], equity:[] };
               if(!token||!id) return { state:init, persist:null };
               try{
-                const r=await fetch(`https://api.github.com/gists/${id}`, { headers:{ Authorization:`Bearer ${token}`, "Accept":"application/vnd.github+json" }});
+                const r=await fetchWithTimeout(`https://api.github.com/gists/${id}`, { headers:{ Authorization:`Bearer ${token}`, "Accept":"application/vnd.github+json", "User-Agent": UA }});
+                if(!r.ok) return { state:init, persist:null };
                 const g=await r.json(); const c=g.files?.["state.json"]?.content;
                 return { state: c? JSON.parse(c): init, persist:{id,token} };
               }catch{ return { state:init, persist:null }; }
             }
             async function saveState(persist, state){
               if(!persist) return;
-              await fetch(`https://api.github.com/gists/${persist.id}`,{
-                method:"PATCH",
-                headers:{ Authorization:`Bearer ${persist.token}`, "Accept":"application/vnd.github+json", "Content-Type":"application/json" },
-                body: JSON.stringify({ files: { "state.json": { content: JSON.stringify(state) } } })
-              }).catch(()=>{});
+              try{
+                await fetchWithTimeout(`https://api.github.com/gists/${persist.id}`,{
+                  method:"PATCH",
+                  headers:{ Authorization:`Bearer ${persist.token}`, "Accept":"application/vnd.github+json", "Content-Type":"application/json", "User-Agent": UA },
+                  body: JSON.stringify({ files: { "state.json": { content: JSON.stringify(state) } } })
+                });
+              }catch{}
             }
             async function evalPending(state){
               const now=Date.now(); const keep=[];
@@ -248,6 +267,12 @@ jobs:
               return { tp_bps: tp, sl_bps: sl, r_used:+(tp/sl).toFixed(2), tp_atr:+(tp/atr_bps).toFixed(2), sl_atr:+(sl/atr_bps).toFixed(2) };
             };
 
+            // ---------- Symbol helpers (USDT + USD, etc.) ----------
+            function splitSymbol(sym, quotes){
+              for(const q of quotes){ if(sym.endsWith(q)) return { base: sym.slice(0, -q.length), quote: q }; }
+              return null;
+            }
+
             // ---------- Main ----------
             try{
               const picked = await pickBaseAnd24hr();
@@ -256,10 +281,25 @@ jobs:
               ALL24 = picked.data;
               console.log("[base]", BASE);
 
-              // Universe by liquidity
-              const usdt = ALL24.filter(t => (t.symbol||"").endsWith("USDT"));
-              const raw = usdt.map(t=>({ symbol:t.symbol, base:t.symbol.slice(0,-4), qv:+(t.quoteVolume||0) }))
-                              .filter(x => x.qv>=MIN_QV && !STABLES.has(x.base) && !isLev(x.base) && !/.*(UP|DOWN)USDT$/.test(x.symbol));
+              const host = new URL(BASE).host;
+              const isUS = /binance\.us$/i.test(host);
+              // Prefer USD+USDT on .us; mostly USDT elsewhere
+              const QUOTES = isUS ? ["USD","USDT","USDC"] : ["USDT","FDUSD","BUSD","TUSD","USDC"];
+
+              // Universe by liquidity (supports USD/USDT/etc.)
+              const raw = [];
+              for(const t of ALL24){
+                const sym = t.symbol||"";
+                const sq = splitSymbol(sym, QUOTES);
+                if(!sq) continue;
+                const base = sq.base;
+                if(STABLES.has(base)) continue;
+                if(isLev(base)) continue;
+                if(/.*(UP|DOWN)USDT$/.test(sym)) continue;
+                const qv=+(t.quoteVolume||0);
+                if(!isFinite(qv) || qv < MIN_QV) continue;
+                raw.push({ symbol:sym, base, quote:sq.quote, qv });
+              }
               raw.sort((a,b)=> b.qv - a.qv);
               const universe = raw.slice(0, UNIVERSE);
               if(universe.length===0) throw new Error("No candidates after filters");
@@ -270,8 +310,8 @@ jobs:
               const bookMap = new Map(books.map(b=>[b.symbol,{ bid:+b.bidPrice, ask:+b.askPrice }]));
 
               // Regime via BTC/ETH 15m
-              const kBTC15 = await fetchK("BTCUSDT","15m",K15M);
-              const kETH15 = await fetchK("ETHUSDT","15m",K15M);
+              const kBTC15 = await fetchK(isUS?"BTCUSD":"BTCUSDT","15m",K15M);
+              const kETH15 = await fetchK(isUS?"ETHUSD":"ETHUSDT","15m",K15M);
               const regime = (()=>{
                 const f=(k)=>{ if(!k||k.length<ADX_P+5) return null; const h=k.map(x=>+x[2]), l=k.map(x=>+x[3]), c=k.map(x=>+x[4]); const { adx }=computeADX_ATR(h,l,c,ADX_P)||{}; const roc=((c.at(-1)/c.at(-5)) - 1); return { adx:adx||0, roc }; };
                 const b=f(kBTC15), e=f(kETH15);
@@ -383,7 +423,7 @@ jobs:
                   const ret5=[]; for(let i=1;i<cl.length;i++){ ret5.push(Math.log(cl[i]/cl[i-1])); }
 
                   return {
-                    symbol:c.symbol, base:c.base, qv:c.qv,
+                    symbol:c.symbol, base:c.base, quote:c.quote, qv:c.qv,
                     side, p_win:+p_final.toFixed(3), p_lcb:+p_lcb.toFixed(3),
                     exp_bps, exp_lcb_bps,
                     tp_bps: rrr.tp_bps, sl_bps: rrr.sl_bps, rrr: rrr.r_used,
@@ -447,7 +487,10 @@ jobs:
               const softmax=(arr,t=25)=>{ const ex=arr.map(x=>Math.exp(x/t)); const s=ex.reduce((a,b)=>a+b,0)||1; return ex.map(x=>x/s); };
               const wExp=softmax(selected.map(x=>x.exp_lcb_bps),25);
               const picks = selected.map((x,i)=>({
-                symbol:x.base, side:x.side, score:x.score, rank:i+1,
+                symbol: x.base,            // base only for display
+                symbol_full: x.symbol,     // full market symbol (e.g., BTCUSDT or BTCUSD)
+                quote: x.quote,
+                side: x.side, score: x.score, rank:i+1,
                 ttl_sec: clamp(Math.round(x.hold_sec + i*15), 480, 1800),
                 p_win:x.p_win, p_lcb:x.p_lcb,
                 exp_bps:x.exp_bps, exp_lcb_bps:x.exp_lcb_bps,
@@ -458,16 +501,17 @@ jobs:
                 size_bps: x.sl_bps>0 ? Math.min(200, Math.round(wExp[i]*TARGET_PORT_RISK_BPS/x.sl_bps*100)) : 0
               }));
 
-              // Queue cooldown + pending eval
-              const ideasTs = new Date().toISOString();
+              // Queue cooldown + pending eval (use full symbol, stop assuming USDT)
+              const nowMs = Date.now();
+              const ideasTs = new Date(nowMs).toISOString();
               for(const p of picks){
-                const symFull = `${p.symbol}USDT`;
+                const symFull = p.symbol_full;
                 const bk = bookMap.get(symFull);
                 const mid = bk ? (bk.bid+bk.ask)/2 : 0;
-                state.cooldown[p.symbol] = Date.now();
+                state.cooldown[p.symbol] = nowMs;
                 state.pending.push({
-                  ts: ideasTs, ts_ms: Date.now(),
-                  symbolFull: symFull, base: p.symbol, side: p.side,
+                  ts: ideasTs, ts_ms: nowMs,
+                  symbolFull: symFull, base: p.symbol, quote: p.quote, side: p.side,
                   entry_price: mid, hold_sec: p.ttl_sec, tp_bps: p.tp_bps, sl_bps: p.sl_bps,
                   regime: p.regime, cost_bps: p.cost_bps
                 });
@@ -491,7 +535,8 @@ jobs:
                     cluster_thresh:CLUSTER_THRESH, cluster_max_picks:CLUSTER_MAX_PICKS, sector_max_picks:SECTOR_MAX_PICKS,
                     cooldown_min: COOLDOWN_MS/60000,
                     target_port_risk_bps:TARGET_PORT_RISK_BPS, cost_bps:COST_BPS, notional_usd: NOTIONAL,
-                    wilson_z: WILSON_Z, min_exp_lcb_bps: MIN_EXP_LCB_BPS
+                    wilson_z: WILSON_Z, min_exp_lcb_bps: MIN_EXP_LCB_BPS,
+                    quotes_considered: QUOTES
                   }
                 },
                 top_n: picks.length,
@@ -499,13 +544,13 @@ jobs:
               };
 
               // Push
-              const resp = await fetch(process.env.WORKER_PUSH_URL, {
+              const resp = await fetchWithTimeout(process.env.WORKER_PUSH_URL, {
                 method:"POST",
                 headers:{ "Content-Type":"application/json", "Authorization": `Bearer ${process.env.PUSH_TOKEN || ""}` },
                 body: JSON.stringify(ideas)
-              });
+              }, 15_000);
               if(!resp.ok){ const txt=await resp.text(); console.error("Push failed", resp.status, txt); process.exit(1); }
-              console.log(`Sent ${picks.length} ideas | Base=${BASE}`);
+              console.log(`Sent ${picks.length} ideas | Base=${BASE} | Quotes=${JSON.stringify(QUOTES)}`);
             }catch(e){
               console.error("Fatal:", e?.message||e);
               process.exit(1);
