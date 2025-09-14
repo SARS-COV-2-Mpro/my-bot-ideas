@@ -1,4 +1,4 @@
- name: Send Trade Ideas (10/10 Auto-RRR, 3h Cooldown)
+name: Send Trade Ideas (10/10 Auto-RRR, 3h Cooldown)
 
 on:
   schedule:
