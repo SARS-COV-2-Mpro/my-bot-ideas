@@ -1,4 +1,4 @@
-name: Send Trade Ideas ELITE (Binance.com only, Windows self-hosted)
+name: Send Trade Ideas ELITE (multi-expert, microstructure, auto-RRR, EV LCB, 3h cooldown)
 
 on:
   schedule:
@@ -7,7 +7,7 @@ on:
 
 jobs:
   push-ideas:
-    runs-on: [self-hosted, Windows, X64]
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     concurrency:
       group: send-trade-ideas-elite
@@ -15,53 +15,32 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      # Ensure bash exists on this Windows runner (fixes "bash: command not found")
-      - name: Install portable Bash (Git for Windows)
-        shell: cmd
-        run: >
-          powershell -NoProfile -ExecutionPolicy Bypass -Command
-          "$ErrorActionPreference='Stop';
-           if (Get-Command bash -ErrorAction SilentlyContinue) { Write-Host 'Bash already available'; exit 0 };
-           [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;
-           $url='https://github.com/git-for-windows/git/releases/download/v2.45.1.windows.1/PortableGit-2.45.1-64-bit.7z.exe';
-           $dst=Join-Path $env:TEMP 'pgit.exe';
-           (New-Object System.Net.WebClient).DownloadFile($url,$dst);
-           $target=Join-Path $env:USERPROFILE 'portablegit';
-           Start-Process -FilePath $dst -ArgumentList @('-y', ('-o' + $target)) -NoNewWindow -Wait;
-           if (!(Test-Path (Join-Path $target 'bin\bash.exe'))) { throw 'PortableGit extract failed'; }
-           Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $target 'bin');
-           Write-Host 'Bash added to PATH';"
-
       - name: Push Ideas (ELITE)
-        shell: bash
         env:
           # Required
           WORKER_PUSH_URL: ${{ secrets.WORKER_PUSH_URL }}
           PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
 
-          # Force Binance.com (no .us fallback)
-          BINANCE_BASE: https://api1.binance.com
+          # Recommended (Repo → Settings → Variables)
+          FEES_BPS: ${{ vars.FEES_BPS }}           # e.g., 12–20 (spot), 4 (futures)
+          NOTIONAL_USD: ${{ vars.NOTIONAL_USD }}   # e.g., 150–200 for ~$200 account
+          MIN_QV_USD: ${{ vars.MIN_QV_USD }}       # e.g., 20_000_000–40_000_000 (binance.com), 3_000_000–8_000_000 (.us)
+          BINANCE_BASE: ${{ vars.BINANCE_BASE }}   # optional (e.g., https://api.binance.us)
+          TOP_N: ${{ vars.TOP_N }}                 # optional cap (default 10)
 
-          # Recommended (plain digits)
-          FEES_BPS: 12
-          NOTIONAL_USD: 150
-          MIN_QV_USD: 25000000
-          TOP_N: 10
-          MAX_SPREAD_BPS: 15
-          EXP_LCB_MIN_BPS: 3
-
-          # Optional state for DD throttle + pending eval
+          # Optional state for DD throttle + pending eval (recommended)
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
 
-          # Optional ToD gate
-          ACTIVE_UTC_START: ${{ vars.ACTIVE_UTC_START }}
-          ACTIVE_UTC_END: ${{ vars.ACTIVE_UTC_END }}
+          # Optional tuning (sane defaults baked in)
+          MAX_SPREAD_BPS: ${{ vars.MAX_SPREAD_BPS }}        # e.g., 12–15
+          EXP_LCB_MIN_BPS: ${{ vars.EXP_LCB_MIN_BPS }}      # e.g., 2–4 (liquidity-adaptive floor will raise it)
+          ACTIVE_UTC_START: ${{ vars.ACTIVE_UTC_START }}     # e.g., 11 (hour UTC); blank = no ToD gate
+          ACTIVE_UTC_END: ${{ vars.ACTIVE_UTC_END }}         # e.g., 23 (hour UTC)
         run: |
           node - <<'NODE'
           (async ()=>{
@@ -107,12 +86,14 @@ jobs:
             const DD_24H_LIMIT_BPS=-150, DD_PEAK_LIMIT_BPS=-300;
             const WILSON_Z=1.28;
 
+            // Auto-RRR bounds (ATR multiples)
             const TP_ATR_MIN=0.40, TP_ATR_MAX=2.00;
             const SL_ATR_MIN=0.30, SL_ATR_MAX=1.50;
             const TP_TREND_BASE=1.08, SL_TREND_BASE=0.56;
             const TP_MR_BASE=0.60,  SL_MR_BASE=0.55;
             const TP_BO_BASE=1.25,  SL_BO_BASE=0.55;
 
+            // Time-of-day gating (optional)
             const S_H = process.env.ACTIVE_UTC_START? Number(process.env.ACTIVE_UTC_START): null;
             const E_H = process.env.ACTIVE_UTC_END?   Number(process.env.ACTIVE_UTC_END):   null;
             const nowH = new Date().getUTCHours();
@@ -131,27 +112,22 @@ jobs:
             if(!PUSH_URL||!PUSH_TOKEN){ console.error("[gha] Missing WORKER_PUSH_URL or PUSH_TOKEN"); process.exit(1); }
             const HEALTH_URL=(()=>{ try{ const u=new URL(PUSH_URL); return `${u.origin}${u.pathname.replace(/\/signals\/push(\?.*)?$/,"/health")}`;}catch{return PUSH_URL.replace(/\/signals\/push(\?.*)?$/,"/health");}})();
 
-            // Health ping
+            // Health ping (guaranteed request to Worker)
             log("health GET", HEALTH_URL);
             try{
               const r=await fetchWithTimeout(HEALTH_URL,{ headers:{ "Authorization":`Bearer ${PUSH_TOKEN}`, "User-Agent":UA }},5000);
               log("health status", r?.status||"ERR");
-            }catch(e){ log("health error", e?.message||e); }
+            }catch(e){
+              log("health error", e?.message||e);
+            }
 
-            // ---------- Base selection (force binance.com only) ----------
-            const baseCandidates=[
-              process.env.BINANCE_BASE,
-              "https://api1.binance.com",
-              "https://api-gcp.binance.com",
-              "https://api2.binance.com",
-              "https://api3.binance.com",
-              "https://api.binance.com"
-            ].filter(Boolean);
+            // Base selection (Binance variants)
+            const baseCandidates=[process.env.BINANCE_BASE,"https://api.binance.com","https://api-gcp.binance.com","https://api1.binance.com","https://api2.binance.com","https://api3.binance.com","https://api.binance.us"].filter(Boolean);
             let BASE=null, ALL24=null;
             async function pickBaseAnd24hr(){
               for(const b of baseCandidates){
                 try{ const r=await fetchWithTimeout(`${b}/api/v3/ticker/24hr`,{},10000); if(r.ok){ return { base:b, data: await r.json() }; } }catch{}
-              } throw new Error("binance.com unreachable (no .us fallback)");
+              } throw new Error("24hr fetch failed for all bases");
             }
             const api=(path,params={})=>{ const u=new URL(path,BASE); for(const [k,v] of Object.entries(params)){ if(v!==undefined&&v!==null) u.searchParams.set(k,String(v)); } return u.toString(); };
             const fetchK=async(sym,interval,limit,startTime,endTime)=>{ try{ const r=await getJSON(api("/api/v3/klines",{symbol:sym,interval,limit,startTime,endTime})); return Array.isArray(r)?r:null; }catch{return null;} };
@@ -193,16 +169,13 @@ jobs:
 
             try{
               const picked=await pickBaseAnd24hr(); BASE=picked.base; ALL24=picked.data;
-              const host = new URL(BASE).host;
-              const isUS = /(^|\.)binance\.us$/i.test(host);
-              if (isUS) { throw new Error("binance.com unreachable; refusing .us fallback"); }
-
+              const isUS=/binance\.us$/i.test(new URL(BASE).host); if(isUS && !process.env.MIN_QV_USD) MIN_QV=3_000_000;
               log("base", BASE, "MIN_QV", MIN_QV);
 
               if(!todOK){ reason="tod_gate"; throw new Error("time-of-day gate"); }
 
               // Universe build (liquidity-first)
-              const QUOTES = ["USDT","FDUSD","BUSD","TUSD","USDC"];
+              const QUOTES = isUS ? ["USD","USDT","USDC"] : ["USDT","FDUSD","BUSD","TUSD","USDC"];
               const split=(sym)=>{ for(const q of QUOTES){ if(sym.endsWith(q)) return { base: sym.slice(0,-q.length), quote:q }; } return null; };
               const all=[]; for(const t of ALL24){ const sym=t.symbol||""; const sq=split(sym); if(!sq) continue; const base=sq.base; if(STABLES.has(base)) continue; const qv=+(t.quoteVolume||0); if(!isFinite(qv)||qv<=0) continue; all.push({ symbol:sym, base, quote:sq.quote, qv }); }
               all.sort((a,b)=>b.qv-a.qv);
@@ -213,10 +186,10 @@ jobs:
               const books=await getJSON(api("/api/v3/ticker/bookTicker"))||[];
               const bookMap=new Map(books.map(b=>[b.symbol,{ bid:+b.bidPrice, ask:+b.askPrice }]));
 
-              const kBTC15=await fetchK("BTCUSDT","15m",K15M);
-              const kETH15=await fetchK("ETHUSDT","15m",K15M);
-              const kBTC1H=await fetchK("BTCUSDT","1h",K1H);
-              const kETH1H=await fetchK("ETHUSDT","1h",K1H);
+              const kBTC15=await fetchK(isUS?"BTCUSD":"BTCUSDT","15m",K15M);
+              const kETH15=await fetchK(isUS?"ETHUSD":"ETHUSDT","15m",K15M);
+              const kBTC1H=await fetchK(isUS?"BTCUSD":"BTCUSDT","1h",K1H);
+              const kETH1H=await fetchK(isUS?"ETHUSD":"ETHUSDT","1h",K1H);
               const regime=(()=>{
                 const f=(k)=>{ if(!k||k.length<ADX_P+5) return null; const h=k.map(x=>+x[2]), l=k.map(x=>+x[3]), c=k.map(x=>+x[4]); const { adx }=computeADX_ATR(h,l,c,ADX_P)||{}; const roc=((c.at(-1)/c.at(-5)) - 1); return { adx:adx||0, roc }; };
                 const b=f(kBTC15)||{adx:0,roc:0}, e=f(kETH15)||{adx:0,roc:0};
@@ -232,6 +205,8 @@ jobs:
               try{ await evalPending(state); }catch{}
               const { pnl24_bps, peak_dd_bps } = equityStats(state.equity);
               const throttle = (pnl24_bps<=DD_24H_LIMIT_BPS) || (peak_dd_bps<=DD_PEAK_LIMIT_BPS);
+              const baseMax = Number.isFinite(Number(process.env.TOP_N)) ? Number(process.env.TOP_N) : 10;
+              const maxIdeas = Math.min(baseMax, throttle?5:(regime.uncertain?6:baseMax));
 
               // Liquidity percentile map
               const liqPct=new Map(); for(let i=0;i<universe.length;i++){ liqPct.set(universe[i].symbol,(universe.length===1)?1:1 - i/(universe.length-1)); }
@@ -434,12 +409,13 @@ jobs:
                   // BTC/ETH beta penalty (lower idio -> higher n)
                   const ret5=[]; for(let i=1;i<c5.length;i++) ret5.push(Math.log(c5[i]/c5[i-1]));
                   const rhoBTC=corr(ret5.slice(-36), btc5), rhoETH=corr(ret5.slice(-36), eth5);
-                  const beta=Math.max(Math.abs(rhoBTC||0), Math.abs(rhoETH||0));
+                  const beta=maxAbs(rhoBTC,rhoETH); function maxAbs(a,b){ return Math.max(Math.abs(a||0), Math.abs(b||0)); }
                   const betaPenalty = clamp(beta - 0.7, 0, 0.3);
 
                   // Confluence score (0..1)
                   let confl=0;
                   confl += trendAlign ? 0.25 : 0;
+                  confl += pullbackOK ? 0.20 : 0;
                   confl += (side==="long" && obi>0) || (side==="short" && obi<0) ? 0.20 : 0;
                   confl += (side==="long" && boUp) || (side==="short" && boDn) ? 0.20 : 0;
                   confl += (Math.abs(z_vwap)<=0.5) ? 0.15 : 0;
@@ -447,20 +423,20 @@ jobs:
 
                   // Dynamic Wilson confidence n
                   const liq = liqPct.get(c.symbol)||0.5;
-                  let nConf = 40 + 25*clamp((adx5-16)/14,0,1) + 20*liq + 20*confl - 20*betaPenalty;
+                  let nConf = 40 + 25*adxF + 20*liq + 20*confl - 20*betaPenalty;
                   nConf = Math.round(clamp(nConf, 35, 120));
 
-                  const p_lcb=wilsonLCB(p_final, nConf, 1.28);
+                  const p_lcb=wilsonLCB(p_final, nConf, WILSON_Z);
                   const exp_lcb_bps=Math.round(p_lcb*rrr.tp_bps - (1-p_lcb)*rrr.sl_bps - costSide);
 
                   // Dynamic EV floor by liquidity + micro
                   const dynFloor = Math.max(EXP_LCB_MIN_BPS, Math.round(EXP_LCB_MIN_BPS + (1-liq)*2 + Math.max(0,12-spreadBps)/12));
                   if(exp_lcb_bps <= dynFloor) return null;
 
-                  const hold_base = (regime.regime==="trend"?720:540) + 240*clamp((adx5-16)/14,0,1);
+                  const hold_base = (regime.regime==="trend"?720:540) + 240*adxF;
                   const hold_sec = Math.round(clamp(hold_base, 480, 1800));
 
-                  const score = clamp(Math.round(56 + 28*(p_final-0.5)*2 + 10*clamp((adx5-16)/14,0,1) + 6*((liq-0.5)*2) + 8*(confl-0.5) - Math.min(10, Math.max(0,(spreadBps-5)/2))), 1, 99);
+                  const score = clamp(Math.round(56 + 28*(p_final-0.5)*2 + 10*adxF + 6*((liq-0.5)*2) + 8*(confl-0.5) - Math.min(10, Math.max(0,(spreadBps-5)/2))), 1, 99);
 
                   return {
                     symbol:c.symbol, base:c.base, quote:c.quote, qv:c.qv,
@@ -508,10 +484,10 @@ jobs:
               const selected=[], usedC=new Map();
               for(const cand of analyzed){
                 if(selected.length>=Math.min(TOP_N, throttle?5:(regime.uncertain?6:TOP_N))) break;
-                let ok=true; for(const s of selected){ if(corr(cand.ret5,s.ret5)>0.85){ ok=false; break; } }
+                let ok=true; for(const s of selected){ if(corr(cand.ret5,s.ret5)>CORR_MAX){ ok=false; break; } }
                 if(!ok) continue;
                 const cid=cand.cluster, cCnt=usedC.get(cid)||0;
-                if(cCnt>=3) continue;
+                if(cCnt>=CLUSTER_MAX_PICKS) continue;
                 selected.push(cand); usedC.set(cid,cCnt+1);
               }
 
