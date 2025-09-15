@@ -7,8 +7,7 @@ on:
 
 jobs:
   push-ideas:
-    # CORRECTED: Labels changed to match your runner's configuration.
-    runs-on: [self-hosted, windows, binance]
+    runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 15
     concurrency:
       group: send-trade-ideas-elite
@@ -16,13 +15,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: 20
 
       - name: Push Ideas (ELITE)
-        shell: powershell
+        shell: cmd
         env:
           # Required
           WORKER_PUSH_URL: ${{ secrets.WORKER_PUSH_URL }}
@@ -43,7 +41,7 @@ jobs:
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
         run: |
-          $code = @'
+          powershell -NoProfile -ExecutionPolicy Bypass -Command "$code = @'
           (async ()=>{
             // ---------- Utils ----------
             const clamp=(x,a,b)=>Math.max(a,Math.min(b,x));
@@ -111,7 +109,7 @@ jobs:
             const PUSH_URL=process.env.WORKER_PUSH_URL||'';
             const PUSH_TOKEN=process.env.PUSH_TOKEN||'';
             if(!PUSH_URL||!PUSH_TOKEN){ console.error('[gha] Missing WORKER_PUSH_URL or PUSH_TOKEN'); process.exit(1); }
-            const HEALTH_URL=(()=>{ try{ const u=new URL(PUSH_URL); return u.origin+u.pathname.replace(/\/signals\/push(\?.*)?$/,'/health'); }catch{return PUSH_URL.replace(/\/signals\/push(\?.*)?$/,'/health'); }})();
+            const HEALTH_URL=(()=>{ try{ const u=new URL(PUSH_URL); return u.origin+u.pathname.replace(/\\/signals\\/push(\\?.*)?$/,'/health'); }catch{return PUSH_URL.replace(/\\/signals\\/push(\\?.*)?$/,'/health'); }})();
 
             // Health ping
             log('health GET', HEALTH_URL);
@@ -176,7 +174,7 @@ jobs:
             try{
               const picked=await pickBaseAnd24hr(); BASE=picked.base; ALL24=picked.data;
               const host = new URL(BASE).host;
-              const isUS = /(^|\.)binance\.us$/i.test(host);
+              const isUS = /(^|\\.)binance\\.us$/i.test(host);
               if (isUS) { throw new Error('binance.com unreachable; refusing .us fallback'); }
 
               log('base', BASE, 'MIN_QV', MIN_QV);
@@ -400,7 +398,7 @@ jobs:
                   let exp_bps = side==='long'? expLong : expShort;
                   if(!rrr || exp_bps<=0) return null;
 
-                  const ret5=[]; for(let i=1;i<c5.length;i++) ret5.push(Math.log(c5[i]/c[i-1]));
+                  const ret5=[]; for(let i=1;i<c5.length;i++) ret5.push(Math.log(c5[i]/c5[i-1]));
                   const rhoBTC=corr(ret5.slice(-36), btc5), rhoETH=corr(ret5.slice(-36), eth5);
                   const beta=Math.max(Math.abs(rhoBTC||0), Math.abs(rhoETH||0));
                   const betaPenalty = clamp(beta - 0.7, 0, 0.3);
@@ -552,7 +550,5 @@ jobs:
             }catch(e){
               console.log(`[gha] push failed ${e?.message||e}`);
             }
-          })();
-          '@
-          $code | Out-File -FilePath "push-ideas.js" -Encoding utf8
-          node push-ideas.js
+          })().catch(e=>console.error('[gha] unhandled error',e));
+          '@; Set-Content -Path push-ideas.js -Value $code -Encoding UTF8; node push-ideas.js"
