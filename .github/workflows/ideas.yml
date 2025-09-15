@@ -1,4 +1,4 @@
-name: Send Trade Ideas ELITE (Binance.com only, Windows self-hosted)
+name: Send Trade Ideas ELITE (Binance.com only, 3h cooldown)
 
 on:
   schedule:
@@ -29,7 +29,7 @@ jobs:
           # Force Binance.com (no .us fallback)
           BINANCE_BASE: https://api1.binance.com
 
-          # Recommended (plain digits; override in repo variables if you want)
+          # Recommended (plain digits)
           FEES_BPS: 12
           NOTIONAL_USD: 150
           MIN_QV_USD: 25000000
@@ -37,13 +37,16 @@ jobs:
           MAX_SPREAD_BPS: 15
           EXP_LCB_MIN_BPS: 3
 
-          # Optional
+          # Optional state (for DD throttle + pending eval)
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
+
+          # Optional ToD gate
           ACTIVE_UTC_START: ${{ vars.ACTIVE_UTC_START }}
           ACTIVE_UTC_END: ${{ vars.ACTIVE_UTC_END }}
         run: |
-          node - <<'NODE'
+          # Write the pusher script and run it (single-file workflow)
+          cat > push-ideas.js <<'NODE'
           (async ()=>{
             // ---------- Utils ----------
             const clamp=(x,a,b)=>Math.max(a,Math.min(b,x));
@@ -175,6 +178,7 @@ jobs:
 
             try{
               const picked=await pickBaseAnd24hr(); BASE=picked.base; ALL24=picked.data;
+              // Hard-fail if .us
               const host = new URL(BASE).host;
               const isUS = /(^|\.)binance\.us$/i.test(host);
               if (isUS) { throw new Error("binance.com unreachable; refusing .us fallback"); }
@@ -214,6 +218,8 @@ jobs:
               try{ await evalPending(state); }catch{}
               const { pnl24_bps, peak_dd_bps } = equityStats(state.equity);
               const throttle = (pnl24_bps<=DD_24H_LIMIT_BPS) || (peak_dd_bps<=DD_PEAK_LIMIT_BPS);
+              const baseMax = Number.isFinite(Number(process.env.TOP_N)) ? Number(process.env.TOP_N) : 10;
+              const maxIdeas = Math.min(baseMax, throttle?5:(regime.uncertain?6:baseMax));
 
               // Liquidity percentile map
               const liqPct=new Map(); for(let i=0;i<universe.length;i++){ liqPct.set(universe[i].symbol,(universe.length===1)?1:1 - i/(universe.length-1)); }
@@ -400,8 +406,8 @@ jobs:
                   const styleLong = trendAlign ? "trend" : (compress||boUp) ? "breakout" : "mr";
                   const styleShort= !trendAlign ? "trend" : (compress||boDn) ? "breakout" : "mr";
 
-                  const rrrLong = computeAutoRRR({ regime:regime.regime, p:pLong,  adx:adx5, atr_bps, cost_bps:costLong,  spread_bps:spreadBps, trend_align:(upF&&upS&&up15&&up1h), style:styleLong });
-                  const rrrShort= computeAutoRRR({ regime:regime.regime, p:pShort, adx:adx5, atr_bps, cost_bps:costShort, spread_bps:spreadBps, trend_align:(!upF&&!upS&&(!up15||!up1h)), style:styleShort });
+                  const rrrLong = computeAutoRRR({ regime:regime.regime, p:pLong,  adx:adx5, atr_bps:atr_bps, cost_bps:costLong,  spread_bps:spreadBps, trend_align:(upF&&upS&&up15&&up1h), style:styleLong });
+                  const rrrShort= computeAutoRRR({ regime:regime.regime, p:pShort, adx:adx5, atr_bps:atr_bps, cost_bps:costShort, spread_bps:spreadBps, trend_align:(!upF&&!upS&&(!up15||!up1h)), style:styleShort });
 
                   const expLong = rrrLong ? Math.round(pLong*rrrLong.tp_bps - (1-pLong)*rrrLong.sl_bps - costLong) : -1e9;
                   const expShort= rrrShort? Math.round(pShort*rrrShort.tp_bps - (1-pShort)*rrrShort.sl_bps - costShort): -1e9;
@@ -422,7 +428,6 @@ jobs:
                   // Confluence score (0..1)
                   let confl=0;
                   confl += trendAlign ? 0.25 : 0;
-                  confl += (Math.abs((last-em21)/(atr5||1)) <= 0.40) ? 0.20 : 0;
                   confl += (side==="long" && obi>0) || (side==="short" && obi<0) ? 0.20 : 0;
                   confl += (side==="long" && boUp) || (side==="short" && boDn) ? 0.20 : 0;
                   confl += (Math.abs(z_vwap)<=0.5) ? 0.15 : 0;
@@ -573,3 +578,5 @@ jobs:
             }
           })();
           NODE
+
+          node push-ideas.js
