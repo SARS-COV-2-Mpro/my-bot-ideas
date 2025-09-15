@@ -20,7 +20,7 @@ jobs:
           node-version: 20
 
       - name: Push Ideas (ELITE)
-        shell: pwsh
+        shell: powershell
         env:
           # Required
           WORKER_PUSH_URL: ${{ secrets.WORKER_PUSH_URL }}
@@ -29,21 +29,17 @@ jobs:
           # Force Binance.com (no .us fallback)
           BINANCE_BASE: https://api1.binance.com
 
-          # Recommended (use plain digits)
-          FEES_BPS: ${{ vars.FEES_BPS }}
-          NOTIONAL_USD: ${{ vars.NOTIONAL_USD }}
-          MIN_QV_USD: ${{ vars.MIN_QV_USD }}
-          TOP_N: ${{ vars.TOP_N }}
+          # Recommended (plain digits)
+          FEES_BPS: 12
+          NOTIONAL_USD: 150
+          MIN_QV_USD: 25000000
+          TOP_N: 10
+          MAX_SPREAD_BPS: 15
+          EXP_LCB_MIN_BPS: 3
 
           # Optional state for DD throttle + pending eval
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
-
-          # Optional tuning
-          MAX_SPREAD_BPS: ${{ vars.MAX_SPREAD_BPS }}
-          EXP_LCB_MIN_BPS: ${{ vars.EXP_LCB_MIN_BPS }}
-          ACTIVE_UTC_START: ${{ vars.ACTIVE_UTC_START }}
-          ACTIVE_UTC_END: ${{ vars.ACTIVE_UTC_END }}
         run: |
           @'
           (async ()=>{
@@ -115,14 +111,12 @@ jobs:
             if(!PUSH_URL||!PUSH_TOKEN){ console.error("[gha] Missing WORKER_PUSH_URL or PUSH_TOKEN"); process.exit(1); }
             const HEALTH_URL=(()=>{ try{ const u=new URL(PUSH_URL); return `${u.origin}${u.pathname.replace(/\/signals\/push(\?.*)?$/,"/health")}`;}catch{return PUSH_URL.replace(/\/signals\/push(\?.*)?$/,"/health");}})();
 
-            // Health ping (guaranteed request to Worker)
+            // Health ping
             log("health GET", HEALTH_URL);
             try{
               const r=await fetchWithTimeout(HEALTH_URL,{ headers:{ "Authorization":`Bearer ${PUSH_TOKEN}`, "User-Agent":UA }},5000);
               log("health status", r?.status||"ERR");
-            }catch(e){
-              log("health error", e?.message||e);
-            }
+            }catch(e){ log("health error", e?.message||e); }
 
             // ---------- Base selection (force binance.com only) ----------
             const baseCandidates=[
@@ -218,8 +212,6 @@ jobs:
               try{ await evalPending(state); }catch{}
               const { pnl24_bps, peak_dd_bps } = equityStats(state.equity);
               const throttle = (pnl24_bps<=DD_24H_LIMIT_BPS) || (peak_dd_bps<=DD_PEAK_LIMIT_BPS);
-              const baseMax = Number.isFinite(Number(process.env.TOP_N)) ? Number(process.env.TOP_N) : 10;
-              const maxIdeas = Math.min(baseMax, throttle?5:(regime.uncertain?6:baseMax));
 
               // Liquidity percentile map
               const liqPct=new Map(); for(let i=0;i<universe.length;i++){ liqPct.set(universe[i].symbol,(universe.length===1)?1:1 - i/(universe.length-1)); }
@@ -306,7 +298,6 @@ jobs:
               // Analyze one symbol
               async function analyze(c){
                 try{
-                  // cooldown
                   const lastTs=state.cooldown?.[c.base]; const now=Date.now();
                   if(lastTs && (now-lastTs) < COOLDOWN_MS) return null;
 
@@ -315,7 +306,6 @@ jobs:
                   const spreadBps=Math.round(((book.ask-book.bid)/mid)*10000);
                   if(spreadBps>MAX_SPREAD_BPS) return null;
 
-                  // Klines
                   const k5 = await fetchK(c.symbol,"5m",K5M); if(!k5||k5.length<Math.max(EMA_SLOW+5,ATR_P+5)) return null;
                   const k15= await fetchK(c.symbol,"15m",K15M);
                   const k1h= await fetchK(c.symbol,"1h",K1H);
@@ -326,12 +316,10 @@ jobs:
                   if(!(adx5&&atr5)) return null;
                   const atr_bps=Math.round((atr5/c5.at(-1))*10000); if(atr_bps<4||atr_bps>240) return null;
 
-                  // 15m/1h context
                   const c15=k15?.map(x=>+x[4])||[], c1h=k1h?.map(x=>+x[4])||[];
                   const em15fast=c15.length?ema(c15,EMA_FAST):null, em15slow=c15.length?ema(c15,EMA_SLOW):null;
                   const em1hfast=c1h.length?ema(c1h,EMA_FAST):null, em1hslow=c1h.length?ema(c1h,EMA_SLOW):null;
 
-                  // Features
                   const vwap5=vwapAnchored(h5,l5,c5,v5,VWAP_5M_WIN);
                   const last=c5.at(-1), prev=c5.at(-2), prev3=c5.at(-4);
                   const roc5=(last/prev)-1, roc15=(last/prev3)-1;
@@ -342,7 +330,6 @@ jobs:
                   const z_vwap=(last-vwap5)/(atr5||1);
                   const rsi14=rsi(c5,14);
 
-                  // Donchian breakout (15m)
                   let pHigh=null,pLow=null;
                   if(k15 && k15.length>40){
                     const highs=k15.map(x=>+x[2]), lows=k15.map(x=>+x[3]);
@@ -351,36 +338,31 @@ jobs:
                   const boUp = pHigh ? (last>pHigh) : false;
                   const boDn = pLow  ? (last<pLow ) : false;
 
-                  // Compression: ATR vs avg abs returns
                   const absBps = avgAbsRetBps(c5, 40);
                   const compress = absBps ? (atr_bps < 0.75*absBps) : false;
 
-                  // Pullback-to-EMA21 in trend
                   const nearEMA21 = Math.abs((last-em21)/(atr5||1)) <= 0.40;
                   const pullbackOK = (upF && upS && nearEMA21) || (!upF && !upS && nearEMA21);
 
-                  // Orderbook depth + OBI
                   const slipObi = await depthSlipAndObi(c.symbol, NOTIONAL, book);
                   const obi = slipObi.obi || 0;
 
-                  // Experts
                   const sideTrend= (0.6*roc5+0.4*roc15)>=0 ? "long":"short";
                   const trendAlign = (sideTrend==="long" && upF&&upS&&up15&&up1h) || (sideTrend==="short" && !upF&&!upS&&(!up15||!up1h));
                   const s1=tanh(roc5/0.0030), s2=tanh(roc15/0.0065);
-                  let pTrend = clamp(0.5 + 0.26*(0.6*s1+0.4*s2)*(trendAlign?1.0:0.7)*adxF, 0.32, 0.92);
+                  let pTrend = clamp(0.5 + 0.26*(0.6*s1+0.4*s2)*(trendAlign?1.0:0.7)*((adx5-16)/14>0?((adx5-16)/14):0), 0.32, 0.92);
 
                   const sideMR = z_vwap>0 ? "short" : "long";
                   const rsiEdge=(rsi14!=null)?(rsi14-50)/50:0;
                   const sMR=tanh(Math.abs(z_vwap))*Math.sign(-z_vwap);
-                  let pMR = clamp(0.5 + 0.22*(0.7*sMR + 0.3*(-rsiEdge))*(1-adxF), 0.35, 0.90);
+                  let pMR = clamp(0.5 + 0.22*(0.7*sMR + 0.3*(-rsiEdge))*(1-((adx5-16)/14>0?((adx5-16)/14):0)), 0.35, 0.90);
 
                   const sideBO = boUp ? "long" : boDn ? "short" : (0.6*roc5+0.4*roc15)>=0?"long":"short";
-                  let boScore = (boUp||boDn ? 1.0 : 0.3) * (compress?1.0:0.6) * (0.6+0.4*adxF);
+                  let boScore = (boUp||boDn ? 1.0 : 0.3) * (compress?1.0:0.6) * (0.6+0.4*clamp((adx5-16)/14,0,1));
                   let pBO = clamp(0.5 + 0.28*(boScore*(sideBO==="long"?1:-1)), 0.35, 0.95);
 
-                  // Microstructure nudge (OBI)
                   const obiAdj = clamp(obi*0.08, -0.06, +0.06);
-                  const bias=(regime.dir>=0?+1:-1);
+                  const bias=Math.sign((kBTC15?.at(-1)?.[4]??0) - (kBTC15?.at(-5)?.[4]??0) + (kETH15?.at(-1)?.[4]??0) - (kETH15?.at(-5)?.[4]??0));
                   const adj=(regime.adxAvg>=22 ? 0.03 : 0.015);
                   const biasT = (sideTrend==="long"?+1:-1)*bias;
                   const biasM = (sideMR==="long"?+1:-1)*bias;
@@ -390,7 +372,6 @@ jobs:
                   pMR   =clamp(pMR   + 0.5*adj*biasM + (sideMR==="long"?obiAdj:-obiAdj), 0.30, 0.95);
                   pBO   =clamp(pBO   + 0.7*adj*biasB + (sideBO==="long"?obiAdj:-obiAdj), 0.30, 0.96);
 
-                  // Regime weights
                   const wT = regime.regime==="trend" ? 0.52 : 0.30;
                   const wM = regime.regime==="trend" ? 0.20 : 0.40;
                   const wB = 1 - (wT+wM);
@@ -398,11 +379,9 @@ jobs:
                   const pLong  = clamp(wT*(sideTrend==="long"?pTrend:1-pTrend) + wM*(sideMR==="long"?pMR:1-pMR) + wB*(sideBO==="long"?pBO:1-pBO), 0.30, 0.97);
                   const pShort = clamp(wT*(sideTrend==="short"?pTrend:1-pTrend) + wM*(sideMR==="short"?pMR:1-pMR) + wB*(sideBO==="short"?pBO:1-pBO), 0.30, 0.97);
 
-                  // Costs (fees + half-spread + depth VWAP slip)
                   const costLong=COST_BPS + Math.max(Math.round(spreadBps/2), slipObi.longBps);
                   const costShort=COST_BPS + Math.max(Math.round(spreadBps/2), slipObi.shortBps);
 
-                  // Styles for RRR and confluence scoring
                   const styleLong = trendAlign ? "trend" : (compress||boUp) ? "breakout" : "mr";
                   const styleShort= !trendAlign ? "trend" : (compress||boDn) ? "breakout" : "mr";
 
@@ -419,30 +398,27 @@ jobs:
                   let exp_bps = side==="long"? expLong : expShort;
                   if(!rrr || exp_bps<=0) return null;
 
-                  // BTC/ETH beta penalty (lower idio -> higher n)
                   const ret5=[]; for(let i=1;i<c5.length;i++) ret5.push(Math.log(c5[i]/c5[i-1]));
                   const rhoBTC=corr(ret5.slice(-36), btc5), rhoETH=corr(ret5.slice(-36), eth5);
-                  const beta=maxAbs(rhoBTC,rhoETH); function maxAbs(a,b){ return Math.max(Math.abs(a||0), Math.abs(b||0)); }
+                  const beta=Math.max(Math.abs(rhoBTC||0), Math.abs(rhoETH||0));
                   const betaPenalty = clamp(beta - 0.7, 0, 0.3);
 
-                  // Confluence score (0..1)
                   let confl=0;
                   confl += trendAlign ? 0.25 : 0;
-                  confl += pullbackOK ? 0.20 : 0;
+                  confl += (Math.abs((last-em21)/( (k5 ? +k5.at(-1)[2] - +k5.at(-1)[3] : 1) || 1)) <= 0.40) ? 0.20 : 0;
                   confl += (side==="long" && obi>0) || (side==="short" && obi<0) ? 0.20 : 0;
                   confl += (side==="long" && boUp) || (side==="short" && boDn) ? 0.20 : 0;
                   confl += (Math.abs(z_vwap)<=0.5) ? 0.15 : 0;
                   confl = clamp(confl, 0, 1);
 
-                  // Dynamic Wilson confidence n
                   const liq = liqPct.get(c.symbol)||0.5;
+                  const adxF=clamp((adx5-16)/14,0,1);
                   let nConf = 40 + 25*adxF + 20*liq + 20*confl - 20*betaPenalty;
                   nConf = Math.round(clamp(nConf, 35, 120));
 
-                  const p_lcb=wilsonLCB(p_final, nConf, WILSON_Z);
+                  const p_lcb=wilsonLCB(p_final, nConf, 1.28);
                   const exp_lcb_bps=Math.round(p_lcb*rrr.tp_bps - (1-p_lcb)*rrr.sl_bps - costSide);
 
-                  // Dynamic EV floor by liquidity + micro
                   const dynFloor = Math.max(EXP_LCB_MIN_BPS, Math.round(EXP_LCB_MIN_BPS + (1-liq)*2 + Math.max(0,12-spreadBps)/12));
                   if(exp_lcb_bps <= dynFloor) return null;
 
@@ -476,7 +452,7 @@ jobs:
               }
               if(!analyzed.length){ reason="no_candidates"; }
 
-              // Correlation clustering + diversification
+              // Clustering + diversification
               const clusterMap=new Map(), leaders=[];
               const retCmp=(a,b)=>corr(a.ret5||[],b.ret5||[]);
               const CLUSTER_THRESH=0.80, CLUSTER_MAX_PICKS=3, CORR_MAX=0.85;
@@ -487,7 +463,6 @@ jobs:
               }
               for(const c of analyzed){ c.cluster=clusterMap.get(c.base)||"C0"; }
 
-              // Sort by exp_lcb_bps → exp_bps → confl → score → qv
               analyzed.sort((a,b)=> b.exp_lcb_bps!==a.exp_lcb_bps ? b.exp_lcb_bps-a.exp_lcb_bps
                                 : b.exp_bps!==a.exp_bps ? b.exp_bps-a.exp_bps
                                 : b.confl!==a.confl ? b.confl-a.confl
@@ -506,7 +481,6 @@ jobs:
 
               if(!selected.length){ reason=reason==="ok"?"filtered_by_caps":reason; }
 
-              // Softmax sizing hint
               const softmax=(arr,t=25)=>{ const ex=arr.map(x=>Math.exp(x/t)); const s=ex.reduce((a,b)=>a+b,0)||1; return ex.map(x=>x/s); };
               const wExp=softmax(selected.map(x=>x.exp_lcb_bps),25);
               const TARGET_PORT_RISK_BPS=50;
