@@ -7,7 +7,7 @@ on:
 
 jobs:
   push-ideas:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 15
     concurrency:
       group: send-trade-ideas-elite
@@ -20,10 +20,29 @@ jobs:
           node-version: 20
 
       - name: Push Ideas (ELITE)
+        runs-on: [self-hosted, windows, binance]
+
+
+        shell: pwsh
         env:
           # Required
           WORKER_PUSH_URL: ${{ secrets.WORKER_PUSH_URL }}
-          PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
+          PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }} 
+          
+          
+          BINANCE_BASE: https://api1.binance.com
+          MIN_QV_USD: 25000000
+          MAX_SPREAD_BPS: 15
+          FEES_BPS: 12
+          TOP_N: 10
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+        run: |
+         @'
+         // PASTE YOUR UPDATED NODE.JS SCRIPT HERE
+         // (This is the version that forbids the .us fallback)
+         '@ | node -
+
 
           # Recommended (Repo → Settings → Variables)
           FEES_BPS: ${{ vars.FEES_BPS }}           # e.g., 12–20 (spot), 4 (futures)
