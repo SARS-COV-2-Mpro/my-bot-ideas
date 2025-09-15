@@ -20,48 +20,32 @@ jobs:
           node-version: 20
 
       - name: Push Ideas (ELITE)
-        runs-on: [self-hosted, windows, binance]
-
-
         shell: pwsh
         env:
           # Required
           WORKER_PUSH_URL: ${{ secrets.WORKER_PUSH_URL }}
-          PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }} 
-          
-          
+          PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
+
+          # Force Binance.com (no .us fallback)
           BINANCE_BASE: https://api1.binance.com
-          MIN_QV_USD: 25000000
-          MAX_SPREAD_BPS: 15
-          FEES_BPS: 12
-          TOP_N: 10
-          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
-          GIST_ID: ${{ secrets.GIST_ID }}
-        run: |
-         @'
-         // PASTE YOUR UPDATED NODE.JS SCRIPT HERE
-         // (This is the version that forbids the .us fallback)
-         '@ | node -
 
+          # Recommended (use plain digits)
+          FEES_BPS: ${{ vars.FEES_BPS }}
+          NOTIONAL_USD: ${{ vars.NOTIONAL_USD }}
+          MIN_QV_USD: ${{ vars.MIN_QV_USD }}
+          TOP_N: ${{ vars.TOP_N }}
 
-          # Recommended (Repo → Settings → Variables)
-          FEES_BPS: ${{ vars.FEES_BPS }}           # e.g., 12–20 (spot), 4 (futures)
-          NOTIONAL_USD: ${{ vars.NOTIONAL_USD }}   # e.g., 150–200 for ~$200 account
-          MIN_QV_USD: ${{ vars.MIN_QV_USD }}       # e.g., 20_000_000–40_000_000 (binance.com), 3_000_000–8_000_000 (.us)
-          BINANCE_BASE: ${{ vars.BINANCE_BASE }}   # optional (e.g., https://api.binance.us)
-          TOP_N: ${{ vars.TOP_N }}                 # optional cap (default 10)
-
-          # Optional state for DD throttle + pending eval (recommended)
+          # Optional state for DD throttle + pending eval
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
 
-          # Optional tuning (sane defaults baked in)
-          MAX_SPREAD_BPS: ${{ vars.MAX_SPREAD_BPS }}        # e.g., 12–15
-          EXP_LCB_MIN_BPS: ${{ vars.EXP_LCB_MIN_BPS }}      # e.g., 2–4 (liquidity-adaptive floor will raise it)
-          ACTIVE_UTC_START: ${{ vars.ACTIVE_UTC_START }}     # e.g., 11 (hour UTC); blank = no ToD gate
-          ACTIVE_UTC_END: ${{ vars.ACTIVE_UTC_END }}         # e.g., 23 (hour UTC)
+          # Optional tuning
+          MAX_SPREAD_BPS: ${{ vars.MAX_SPREAD_BPS }}
+          EXP_LCB_MIN_BPS: ${{ vars.EXP_LCB_MIN_BPS }}
+          ACTIVE_UTC_START: ${{ vars.ACTIVE_UTC_START }}
+          ACTIVE_UTC_END: ${{ vars.ACTIVE_UTC_END }}
         run: |
-          node - <<'NODE'
+          @'
           (async ()=>{
             // ---------- Utils ----------
             const clamp=(x,a,b)=>Math.max(a,Math.min(b,x));
@@ -195,7 +179,6 @@ jobs:
 
             try{
               const picked=await pickBaseAnd24hr(); BASE=picked.base; ALL24=picked.data;
-              // Hard-fail if .us (force binance.com only)
               const host = new URL(BASE).host;
               const isUS = /(^|\.)binance\.us$/i.test(host);
               if (isUS) { throw new Error("binance.com unreachable; refusing .us fallback"); }
@@ -205,7 +188,7 @@ jobs:
               if(!todOK){ reason="tod_gate"; throw new Error("time-of-day gate"); }
 
               // Universe build (liquidity-first)
-              const QUOTES = isUS ? ["USD","USDT","USDC"] : ["USDT","FDUSD","BUSD","TUSD","USDC"];
+              const QUOTES = ["USDT","FDUSD","BUSD","TUSD","USDC"];
               const split=(sym)=>{ for(const q of QUOTES){ if(sym.endsWith(q)) return { base: sym.slice(0,-q.length), quote:q }; } return null; };
               const all=[]; for(const t of ALL24){ const sym=t.symbol||""; const sq=split(sym); if(!sq) continue; const base=sq.base; if(STABLES.has(base)) continue; const qv=+(t.quoteVolume||0); if(!isFinite(qv)||qv<=0) continue; all.push({ symbol:sym, base, quote:sq.quote, qv }); }
               all.sort((a,b)=>b.qv-a.qv);
@@ -216,10 +199,10 @@ jobs:
               const books=await getJSON(api("/api/v3/ticker/bookTicker"))||[];
               const bookMap=new Map(books.map(b=>[b.symbol,{ bid:+b.bidPrice, ask:+b.askPrice }]));
 
-              const kBTC15=await fetchK(isUS?"BTCUSD":"BTCUSDT","15m",K15M);
-              const kETH15=await fetchK(isUS?"ETHUSD":"ETHUSDT","15m",K15M);
-              const kBTC1H=await fetchK(isUS?"BTCUSD":"BTCUSDT","1h",K1H);
-              const kETH1H=await fetchK(isUS?"ETHUSD":"ETHUSDT","1h",K1H);
+              const kBTC15=await fetchK("BTCUSDT","15m",K15M);
+              const kETH15=await fetchK("ETHUSDT","15m",K15M);
+              const kBTC1H=await fetchK("BTCUSDT","1h",K1H);
+              const kETH1H=await fetchK("ETHUSDT","1h",K1H);
               const regime=(()=>{
                 const f=(k)=>{ if(!k||k.length<ADX_P+5) return null; const h=k.map(x=>+x[2]), l=k.map(x=>+x[3]), c=k.map(x=>+x[4]); const { adx }=computeADX_ATR(h,l,c,ADX_P)||{}; const roc=((c.at(-1)/c.at(-5)) - 1); return { adx:adx||0, roc }; };
                 const b=f(kBTC15)||{adx:0,roc:0}, e=f(kETH15)||{adx:0,roc:0};
@@ -595,4 +578,4 @@ jobs:
               console.log(`[gha] push failed ${e?.message||e}`);
             }
           })();
-          NODE
+          '@ | node -
