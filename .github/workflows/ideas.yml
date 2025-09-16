@@ -385,7 +385,7 @@ jobs:
                   const pLong  = clamp(wT*(sideTrend==="long"?pTrend:1-pTrend) + wM*(sideMR==="long"?pMR:1-pMR) + wB*(sideBO==="long"?pBO:1-pBO), 0.30, 0.97);
                   const pShort = clamp(wT*(sideTrend==="short"?pTrend:1-pTrend) + wM*(sideMR==="short"?pMR:1-pMR) + wB*(sideBO==="short"?pBO:1-pBO), 0.30, 0.97);
 
-                  const spreadBps=Math.round(((book.ask-book.bid)/mid)*10000);
+                  
                   const costLong=COST_BPS + Math.max(Math.round(spreadBps/2), slipObi.longBps);
                   const costShort=COST_BPS + Math.max(Math.round(spreadBps/2), slipObi.shortBps);
 
