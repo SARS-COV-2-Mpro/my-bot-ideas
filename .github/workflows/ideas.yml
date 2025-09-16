@@ -1,4 +1,4 @@
-name: Send Trade Ideas ELITE (proxy-first, always-push)
+name: Send Trade Ideas ELITE (proxy-first, batched-24hr, always-push)
 
 on:
   schedule:
@@ -12,7 +12,7 @@ jobs:
     concurrency:
       group: send-trade-ideas-elite
       cancel-in-progress: true
-    # environment: production
+    # environment: production  # uncomment if your repo Variables are under an Environment
 
     steps:
       - uses: actions/checkout@v4
@@ -20,7 +20,7 @@ jobs:
         with:
           node-version: 20
 
-      # Preflight: trim trailing slash, force proxy to re-pick upstream (rebase), show HTTP codes
+      # Preflight: trim trailing slash, force proxy to re-pick upstream (rebase), show HTTP codes (non-fatal)
       - name: Verify Cloudflare proxy connectivity
         continue-on-error: true
         run: |
@@ -34,13 +34,13 @@ jobs:
           fi
           curl -sS -o /dev/null "$BASE/api/v3/ping?rebase=1&nocache=1" || true
           S1=$(curl -sS -o /dev/null -w '%{http_code}' "$BASE/api/v3/ping?nocache=1" || echo ERR)
-          S2=$(curl -sS -o /dev/null -w '%{http_code}' "$BASE/api/v3/ticker/24hr?symbol=BTCUSDT&nocache=1" || echo ERR)
-          echo "preflight: ping=$S1  24hr(BTCUSDT)=$S2"
+          S2=$(curl -sS -o /dev/null -w '%{http_code}' "$BASE/api/v3/ticker/bookTicker?nocache=1" || echo ERR)
+          echo "preflight: ping=$S1  bookTicker(all)=$S2"
           if [ "$S1" != "200" ] || [ "$S2" != "200" ]; then
             echo "::warning::Preflight not 200; continuing to main step…"
           fi
 
-      # Show which upstream the Worker actually used (requires Worker to set X-Upstream-Base)
+      # Shows HTTP status and upstream used (requires Worker to set X-Upstream-Base)
       - name: Show upstream
         run: |
           BASE="${{ vars.BINANCE_BASE }}"; BASE="${BASE%/}"
@@ -55,7 +55,7 @@ jobs:
           # Market data via your Cloudflare proxy (repo → Settings → Variables)
           BINANCE_BASE: ${{ vars.BINANCE_BASE }}            # e.g., https://binance-proxy.YOUR.workers.dev
 
-          # Optional tuning
+          # Optional tuning (defaults below)
           FEES_BPS: ${{ vars.FEES_BPS }}
           NOTIONAL_USD: ${{ vars.NOTIONAL_USD }}
           MIN_QV_USD: ${{ vars.MIN_QV_USD }}
@@ -87,15 +87,16 @@ jobs:
               const atr=trN/p; return { adx, atr, trLast: TR.at(-1) };
             };
             const vwapAnchored=(h,l,c,v,win)=>{ const n=c.length,s=Math.max(0,n-win); let pv=0,vv=0; for(let i=s;i<n;i++){ const tp=(h[i]+l[i]+c[i])/3; const vol=+v[i]||0; pv+=tp*vol; vv+=vol; } return vv>0?pv/vv:c.at(-1); };
-            const corr=(a,b)=>{ const n=Math.min(a.length,b.length); if(n<5) return 0; const as=a.slice(-n), bs=b.slice(-n); const ma=as.reduce((x,y)=>x+y,0)/n, mb=bs.reduce((x,y)=>x+y,0)/n;
-              let num=0,da=0,db=0; for(let i=0;i<n;i++){ const xa=as[i]-ma, xb=bs[i]-mb; num+=xa*xb; da+=xa*xa; db+=xb*xb; }
+            const corr=(a,b)=>{ const n=Math.min(a.length,b.length); if(n<5) return 0; const as=a.slice(-n), bs=b.slice(-n);
+              const ma=as.reduce((x,y)=>x+y,0)/n, mb=bs.reduce((x,y)=>x+y,0)/n; let num=0,da=0,db=0;
+              for(let i=0;i<n;i++){ const xa=as[i]-ma, xb=bs[i]-mb; num+=xa*xb; da+=xa*xa; db+=xb*xb; }
               const den=Math.sqrt(da*db); return den===0?0:num/den; };
             const wilsonLCB=(p,n,z=1.28)=>{ if(n<=0) return p; const z2=z*z; const a=p + z2/(2*n); const b=z*Math.sqrt((p*(1-p)+z2/(4*n))/n); const c=1+z2/n; return clamp((a-b)/c, 0, 1); };
             const avgAbsRetBps=(c,win=40)=>{ if(c.length<win+1) return null; let s=0; for(let i=c.length-win;i<c.length;i++){ s += Math.abs((c[i]/c[i-1])-1); } return (s/win)*10000; };
             const log=(...a)=>console.log("[gha]",...a);
 
             // ---------- Config ----------
-            let MIN_QV = Number(process.env.MIN_QV_USD||"0") || 25_000_000;
+            let MIN_QV = Number(process.env.MIN_QV_USD||"0") || 25_000_000; // default for .com
             const TOP_N = Number(process.env.TOP_N||"10");
             const MAX_SPREAD_BPS = Number(process.env.MAX_SPREAD_BPS||"15");
             const EXP_LCB_MIN_BPS = Number(process.env.EXP_LCB_MIN_BPS||"2");
@@ -120,9 +121,10 @@ jobs:
             const todOK = (S_H==null || E_H==null) ? true : (S_H<=E_H ? (nowH>=S_H && nowH<=E_H) : (nowH>=S_H || nowH<=E_H));
 
             const STABLES=new Set(["USDT","BUSD","USDC","TUSD","FDUSD","DAI","USDP","PAX","USTC","USD"]);
+            const QUOTES = ["USDT","FDUSD","BUSD","TUSD","USDC","USD"];
 
             // ---------- Net ----------
-            const UA="gh-actions-ideas-elite/1.3 (+https://github.com/)";
+            const UA="gh-actions-ideas-elite/1.4 (+https://github.com/)";
             async function fetchWithTimeout(url,opts={},ms=12000){ const ac=new AbortController(); const t=setTimeout(()=>ac.abort(),ms); try{ return await fetch(url,{...opts,signal:ac.signal,headers:{"User-Agent":UA,...(opts.headers||{})}});} finally{ clearTimeout(t);} }
             async function getJSON(url,ms=12000){ const r=await fetchWithTimeout(url,{},ms); if(!r?.ok) return null; try{ return await r.json(); }catch{return null;} }
 
@@ -146,18 +148,54 @@ jobs:
             // ---------- Ask proxy to re-pick upstream for this GH POP ----------
             try { await fetchWithTimeout(`${BASE}/api/v3/ping?rebase=1`, {}, 6000); } catch {}
 
-            // ---------- API via proxy ----------
-            async function pickBaseAnd24hr(){
-              let r = await fetchWithTimeout(`${BASE}/api/v3/ticker/24hr`,{},10000);
-              if(!r.ok){
-                try { await fetchWithTimeout(`${BASE}/api/v3/ping?rebase=1`, {}, 6000); } catch {}
-                r = await fetchWithTimeout(`${BASE}/api/v3/ticker/24hr`,{},10000);
+            // ---------- Seed & 24hr (batched per-symbol; avoids all-24hr block) ----------
+            async function seedSymbols(max=600){
+              // Prefer bookTicker(all); fallback to exchangeInfo; final fallback to a small static set
+              let syms = [];
+              const bt = await getJSON(`${BASE}/api/v3/ticker/bookTicker`);
+              if (Array.isArray(bt) && bt.length) {
+                syms = bt.map(x=>x.symbol).filter(s => QUOTES.some(q=>s.endsWith(q)));
+              } else {
+                const ex = await getJSON(`${BASE}/api/v3/exchangeInfo`);
+                if (ex?.symbols?.length) {
+                  syms = ex.symbols.filter(s => s.status==="TRADING" && QUOTES.includes(s.quoteAsset))
+                                   .map(s => s.symbol);
+                } else {
+                  syms = ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","ADAUSDT"];
+                }
               }
-              if(!r.ok) throw new Error(`24hr fetch failed via proxy (${r.status})`);
-              return { base: BASE, data: await r.json() };
+              // Keep first 'max' to limit I/O
+              return syms.slice(0, max);
             }
-            const api=(path,params={})=>{ const u=new URL(path,BASE); for(const [k,v] of Object.entries(params)){ if(v!==undefined&&v!==null) u.searchParams.set(k,String(v)); } return u.toString(); };
-            const fetchK=async(sym,interval,limit,startTime,endTime)=>{ try{ const r=await getJSON(api("/api/v3/klines",{symbol:sym,interval,limit,startTime,endTime})); return Array.isArray(r)?r:null; }catch{return null;} };
+
+            async function get24hrBatch(base, max=600, conc=16){
+              const symbols = await seedSymbols(max);
+              const out = [];
+              let i = 0;
+              async function one(s){
+                // 3 short retries on 429/5xx with jitter
+                for (let a=0; a<3; a++){
+                  const r = await fetchWithTimeout(`${base}/api/v3/ticker/24hr?symbol=${encodeURIComponent(s)}`, {}, 9000);
+                  if (r && r.ok) {
+                    try { const j = await r.json(); if (j && j.symbol) out.push(j); } catch {}
+                    return;
+                  }
+                  if (r && (r.status===429 || r.status>=500)) {
+                    await new Promise(res=>setTimeout(res, 200*(a+1) + Math.random()*200));
+                    continue;
+                  }
+                  return; // 4xx other than 429 → give up
+                }
+              }
+              async function worker(){
+                while(i < symbols.length){
+                  const s = symbols[i++];
+                  try { await one(s); } catch {}
+                }
+              }
+              await Promise.all(Array.from({length: conc}, worker));
+              return out;
+            }
 
             // ---------- Gist state ----------
             async function loadState(){ const token=process.env.GIST_TOKEN, id=process.env.GIST_ID; const init={ v:"elite-ideas-1.0", cooldown:{}, pending:[], equity:[] };
@@ -169,8 +207,8 @@ jobs:
               const now=Date.now(); const keep=[];
               for(const p of state.pending||[]){
                 if(now < p.ts_ms + p.hold_sec*1000 + 5000){ keep.push(p); continue; }
-                const k = await fetchK(p.symbolFull,"1m",240, p.ts_ms-60*1000, p.ts_ms+p.hold_sec*1000+60*1000);
-                if(!k){ keep.push(p); continue; }
+                const k = await getJSON(`${BASE}/api/v3/klines?symbol=${encodeURIComponent(p.symbolFull)}&interval=1m&limit=240`);
+                if(!Array.isArray(k)){ keep.push(p); continue; }
                 const highs=k.map(x=>+x[2]), lows=k.map(x=>+x[3]), closes=k.map(x=>+x[4]);
                 const entry=p.entry_price, long=p.side==="long", tp=p.tp_bps/10000, sl=p.sl_bps/10000;
                 let exitPx=closes.at(-1);
@@ -195,42 +233,36 @@ jobs:
             let picks=[], reason="ok", metaExtra={};
 
             try{
-              const picked=await pickBaseAnd24hr(); const ALL24=picked.data;
-              log("base", picked.base, "MIN_QV", MIN_QV);
-
               if(!todOK){ reason="tod_gate"; throw new Error("time-of-day gate"); }
 
-              // Universe with dynamic MIN_QV fallback (handles .us fallback at proxy)
-              const QUOTES = ["USDT","FDUSD","BUSD","TUSD","USDC","USD"];
-              const split=(sym)=>{ for(const q of QUOTES){ if(sym.endsWith(q)) return { base: sym.slice(0,-q.length), quote:q }; } return null; };
-              function buildUniverse(minQV){
-                const all=[];
-                for(const t of ALL24){
-                  const sym=t.symbol||""; const sq=split(sym); if(!sq) continue;
-                  const base=sq.base; if(STABLES.has(base)) continue;
-                  const qv=+(t.quoteVolume||0); if(!isFinite(qv)||qv<=0) continue;
-                  all.push({ symbol:sym, base, quote:sq.quote, qv });
-                }
-                all.sort((a,b)=>b.qv-a.qv);
-                return all.filter(x=>x.qv>=minQV).slice(0,60);
-              }
-              let lowered=false, minTried=MIN_QV;
-              let universe = buildUniverse(MIN_QV);
-              if(!universe.length){ MIN_QV = 3_000_000; lowered=true; universe = buildUniverse(MIN_QV); }
-              if(!universe.length){ MIN_QV = 1_000_000; lowered=true; universe = buildUniverse(MIN_QV); }
-              if(!universe.length){ reason="no_universe"; throw new Error("no liquid symbols"); }
-              if(lowered) metaExtra.min_qv_lowered_from = minTried;
+              // 24hr per-symbol batch (avoid 'all 24hr')
+              const ALL24 = await get24hrBatch(BASE, 600, 16);
+              if(!Array.isArray(ALL24) || !ALL24.length){ reason="data_error"; throw new Error("24hr batch empty"); }
 
-              // Books and regime
-              const books=await getJSON(api("/api/v3/ticker/bookTicker"))||[];
+              // Universe build (liquidity-first)
+              const split=(sym)=>{ for(const q of QUOTES){ if(sym.endsWith(q)) return { base: sym.slice(0,-q.length), quote:q }; } return null; };
+              const all=[]; for(const t of ALL24){ const sym=t.symbol||""; const sq=split(sym); if(!sq) continue; const base=sq.base; if(STABLES.has(base)) continue; const qv=+(t.quoteVolume||0); if(!isFinite(qv)||qv<=0) continue; all.push({ symbol:sym, base, quote:sq.quote, qv }); }
+              all.sort((a,b)=>b.qv-a.qv);
+
+              // Dynamic MIN_QV fallback to cope with .us if proxy fell back there
+              let lowered=false, minTried=MIN_QV;
+              let universe = all.filter(x=>x.qv>=MIN_QV).slice(0,60);
+              if(!universe.length){ MIN_QV=3_000_000; lowered=true; universe = all.filter(x=>x.qv>=MIN_QV).slice(0,60); }
+              if(!universe.length){ MIN_QV=1_000_000; lowered=true; universe = all.filter(x=>x.qv>=MIN_QV).slice(0,60); }
+              if(!universe.length){ reason="no_universe"; throw new Error("no liquid symbols"); }
+              if(lowered) metaExtra.min_qv_lowered_from=minTried;
+
+              // Books (use bookTicker all)
+              const books=await getJSON(`${BASE}/api/v3/ticker/bookTicker`)||[];
               const bookMap=new Map(books.map(b=>[b.symbol,{ bid:+b.bidPrice, ask:+b.askPrice }]));
 
-              const kBTC15=await fetchK("BTCUSDT","15m",K15M);
-              const kETH15=await fetchK("ETHUSDT","15m",K15M);
-              const kBTC1H=await fetchK("BTCUSDT","1h",K1H);
-              const kETH1H=await fetchK("ETHUSDT","1h",K1H);
+              // Regime (BTC/ETH)
+              const kBTC15=await getJSON(`${BASE}/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=${K15M}`);
+              const kETH15=await getJSON(`${BASE}/api/v3/klines?symbol=ETHUSDT&interval=15m&limit=${K15M}`);
+              const kBTC1H=await getJSON(`${BASE}/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=${K1H}`);
+              const kETH1H=await getJSON(`${BASE}/api/v3/klines?symbol=ETHUSDT&interval=1h&limit=${K1H}`);
               const regime=(()=>{
-                const f=(k)=>{ if(!k||k.length<ADX_P+5) return null; const h=k.map(x=>+x[2]), l=k.map(x=>+x[3]), c=k.map(x=>+x[4]); const { adx }=computeADX_ATR(h,l,c,ADX_P)||{}; const roc=((c.at(-1)/c.at(-5)) - 1); return { adx:adx||0, roc }; };
+                const f=(k)=>{ if(!Array.isArray(k)||k.length<ADX_P+5) return null; const h=k.map(x=>+x[2]), l=k.map(x=>+x[3]), c=k.map(x=>+x[4]); const { adx }=computeADX_ATR(h,l,c,ADX_P)||{}; const roc=((c.at(-1)/c.at(-5)) - 1); return { adx:adx||0, roc }; };
                 const b=f(kBTC15)||{adx:0,roc:0}, e=f(kETH15)||{adx:0,roc:0};
                 const adxAvg=((b.adx||0)+(e.adx||0))/2, dir = Math.sign((b.roc||0)+(e.roc||0));
                 const isTrend=adxAvg>=22 && Math.abs(b.roc)>0.001 && Math.abs(e.roc)>0.001;
@@ -239,19 +271,19 @@ jobs:
               })();
               log("regime", regime.regime, "adxAvg", regime.adxAvg?.toFixed?.(1)||"");
 
-              // State (DD throttle)
+              // State (DD throttle etc.)
               const { state, persist } = await loadState();
               try{ await evalPending(state); }catch{}
               const { pnl24_bps, peak_dd_bps } = equityStats(state.equity);
               const throttle = (pnl24_bps<=DD_24H_LIMIT_BPS) || (peak_dd_bps<=DD_PEAK_LIMIT_BPS);
               const baseMax = Number.isFinite(Number(process.env.TOP_N)) ? Number(process.env.TOP_N) : 10;
 
-              // Liquidity percentile map
+              // Liquidity percentile
               const liqPct=new Map(); for(let i=0;i<universe.length;i++){ liqPct.set(universe[i].symbol,(universe.length===1)?1:1 - i/(universe.length-1)); }
 
               // Depth + OBI
               async function depthSlipAndObi(symbol, notionalUSD, book){
-                const depth=await getJSON(api("/api/v3/depth",{symbol,limit:20}));
+                const depth=await getJSON(`${BASE}/api/v3/depth?symbol=${encodeURIComponent(symbol)}&limit=20`);
                 const mid=(book.bid+book.ask)/2;
                 const fallback = {
                   longBps: Math.max(0, Math.round((book.ask-mid)/mid*10000)),
@@ -281,6 +313,11 @@ jobs:
                 };
               }
 
+              // BTC/ETH 5m market returns for beta
+              const mkt5 = (k)=>{ if(!k) return []; const c=k.map(x=>+x[4]); const r=[]; for(let i=1;i<c.length;i++) r.push(Math.log(c[i]/c[i-1])); return r.slice(-36); };
+              const btc5 = mkt5(kBTC15), eth5 = mkt5(kETH15);
+
+              // RRR helper
               const computeAutoRRR=({regime,p,adx,atr_bps,cost_bps,spread_bps,trend_align,style})=>{
                 const adxF=clamp((adx-16)/14,0,1);
                 let baseR = style==="trend" ? (1.4+0.8*adxF) : style==="mr" ? (1.05+0.20*(1-adxF)) : (1.6+0.9*adxF);
@@ -324,12 +361,10 @@ jobs:
                 return { tp_bps:tp, sl_bps:sl, r_used:+(tp/sl).toFixed(2), tp_atr:+(tp/atr_bps).toFixed(2), sl_atr:+(sl/atr_bps).toFixed(2) };
               };
 
-              const mkt5 = (k)=>{ if(!k) return []; const c=k.map(x=>+x[4]); const r=[]; for(let i=1;i<c.length;i++) r.push(Math.log(c[i]/c[i-1])); return r.slice(-36); };
-              const btc5 = mkt5(kBTC15), eth5 = mkt5(kETH15);
-
               // Analyze one symbol
               async function analyze(c){
                 try{
+                  // cooldown
                   const lastTs=state.cooldown?.[c.base]; const now=Date.now();
                   if(lastTs && (now-lastTs) < COOLDOWN_MS) return null;
 
@@ -338,9 +373,10 @@ jobs:
                   const spreadBps=Math.round(((book.ask-book.bid)/mid)*10000);
                   if(spreadBps>MAX_SPREAD_BPS) return null;
 
-                  const k5 = await fetchK(c.symbol,"5m",K5M); if(!k5||k5.length<Math.max(EMA_SLOW+5,ATR_P+5)) return null;
-                  const k15= await fetchK(c.symbol,"15m",K15M);
-                  const k1h= await fetchK(c.symbol,"1h",K1H);
+                  // Klines
+                  const k5 = await getJSON(`${BASE}/api/v3/klines?symbol=${encodeURIComponent(c.symbol)}&interval=5m&limit=${K5M}`); if(!k5||k5.length<Math.max(EMA_SLOW+5,ATR_P+5)) return null;
+                  const k15= await getJSON(`${BASE}/api/v3/klines?symbol=${encodeURIComponent(c.symbol)}&interval=15m&limit=${K15M}`);
+                  const k1h= await getJSON(`${BASE}/api/v3/klines?symbol=${encodeURIComponent(c.symbol)}&interval=1h&limit=${K1H}`);
 
                   const h5=k5.map(x=>+x[2]), l5=k5.map(x=>+x[3]), c5=k5.map(x=>+x[4]), v5=k5.map(x=>+x[5]);
                   const em21=ema(c5,EMA_FAST), em50=ema(c5,EMA_SLOW);
@@ -348,6 +384,7 @@ jobs:
                   if(!(adx5&&atr5)) return null;
                   const atr_bps=Math.round((atr5/c5.at(-1))*10000); if(atr_bps<4||atr_bps>240) return null;
 
+                  // 15m/1h context
                   const c15=k15?.map(x=>+x[4])||[], c1h=k1h?.map(x=>+x[4])||[];
                   const em15fast=c15.length?ema(c15,EMA_FAST):null, em15slow=c15.length?ema(c15,EMA_SLOW):null;
                   const em1hfast=c1h.length?ema(c1h,EMA_FAST):null, em1hslow=c1h.length?ema(c1h,EMA_SLOW):null;
@@ -414,7 +451,7 @@ jobs:
                   const pLong  = clamp(wT*(sideTrend==="long"?pTrend:1-pTrend) + wM*(sideMR==="long"?pMR:1-pMR) + wB*(sideBO==="long"?pBO:1-pBO), 0.30, 0.97);
                   const pShort = clamp(wT*(sideTrend==="short"?pTrend:1-pTrend) + wM*(sideMR==="short"?pMR:1-pMR) + wB*(sideBO==="short"?pBO:1-pBO), 0.30, 0.97);
 
-                  // Costs using precomputed spreadBps
+                  // Costs
                   const costLong=COST_BPS + Math.max(Math.round(spreadBps/2), slipObi.longBps);
                   const costShort=COST_BPS + Math.max(Math.round(spreadBps/2), slipObi.shortBps);
 
@@ -444,7 +481,7 @@ jobs:
                   let confl=0;
                   confl += trendAlign ? 0.25 : 0;
                   confl += (Math.abs(z_vwap)<=0.5) ? 0.15 : 0;
-                  confl += (side==="long" && obi>0) || (side==="short" && obi<0) ? 0.20 : 0;
+                  confl += (side==="long" && slipObi.obi>0) || (side==="short" && slipObi.obi<0) ? 0.20 : 0;
                   confl += (side==="long" && boUp) || (side==="short" && boDn) ? 0.20 : 0;
                   confl = clamp(confl, 0, 1);
 
@@ -454,7 +491,7 @@ jobs:
                   let nConf = 40 + 25*adxF2 + 20*liq + 20*confl - 20*betaPenalty;
                   nConf = Math.round(clamp(nConf, 35, 120));
 
-                  const p_lcb=wilsonLCB(p_final, nConf, 1.28);
+                  const p_lcb=wilsonLCB(p_final, nConf, WILSON_Z);
                   const exp_lcb_bps=Math.round(p_lcb*rrr.tp_bps - (1-p_lcb)*rrr.sl_bps - costSide);
 
                   const dynFloor = Math.max(EXP_LCB_MIN_BPS, Math.round(EXP_LCB_MIN_BPS + (1-liq)*2 + Math.max(0,12-spreadBps)/12));
@@ -475,7 +512,7 @@ jobs:
                     spread_bps: spreadBps, cost_bps: costSide,
                     adx:+(adx5||0).toFixed(1), atr_bps,
                     regime: regime.regime, style: side==="long"?styleLong:styleShort,
-                    score, beta:+beta.toFixed(2), n_conf:nConf, obi:+(obi||0).toFixed(3), confl:+confl.toFixed(2),
+                    score, beta:+beta.toFixed(2), n_conf:nConf, obi:+(slipObi.obi||0).toFixed(3), confl:+confl.toFixed(2),
                     hold_sec, ret5: ret5.slice(-36), liq_pct:+liq.toFixed(3)
                   };
                 }catch{ return null; }
@@ -489,7 +526,7 @@ jobs:
               }
               if(!analyzed.length){ reason="no_candidates"; }
 
-              // Diversification (clusters + corr)
+              // Clustering/diversification
               const clusterMap=new Map(), leaders=[];
               const retCmp=(a,b)=>corr(a.ret5||[],b.ret5||[]);
               const CLUSTER_THRESH=0.80, CLUSTER_MAX_PICKS=3, CORR_MAX=0.85;
@@ -522,8 +559,8 @@ jobs:
               const TARGET_PORT_RISK_BPS=50;
 
               picks = selected.map((x,i)=>({
-                symbol: x.symbol,
-                symbol_full: x.symbol_full,
+                symbol: x.base,
+                symbol_full: x.symbol,
                 quote: x.quote,
                 side: x.side, score: x.score, rank:i+1,
                 ttl_sec: clamp(Math.round(x.hold_sec + i*15), 480, 1800),
@@ -538,7 +575,7 @@ jobs:
                 size_bps: x.sl_bps>0 ? Math.min(200, Math.round(wExp[i]*TARGET_PORT_RISK_BPS/x.sl_bps*100)) : 0
               }));
 
-              // State save: cooldown + pending eval queue
+              // State save: cooldown + pending eval
               try{
                 const nowMs=Date.now(); const ideasTs=new Date(nowMs).toISOString();
                 for(const p of picks){
