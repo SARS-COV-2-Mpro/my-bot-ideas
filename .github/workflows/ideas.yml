@@ -12,6 +12,8 @@ jobs:
     concurrency:
       group: send-trade-ideas-elite
       cancel-in-progress: true
+    # If you store variables under a specific Environment, uncomment:
+    # environment: production
 
     steps:
       - uses: actions/checkout@v4
@@ -19,28 +21,40 @@ jobs:
         with:
           node-version: 20
 
+      # Preflight: ensure we will use the CF proxy and it is reachable
+      - name: Verify Cloudflare proxy connectivity
+        run: |
+          set -euo pipefail
+          echo "BINANCE_BASE=${{ vars.BINANCE_BASE }}"
+          test -n "${{ vars.BINANCE_BASE }}" || (echo "ERROR: repo Variable BINANCE_BASE is not set. Set it to your Worker URL (e.g., https://binance-proxy.YOUR.workers.dev)" && exit 1)
+          curl -fsS "${{ vars.BINANCE_BASE }}/api/v3/ping?nocache=1" >/dev/null
+          curl -fsS "${{ vars.BINANCE_BASE }}/api/v3/ticker/24hr?symbol=BTCUSDT&nocache=1" | head -c 200
+
       - name: Push Ideas (ELITE)
         env:
-          # Required
+          # Required (ingestion Worker)
           WORKER_PUSH_URL: ${{ secrets.WORKER_PUSH_URL }}
           PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
 
-          # Recommended (Repo → Settings → Variables)
-          FEES_BPS: ${{ vars.FEES_BPS }}           # e.g., 12–20 (spot), 4 (futures)
-          NOTIONAL_USD: ${{ vars.NOTIONAL_USD }}   # e.g., 150–200 for ~$200 account
-          MIN_QV_USD: ${{ vars.MIN_QV_USD }}       # e.g., 20_000_000–40_000_000 (binance.com), 3_000_000–8_000_000 (.us)
-          BINANCE_BASE: ${{ vars.BINANCE_BASE }}   # optional (e.g., https://api.binance.us)
-          TOP_N: ${{ vars.TOP_N }}                 # optional cap (default 10)
+          # Use the CF proxy (repo → Settings → Variables)
+          BINANCE_BASE: ${{ vars.BINANCE_BASE }}  # e.g., https://binance-proxy.abdo-xchg-61892.workers.dev
+          # Optional: allow .us fallback only if you explicitly want it (default 0 = disabled)
+          ALLOW_US: ${{ vars.ALLOW_US }}
 
-          # Optional state for DD throttle + pending eval (recommended)
+          # Recommended (tuning)
+          FEES_BPS: ${{ vars.FEES_BPS }}           # e.g., 12–20 (spot), 4 (futures)
+          NOTIONAL_USD: ${{ vars.NOTIONAL_USD }}   # e.g., 150–200
+          MIN_QV_USD: ${{ vars.MIN_QV_USD }}       # e.g., 20_000_000–40_000_000 for .com via proxy
+          TOP_N: ${{ vars.TOP_N }}                 # optional cap (default 10)
+          MAX_SPREAD_BPS: ${{ vars.MAX_SPREAD_BPS }}
+          EXP_LCB_MIN_BPS: ${{ vars.EXP_LCB_MIN_BPS }}
+          ACTIVE_UTC_START: ${{ vars.ACTIVE_UTC_START }}
+          ACTIVE_UTC_END: ${{ vars.ACTIVE_UTC_END }}
+
+          # Optional state (DD throttle + pending eval)
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
 
-          # Optional tuning (sane defaults baked in)
-          MAX_SPREAD_BPS: ${{ vars.MAX_SPREAD_BPS }}        # e.g., 12–15
-          EXP_LCB_MIN_BPS: ${{ vars.EXP_LCB_MIN_BPS }}      # e.g., 2–4 (liquidity-adaptive floor will raise it)
-          ACTIVE_UTC_START: ${{ vars.ACTIVE_UTC_START }}     # e.g., 11 (hour UTC); blank = no ToD gate
-          ACTIVE_UTC_END: ${{ vars.ACTIVE_UTC_END }}         # e.g., 23 (hour UTC)
         run: |
           node - <<'NODE'
           (async ()=>{
@@ -66,7 +80,6 @@ jobs:
             };
             const wilsonLCB=(p,n,z=1.28)=>{ if(n<=0) return p; const z2=z*z; const a=p + z2/(2*n); const b=z*Math.sqrt((p*(1-p)+z2/(4*n))/n); const c=1+z2/n; return clamp((a-b)/c, 0, 1); };
             const avgAbsRetBps=(c,win=40)=>{ if(c.length<win+1) return null; let s=0; for(let i=c.length-win;i<c.length;i++){ s += Math.abs((c[i]/c[i-1])-1); } return (s/win)*10000; };
-
             const log=(...a)=>console.log("[gha]",...a);
 
             // ---------- Config ----------
@@ -93,7 +106,7 @@ jobs:
             const TP_MR_BASE=0.60,  SL_MR_BASE=0.55;
             const TP_BO_BASE=1.25,  SL_BO_BASE=0.55;
 
-            // Time-of-day gating (optional)
+            // Time-of-day gating
             const S_H = process.env.ACTIVE_UTC_START? Number(process.env.ACTIVE_UTC_START): null;
             const E_H = process.env.ACTIVE_UTC_END?   Number(process.env.ACTIVE_UTC_END):   null;
             const nowH = new Date().getUTCHours();
@@ -102,32 +115,42 @@ jobs:
             const STABLES=new Set(["USDT","BUSD","USDC","TUSD","FDUSD","DAI","USDP","PAX","USTC","USD"]);
 
             // ---------- Net ----------
-            const UA="gh-actions-ideas-elite/1.0 (+https://github.com/)";
+            const UA="gh-actions-ideas-elite/1.1 (+https://github.com/)";
             async function fetchWithTimeout(url,opts={},ms=12000){ const ac=new AbortController(); const t=setTimeout(()=>ac.abort(),ms); try{ return await fetch(url,{...opts,signal:ac.signal,headers:{"User-Agent":UA,...(opts.headers||{})}});} finally{ clearTimeout(t);} }
             async function getJSON(url,ms=12000){ const r=await fetchWithTimeout(url,{},ms); if(!r?.ok) return null; try{ return await r.json(); }catch{return null;} }
 
-            // Worker endpoints
-            const PUSH_URL=process.env.WORKER_PUSH_URL||"";
-            const PUSH_TOKEN=process.env.PUSH_TOKEN||"";
+            // Worker endpoints (ingestion)
+            const PUSH_URL=process.env.WORKER_PUSH_URL||""; const PUSH_TOKEN=process.env.PUSH_TOKEN||"";
             if(!PUSH_URL||!PUSH_TOKEN){ console.error("[gha] Missing WORKER_PUSH_URL or PUSH_TOKEN"); process.exit(1); }
             const HEALTH_URL=(()=>{ try{ const u=new URL(PUSH_URL); return `${u.origin}${u.pathname.replace(/\/signals\/push(\?.*)?$/,"/health")}`;}catch{return PUSH_URL.replace(/\/signals\/push(\?.*)?$/,"/health");}})();
 
-            // Health ping (guaranteed request to Worker)
+            // Health ping to ingestion Worker
             log("health GET", HEALTH_URL);
-            try{
-              const r=await fetchWithTimeout(HEALTH_URL,{ headers:{ "Authorization":`Bearer ${PUSH_TOKEN}`, "User-Agent":UA }},5000);
-              log("health status", r?.status||"ERR");
-            }catch(e){
-              log("health error", e?.message||e);
-            }
+            try{ const r=await fetchWithTimeout(HEALTH_URL,{ headers:{ "Authorization":`Bearer ${PUSH_TOKEN}`, "User-Agent":UA }},5000); log("health status", r?.status||"ERR"); }catch(e){ log("health error", e?.message||e); }
 
-            // Base selection (Binance variants)
-            const baseCandidates=[process.env.BINANCE_BASE,"https://api.binance.com","https://api-gcp.binance.com","https://api1.binance.com","https://api2.binance.com","https://api3.binance.com","https://api.binance.us"].filter(Boolean);
+            // ---------- Exchange base selection ----------
+            // IMPORTANT: If BINANCE_BASE is set (your CF proxy), we ONLY use it. No fallback to binance.us.
+            const allowUSFallback = (process.env.ALLOW_US||"0")==="1";
+            const baseCandidates = process.env.BINANCE_BASE
+              ? [process.env.BINANCE_BASE]
+              : [
+                  "https://api.binance.com",
+                  "https://api-gcp.binance.com",
+                  "https://api1.binance.com",
+                  "https://api2.binance.com",
+                  "https://api3.binance.com",
+                  ...(allowUSFallback?["https://api.binance.us"]:[]),
+                ];
+
             let BASE=null, ALL24=null;
             async function pickBaseAnd24hr(){
               for(const b of baseCandidates){
-                try{ const r=await fetchWithTimeout(`${b}/api/v3/ticker/24hr`,{},10000); if(r.ok){ return { base:b, data: await r.json() }; } }catch{}
-              } throw new Error("24hr fetch failed for all bases");
+                try{
+                  const r=await fetchWithTimeout(`${b}/api/v3/ticker/24hr`,{},10000);
+                  if(r.ok){ return { base:b, data: await r.json() }; }
+                }catch{}
+              }
+              throw new Error("24hr fetch failed for all bases");
             }
             const api=(path,params={})=>{ const u=new URL(path,BASE); for(const [k,v] of Object.entries(params)){ if(v!==undefined&&v!==null) u.searchParams.set(k,String(v)); } return u.toString(); };
             const fetchK=async(sym,interval,limit,startTime,endTime)=>{ try{ const r=await getJSON(api("/api/v3/klines",{symbol:sym,interval,limit,startTime,endTime})); return Array.isArray(r)?r:null; }catch{return null;} };
@@ -138,11 +161,12 @@ jobs:
               try{ const r=await fetchWithTimeout(`https://api.github.com/gists/${id}`,{ headers:{Authorization:`Bearer ${token}`,"Accept":"application/vnd.github+json","User-Agent":UA}}); if(!r.ok) return { state:init, persist:null };
                 const g=await r.json(); const c=g.files?.["state.json"]?.content; return { state: c?JSON.parse(c):init, persist:{id,token} }; }catch{ return { state:init, persist:null }; } }
             async function saveState(persist,state){ if(!persist) return; try{ await fetchWithTimeout(`https://api.github.com/gists/${persist.id}`,{ method:"PATCH", headers:{Authorization:`Bearer ${persist.token}`,"Accept":"application/vnd.github+json","Content-Type":"application/json","User-Agent":UA}, body: JSON.stringify({ files:{ "state.json":{ content: JSON.stringify(state) } } }) }); }catch{} }
+
             async function evalPending(state){
               const now=Date.now(); const keep=[];
               for(const p of state.pending||[]){
                 if(now < p.ts_ms + p.hold_sec*1000 + 5000){ keep.push(p); continue; }
-                const k = await fetchK(p.symbolFull,"1m",K1M, p.ts_ms-60*1000, p.ts_ms+p.hold_sec*1000+60*1000);
+                const k = await fetchK(p.symbolFull,"1m",240, p.ts_ms-60*1000, p.ts_ms+p.hold_sec*1000+60*1000);
                 if(!k){ keep.push(p); continue; }
                 const highs=k.map(x=>+x[2]), lows=k.map(x=>+x[3]), closes=k.map(x=>+x[4]);
                 const entry=p.entry_price, long=p.side==="long", tp=p.tp_bps/10000, sl=p.sl_bps/10000;
@@ -169,12 +193,14 @@ jobs:
 
             try{
               const picked=await pickBaseAnd24hr(); BASE=picked.base; ALL24=picked.data;
-              const isUS=/binance\.us$/i.test(new URL(BASE).host); if(isUS && !process.env.MIN_QV_USD) MIN_QV=3_000_000;
-              log("base", BASE, "MIN_QV", MIN_QV);
+              const host=new URL(BASE).host;
+              const isUS = /binance\.us$/i.test(host); // if you point directly to .us
+              if(isUS && !process.env.MIN_QV_USD) MIN_QV=3_000_000; // auto-lower on .us only if no override
+              log("base", BASE, "MIN_QV", MIN_QV, "allowUSFallback", (process.env.ALLOW_US||"0"));
 
               if(!todOK){ reason="tod_gate"; throw new Error("time-of-day gate"); }
 
-              // Universe build (liquidity-first)
+              // Universe (liquidity-first)
               const QUOTES = isUS ? ["USD","USDT","USDC"] : ["USDT","FDUSD","BUSD","TUSD","USDC"];
               const split=(sym)=>{ for(const q of QUOTES){ if(sym.endsWith(q)) return { base: sym.slice(0,-q.length), quote:q }; } return null; };
               const all=[]; for(const t of ALL24){ const sym=t.symbol||""; const sq=split(sym); if(!sq) continue; const base=sq.base; if(STABLES.has(base)) continue; const qv=+(t.quoteVolume||0); if(!isFinite(qv)||qv<=0) continue; all.push({ symbol:sym, base, quote:sq.quote, qv }); }
@@ -182,14 +208,14 @@ jobs:
               const universe = all.filter(x=>x.qv>=MIN_QV).slice(0,60);
               if(!universe.length){ reason="no_universe"; throw new Error("no liquid symbols"); }
 
-              // Books and regime
+              // Books + regime
               const books=await getJSON(api("/api/v3/ticker/bookTicker"))||[];
               const bookMap=new Map(books.map(b=>[b.symbol,{ bid:+b.bidPrice, ask:+b.askPrice }]));
 
-              const kBTC15=await fetchK(isUS?"BTCUSD":"BTCUSDT","15m",K15M);
-              const kETH15=await fetchK(isUS?"ETHUSD":"ETHUSDT","15m",K15M);
-              const kBTC1H=await fetchK(isUS?"BTCUSD":"BTCUSDT","1h",K1H);
-              const kETH1H=await fetchK(isUS?"ETHUSD":"ETHUSDT","1h",K1H);
+              const kBTC15=await fetchK(isUS?"BTCUSD":"BTCUSDT","15m",96);
+              const kETH15=await fetchK(isUS?"ETHUSD":"ETHUSDT","15m",96);
+              const kBTC1H=await fetchK(isUS?"BTCUSD":"BTCUSDT","1h",96);
+              const kETH1H=await fetchK(isUS?"ETHUSD":"ETHUSDT","1h",96);
               const regime=(()=>{
                 const f=(k)=>{ if(!k||k.length<ADX_P+5) return null; const h=k.map(x=>+x[2]), l=k.map(x=>+x[3]), c=k.map(x=>+x[4]); const { adx }=computeADX_ATR(h,l,c,ADX_P)||{}; const roc=((c.at(-1)/c.at(-5)) - 1); return { adx:adx||0, roc }; };
                 const b=f(kBTC15)||{adx:0,roc:0}, e=f(kETH15)||{adx:0,roc:0};
@@ -286,14 +312,12 @@ jobs:
                 return { tp_bps:tp, sl_bps:sl, r_used:+(tp/sl).toFixed(2), tp_atr:+(tp/atr_bps).toFixed(2), sl_atr:+(sl/atr_bps).toFixed(2) };
               };
 
-              // BTC/ETH 5m returns for beta penalty
               const mkt5 = (k)=>{ if(!k) return []; const c=k.map(x=>+x[4]); const r=[]; for(let i=1;i<c.length;i++) r.push(Math.log(c[i]/c[i-1])); return r.slice(-36); };
               const btc5 = mkt5(kBTC15), eth5 = mkt5(kETH15);
 
-              // Analyze one symbol
+              // Analyze one symbol (unchanged core logic)
               async function analyze(c){
                 try{
-                  // cooldown
                   const lastTs=state.cooldown?.[c.base]; const now=Date.now();
                   if(lastTs && (now-lastTs) < COOLDOWN_MS) return null;
 
@@ -302,10 +326,9 @@ jobs:
                   const spreadBps=Math.round(((book.ask-book.bid)/mid)*10000);
                   if(spreadBps>MAX_SPREAD_BPS) return null;
 
-                  // Klines
-                  const k5 = await fetchK(c.symbol,"5m",K5M); if(!k5||k5.length<Math.max(EMA_SLOW+5,ATR_P+5)) return null;
-                  const k15= await fetchK(c.symbol,"15m",K15M);
-                  const k1h= await fetchK(c.symbol,"1h",K1H);
+                  const k5 = await fetchK(c.symbol,"5m",120); if(!k5||k5.length<Math.max(EMA_SLOW+5,ATR_P+5)) return null;
+                  const k15= await fetchK(c.symbol,"15m",96);
+                  const k1h= await fetchK(c.symbol,"1h",96);
 
                   const o5=k5.map(x=>+x[1]), h5=k5.map(x=>+x[2]), l5=k5.map(x=>+x[3]), c5=k5.map(x=>+x[4]), v5=k5.map(x=>+x[5]);
                   const em21=ema(c5,EMA_FAST), em50=ema(c5,EMA_SLOW);
@@ -313,12 +336,10 @@ jobs:
                   if(!(adx5&&atr5)) return null;
                   const atr_bps=Math.round((atr5/c5.at(-1))*10000); if(atr_bps<4||atr_bps>240) return null;
 
-                  // 15m/1h context
                   const c15=k15?.map(x=>+x[4])||[], c1h=k1h?.map(x=>+x[4])||[];
                   const em15fast=c15.length?ema(c15,EMA_FAST):null, em15slow=c15.length?ema(c15,EMA_SLOW):null;
                   const em1hfast=c1h.length?ema(c1h,EMA_FAST):null, em1hslow=c1h.length?ema(c1h,EMA_SLOW):null;
 
-                  // Features
                   const vwap5=vwapAnchored(h5,l5,c5,v5,VWAP_5M_WIN);
                   const last=c5.at(-1), prev=c5.at(-2), prev3=c5.at(-4);
                   const roc5=(last/prev)-1, roc15=(last/prev3)-1;
@@ -329,7 +350,6 @@ jobs:
                   const z_vwap=(last-vwap5)/(atr5||1);
                   const rsi14=rsi(c5,14);
 
-                  // Donchian breakout (15m)
                   let pHigh=null,pLow=null;
                   if(k15 && k15.length>40){
                     const highs=k15.map(x=>+x[2]), lows=k15.map(x=>+x[3]);
@@ -338,19 +358,15 @@ jobs:
                   const boUp = pHigh ? (last>pHigh) : false;
                   const boDn = pLow  ? (last<pLow ) : false;
 
-                  // Compression: ATR vs avg abs returns
                   const absBps = avgAbsRetBps(c5, 40);
                   const compress = absBps ? (atr_bps < 0.75*absBps) : false;
 
-                  // Pullback-to-EMA21 in trend
                   const nearEMA21 = Math.abs((last-em21)/(atr5||1)) <= 0.40;
                   const pullbackOK = (upF && upS && nearEMA21) || (!upF && !upS && nearEMA21);
 
-                  // Orderbook depth + OBI
                   const slipObi = await depthSlipAndObi(c.symbol, NOTIONAL, book);
                   const obi = slipObi.obi || 0;
 
-                  // Experts
                   const sideTrend= (0.6*roc5+0.4*roc15)>=0 ? "long":"short";
                   const trendAlign = (sideTrend==="long" && upF&&upS&&up15&&up1h) || (sideTrend==="short" && !upF&&!upS&&(!up15||!up1h));
                   const s1=tanh(roc5/0.0030), s2=tanh(roc15/0.0065);
@@ -365,7 +381,6 @@ jobs:
                   let boScore = (boUp||boDn ? 1.0 : 0.3) * (compress?1.0:0.6) * (0.6+0.4*adxF);
                   let pBO = clamp(0.5 + 0.28*(boScore*(sideBO==="long"?1:-1)), 0.35, 0.95);
 
-                  // Microstructure nudge (OBI)
                   const obiAdj = clamp(obi*0.08, -0.06, +0.06);
                   const bias=(regime.dir>=0?+1:-1);
                   const adj=(regime.adxAvg>=22 ? 0.03 : 0.015);
@@ -377,7 +392,6 @@ jobs:
                   pMR   =clamp(pMR   + 0.5*adj*biasM + (sideMR==="long"?obiAdj:-obiAdj), 0.30, 0.95);
                   pBO   =clamp(pBO   + 0.7*adj*biasB + (sideBO==="long"?obiAdj:-obiAdj), 0.30, 0.96);
 
-                  // Regime weights
                   const wT = regime.regime==="trend" ? 0.52 : 0.30;
                   const wM = regime.regime==="trend" ? 0.20 : 0.40;
                   const wB = 1 - (wT+wM);
@@ -385,11 +399,9 @@ jobs:
                   const pLong  = clamp(wT*(sideTrend==="long"?pTrend:1-pTrend) + wM*(sideMR==="long"?pMR:1-pMR) + wB*(sideBO==="long"?pBO:1-pBO), 0.30, 0.97);
                   const pShort = clamp(wT*(sideTrend==="short"?pTrend:1-pTrend) + wM*(sideMR==="short"?pMR:1-pMR) + wB*(sideBO==="short"?pBO:1-pBO), 0.30, 0.97);
 
-                  // Costs (fees + half-spread + depth VWAP slip)
                   const costLong=COST_BPS + Math.max(Math.round(spreadBps/2), slipObi.longBps);
                   const costShort=COST_BPS + Math.max(Math.round(spreadBps/2), slipObi.shortBps);
 
-                  // Styles for RRR and confluence scoring
                   const styleLong = trendAlign ? "trend" : (compress||boUp) ? "breakout" : "mr";
                   const styleShort= !trendAlign ? "trend" : (compress||boDn) ? "breakout" : "mr";
 
@@ -406,37 +418,33 @@ jobs:
                   let exp_bps = side==="long"? expLong : expShort;
                   if(!rrr || exp_bps<=0) return null;
 
-                  // BTC/ETH beta penalty (lower idio -> higher n)
                   const ret5=[]; for(let i=1;i<c5.length;i++) ret5.push(Math.log(c5[i]/c5[i-1]));
                   const rhoBTC=corr(ret5.slice(-36), btc5), rhoETH=corr(ret5.slice(-36), eth5);
-                  const beta=maxAbs(rhoBTC,rhoETH); function maxAbs(a,b){ return Math.max(Math.abs(a||0), Math.abs(b||0)); }
+                  const beta=Math.max(Math.abs(rhoBTC||0), Math.abs(rhoETH||0));
                   const betaPenalty = clamp(beta - 0.7, 0, 0.3);
 
-                  // Confluence score (0..1)
                   let confl=0;
                   confl += trendAlign ? 0.25 : 0;
                   confl += pullbackOK ? 0.20 : 0;
-                  confl += (side==="long" && obi>0) || (side==="short" && obi<0) ? 0.20 : 0;
+                  confl += (side==="long" && slipObi.obi>0) || (side==="short" && slipObi.obi<0) ? 0.20 : 0;
                   confl += (side==="long" && boUp) || (side==="short" && boDn) ? 0.20 : 0;
                   confl += (Math.abs(z_vwap)<=0.5) ? 0.15 : 0;
                   confl = clamp(confl, 0, 1);
 
-                  // Dynamic Wilson confidence n
                   const liq = liqPct.get(c.symbol)||0.5;
-                  let nConf = 40 + 25*adxF + 20*liq + 20*confl - 20*betaPenalty;
+                  let nConf = 40 + 25*clamp((adx5-16)/14,0,1) + 20*liq + 20*confl - 20*betaPenalty;
                   nConf = Math.round(clamp(nConf, 35, 120));
 
                   const p_lcb=wilsonLCB(p_final, nConf, WILSON_Z);
                   const exp_lcb_bps=Math.round(p_lcb*rrr.tp_bps - (1-p_lcb)*rrr.sl_bps - costSide);
 
-                  // Dynamic EV floor by liquidity + micro
                   const dynFloor = Math.max(EXP_LCB_MIN_BPS, Math.round(EXP_LCB_MIN_BPS + (1-liq)*2 + Math.max(0,12-spreadBps)/12));
                   if(exp_lcb_bps <= dynFloor) return null;
 
-                  const hold_base = (regime.regime==="trend"?720:540) + 240*adxF;
+                  const hold_base = (regime.regime==="trend"?720:540) + 240*clamp((adx5-16)/14,0,1);
                   const hold_sec = Math.round(clamp(hold_base, 480, 1800));
 
-                  const score = clamp(Math.round(56 + 28*(p_final-0.5)*2 + 10*adxF + 6*((liq-0.5)*2) + 8*(confl-0.5) - Math.min(10, Math.max(0,(spreadBps-5)/2))), 1, 99);
+                  const score = clamp(Math.round(56 + 28*(p_final-0.5)*2 + 10*clamp((adx5-16)/14,0,1) + 6*((liq-0.5)*2) + 8*(confl-0.5) - Math.min(10, Math.max(0,(spreadBps-5)/2))), 1, 99);
 
                   return {
                     symbol:c.symbol, base:c.base, quote:c.quote, qv:c.qv,
@@ -447,7 +455,7 @@ jobs:
                     spread_bps: spreadBps, cost_bps: costSide,
                     adx:+(adx5||0).toFixed(1), atr_bps,
                     regime: regime.regime, style: side==="long"?styleLong:styleShort,
-                    score, beta: +beta.toFixed(2), n_conf:nConf, obi:+obi.toFixed(3), confl:+confl.toFixed(2),
+                    score, beta:+beta.toFixed(2), n_conf:nConf, obi:+(slipObi.obi||0).toFixed(3), confl:+confl.toFixed(2),
                     hold_sec,
                     ret5: ret5.slice(-36),
                     liq_pct:+liq.toFixed(3)
@@ -463,7 +471,7 @@ jobs:
               }
               if(!analyzed.length){ reason="no_candidates"; }
 
-              // Correlation clustering + diversification
+              // Diversification by correlation + clusters
               const clusterMap=new Map(), leaders=[];
               const retCmp=(a,b)=>corr(a.ret5||[],b.ret5||[]);
               const CLUSTER_THRESH=0.80, CLUSTER_MAX_PICKS=3, CORR_MAX=0.85;
@@ -474,7 +482,6 @@ jobs:
               }
               for(const c of analyzed){ c.cluster=clusterMap.get(c.base)||"C0"; }
 
-              // Sort by exp_lcb_bps → exp_bps → confl → score → qv
               analyzed.sort((a,b)=> b.exp_lcb_bps!==a.exp_lcb_bps ? b.exp_lcb_bps-a.exp_lcb_bps
                                 : b.exp_bps!==a.exp_bps ? b.exp_bps-a.exp_bps
                                 : b.confl!==a.confl ? b.confl-a.confl
@@ -490,15 +497,13 @@ jobs:
                 if(cCnt>=CLUSTER_MAX_PICKS) continue;
                 selected.push(cand); usedC.set(cid,cCnt+1);
               }
-
               if(!selected.length){ reason=reason==="ok"?"filtered_by_caps":reason; }
 
-              // Softmax sizing hint
               const softmax=(arr,t=25)=>{ const ex=arr.map(x=>Math.exp(x/t)); const s=ex.reduce((a,b)=>a+b,0)||1; return ex.map(x=>x/s); };
               const wExp=softmax(selected.map(x=>x.exp_lcb_bps),25);
               const TARGET_PORT_RISK_BPS=50;
 
-              picks = selected.map((x,i)=>({
+              const picks = selected.map((x,i)=>({
                 symbol: x.base,
                 symbol_full: x.symbol,
                 quote: x.quote,
@@ -533,36 +538,29 @@ jobs:
 
               metaExtra = {
                 exchange_base: BASE,
-                filters:{
-                  min_qv:MIN_QV, top_n:TOP_N, max_spread_bps:MAX_SPREAD_BPS,
-                  ema_fast:EMA_FAST, ema_slow:EMA_SLOW, adx_p:ADX_P, atr_p:ATR_P,
-                  vwap_5m_win:VWAP_5M_WIN, corr_win:36, corr_max:0.85,
-                  cluster_thresh:0.80, cluster_max_picks:3,
-                  cooldown_min: COOLDOWN_MS/60000,
-                  cost_bps:COST_BPS, notional_usd:NOTIONAL,
-                  exp_lcb_min_bps:EXP_LCB_MIN_BPS, wilson_z:WILSON_Z
-                },
-                dd_gate:{ pnl24_bps, peak_dd_bps, throttle },
+                filters:{ min_qv:MIN_QV, top_n:TOP_N, max_spread_bps:MAX_SPREAD_BPS, ema_fast:EMA_FAST, ema_slow:EMA_SLOW, adx_p:ADX_P, atr_p:ATR_P, vwap_5m_win:VWAP_5M_WIN, corr_win:36, corr_max:0.85, cluster_thresh:0.80, cluster_max_picks:3, cooldown_min: COOLDOWN_MS/60000, cost_bps:COST_BPS, notional_usd:NOTIONAL, exp_lcb_min_bps:EXP_LCB_MIN_BPS, wilson_z:WILSON_Z },
+                dd_gate:{ ...(equityStats(state.equity)) , throttle },
                 tod: { active: S_H!=null && E_H!=null, start:S_H, end:E_H }
               };
 
-            }catch(e){
-              if(reason==="ok"){ reason="data_error"; }
-              metaExtra.error=(e?.message||String(e)).slice(0,180);
-              log("error", metaExtra.error);
-            }
+              // POST (even if 0 ideas)
+              const payload={ ts:new Date().toISOString(), mode:"normal", source:"external_pusher", meta:{ origin:"github_actions", reason, ...(metaExtra||{}) }, top_n:picks.length||0, ideas:picks||[] };
+              console.log(`[gha] pushing ${picks.length} ideas to ${PUSH_URL}`);
+              try{
+                const r=await fetchWithTimeout(PUSH_URL,{ method:"POST", headers:{ "Content-Type":"application/json","Authorization":`Bearer ${PUSH_TOKEN}` }, body: JSON.stringify(payload) },15000);
+                let txt=""; try{ txt=await r.text(); }catch{}
+                console.log(`[gha] push status ${r?.status||"ERR"} ${txt.slice(0,400)}`);
+              }catch(e){ console.log(`[gha] push failed ${e?.message||e}`); }
 
-            // POST to worker (always push, even with 0 ideas)
-            const payload={ ts:new Date().toISOString(), mode:"normal", source:"external_pusher", meta:{ origin:"github_actions", reason, ...(metaExtra||{}) }, top_n:picks.length||0, ideas:picks||[] };
-
-            console.log(`[gha] pushing ${picks.length} ideas to ${PUSH_URL}`);
-            try{
-              const r=await fetchWithTimeout(PUSH_URL,{ method:"POST", headers:{ "Content-Type":"application/json","Authorization":`Bearer ${PUSH_TOKEN}` }, body: JSON.stringify(payload) },15000);
-              let txt=""; try{ txt=await r.text(); }catch{}
-              const body=txt || "";
-              console.log(`[gha] push status ${r?.status||"ERR"} ${body.slice(0,400)}`);
             }catch(e){
-              console.log(`[gha] push failed ${e?.message||e}`);
+              if(reason==="ok") reason="data_error";
+              console.log("[gha] error", e?.message||String(e));
+              // Push empty payload so you still get a heartbeat
+              const payload={ ts:new Date().toISOString(), mode:"normal", source:"external_pusher", meta:{ origin:"github_actions", reason, error:String(e?.message||e) }, top_n:0, ideas:[] };
+              try{
+                const r=await fetchWithTimeout(PUSH_URL,{ method:"POST", headers:{ "Content-Type":"application/json","Authorization":`Bearer ${PUSH_TOKEN}` }, body: JSON.stringify(payload) },15000);
+                console.log(`[gha] push status ${r?.status||"ERR"}`);
+              }catch(_){}
             }
           })();
           NODE
