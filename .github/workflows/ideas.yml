@@ -21,16 +21,24 @@ jobs:
         with:
           node-version: 20
 
-      # Preflight: require CF proxy and verify it’s reachable (trim trailing slash)
+      # Preflight: trim trailing slash and show HTTP codes. Non-fatal so the job continues.
       - name: Verify Cloudflare proxy connectivity
+        continue-on-error: true
         run: |
           set -euo pipefail
           BASE="${{ vars.BINANCE_BASE }}"
           BASE="${BASE%/}"  # strip trailing slash if present
           echo "BINANCE_BASE=$BASE"
-          test -n "$BASE" || (echo "ERROR: Set repo Variable BINANCE_BASE to your Cloudflare Worker URL (e.g., https://binance-proxy.YOUR.workers.dev)" && exit 1)
-          curl -fsS "$BASE/api/v3/ping?nocache=1" >/dev/null
-          curl -fsS "$BASE/api/v3/ticker/24hr?symbol=BTCUSDT&nocache=1" | head -c 200
+          if [ -z "$BASE" ]; then
+            echo "::error::Set repo Variable BINANCE_BASE to your Worker URL (e.g., https://binance-proxy.YOUR.workers.dev)"
+            exit 1
+          fi
+          S1=$(curl -sS -o /dev/null -w '%{http_code}' "$BASE/api/v3/ping?nocache=1" || echo ERR)
+          S2=$(curl -sS -o /dev/null -w '%{http_code}' "$BASE/api/v3/ticker/24hr?symbol=BTCUSDT&nocache=1" || echo ERR)
+          echo "preflight: ping=$S1  24hr=$S2"
+          if [ "$S1" != "200" ] || [ "$S2" != "200" ]; then
+            echo "::warning::Preflight not 200 (ping=$S1 24hr=$S2). Continuing to main step…"
+          fi
 
       - name: Push Ideas (ELITE)
         env:
@@ -114,27 +122,25 @@ jobs:
             async function fetchWithTimeout(url,opts={},ms=12000){ const ac=new AbortController(); const t=setTimeout(()=>ac.abort(),ms); try{ return await fetch(url,{...opts,signal:ac.signal,headers:{"User-Agent":UA,...(opts.headers||{})}});} finally{ clearTimeout(t);} }
             async function getJSON(url,ms=12000){ const r=await fetchWithTimeout(url,{},ms); if(!r?.ok) return null; try{ return await r.json(); }catch{return null;} }
 
-            // Worker endpoints (ingestion)
+            // ---------- Ingestion Worker endpoints ----------
             const PUSH_URL=process.env.WORKER_PUSH_URL||""; const PUSH_TOKEN=process.env.PUSH_TOKEN||"";
             if(!PUSH_URL||!PUSH_TOKEN){ console.error("[gha] Missing WORKER_PUSH_URL or PUSH_TOKEN"); process.exit(1); }
             const HEALTH_URL=(()=>{ try{ const u=new URL(PUSH_URL); return `${u.origin}${u.pathname.replace(/\/signals\/push(\?.*)?$/,"/health")}`;}catch{return PUSH_URL.replace(/\/signals\/push(\?.*)?$/,"/health");}})();
 
-            // Mandatory: CF proxy base (sanitize trailing slash)
+            // ---------- Proxy base (sanitize trailing slash) ----------
             const PROXY_BASE_RAW = process.env.BINANCE_BASE || "";
             const PROXY_BASE = PROXY_BASE_RAW.replace(/\/+$/,"");
-            if(!PROXY_BASE){ console.error("[gha] Missing BINANCE_BASE (must be your Cloudflare proxy URL)"); process.exit(1); }
+            if(!PROXY_BASE){ console.error("[gha] Missing BINANCE_BASE (must be your CF proxy URL)"); process.exit(1); }
 
-            // ---------- guaranteed call to Worker (health) ----------
+            // ---------- Guaranteed health call ----------
             log("health GET", HEALTH_URL);
             try{
               const r=await fetchWithTimeout(HEALTH_URL,{ headers:{ "Authorization":`Bearer ${PUSH_TOKEN}`, "User-Agent":UA }},6000);
               log("health status", r?.status||"ERR");
-            }catch(e){
-              log("health error", e?.message||e);
-            }
+            }catch(e){ log("health error", e?.message||e); }
 
-            // ---------- Base + API helpers (proxy-first, no fallback) ----------
-            const BASE = PROXY_BASE; // force proxy usage
+            // ---------- Use proxy only for market data ----------
+            const BASE = PROXY_BASE;
             async function pickBaseAnd24hr(){
               const r = await fetchWithTimeout(`${BASE}/api/v3/ticker/24hr`,{},10000);
               if(!r.ok) throw new Error(`24hr fetch failed via proxy (${r.status})`);
@@ -379,6 +385,7 @@ jobs:
                   const pLong  = clamp(wT*(sideTrend==="long"?pTrend:1-pTrend) + wM*(sideMR==="long"?pMR:1-pMR) + wB*(sideBO==="long"?pBO:1-pBO), 0.30, 0.97);
                   const pShort = clamp(wT*(sideTrend==="short"?pTrend:1-pTrend) + wM*(sideMR==="short"?pMR:1-pMR) + wB*(sideBO==="short"?pBO:1-pBO), 0.30, 0.97);
 
+                  const spreadBps=Math.round(((book.ask-book.bid)/mid)*10000);
                   const costLong=COST_BPS + Math.max(Math.round(spreadBps/2), slipObi.longBps);
                   const costShort=COST_BPS + Math.max(Math.round(spreadBps/2), slipObi.shortBps);
 
@@ -404,10 +411,10 @@ jobs:
                   const betaPenalty = clamp(beta - 0.7, 0, 0.3);
 
                   let confl=0;
-                  confl += (side==="long" && boUp) || (side==="short" && boDn) ? 0.20 : 0;
+                  confl += trendAlign ? 0.25 : 0;
                   confl += (Math.abs(z_vwap)<=0.5) ? 0.15 : 0;
                   confl += (side==="long" && obi>0) || (side==="short" && obi<0) ? 0.20 : 0;
-                  confl += trendAlign ? 0.25 : 0;
+                  confl += (side==="long" && boUp) || (side==="short" && boDn) ? 0.20 : 0;
                   confl = clamp(confl, 0, 1);
 
                   const liq = liqPct.get(c.symbol)||0.5;
@@ -434,7 +441,7 @@ jobs:
                     spread_bps: spreadBps, cost_bps: costSide,
                     adx:+(adx5||0).toFixed(1), atr_bps,
                     regime: regime.regime, style: side==="long"?styleLong:styleShort,
-                    score, beta:+beta.toFixed(2), n_conf:nConf, obi:+obi.toFixed(3), confl:+confl.toFixed(2),
+                    score, beta:+beta.toFixed(2), n_conf:nConf, obi:+(obi||0).toFixed(3), confl:+confl.toFixed(2),
                     hold_sec,
                     ret5: ret5.slice(-36),
                     liq_pct:+liq.toFixed(3)
@@ -450,7 +457,7 @@ jobs:
               }
               if(!analyzed.length){ reason="no_candidates"; }
 
-              // Diversification
+              // Clustering/diversification
               const clusterMap=new Map(), leaders=[];
               const retCmp=(a,b)=>corr(a.ret5||[],b.ret5||[]);
               const CLUSTER_THRESH=0.80, CLUSTER_MAX_PICKS=3, CORR_MAX=0.85;
@@ -500,6 +507,7 @@ jobs:
 
               // State save: cooldown + pending eval
               try{
+                const { pnl24_bps, peak_dd_bps } = equityStats(state.equity);
                 const nowMs=Date.now(); const ideasTs=new Date(nowMs).toISOString();
                 for(const p of picks){
                   const bk=bookMap.get(p.symbol_full); const mid=bk? (bk.bid+bk.ask)/2 : 0;
@@ -512,31 +520,16 @@ jobs:
                 if(state.pending.length>400) state.pending=state.pending.slice(-400);
                 state.last_ts=ideasTs;
                 await saveState(persist,state);
+                metaExtra = { exchange_base: BASE, dd_gate:{ pnl24_bps, peak_dd_bps } };
               }catch(e){ log("state save warn", e?.message||e); }
-
-              const { pnl24_bps, peak_dd_bps } = equityStats(state.equity);
-              metaExtra = {
-                exchange_base: BASE,
-                filters:{
-                  min_qv:MIN_QV, top_n:TOP_N, max_spread_bps:MAX_SPREAD_BPS,
-                  ema_fast:EMA_FAST, ema_slow:EMA_SLOW, adx_p:ADX_P, atr_p:ATR_P,
-                  vwap_5m_win:VWAP_5M_WIN, corr_win:36, corr_max:0.85,
-                  cluster_thresh:0.80, cluster_max_picks:3,
-                  cooldown_min: COOLDOWN_MS/60000,
-                  cost_bps:COST_BPS, notional_usd:NOTIONAL,
-                  exp_lcb_min_bps:EXP_LCB_MIN_BPS, wilson_z:WILSON_Z
-                },
-                dd_gate:{ pnl24_bps, peak_dd_bps, throttle },
-                tod: { active: S_H!=null && E_H!=null, start:S_H, end:E_H }
-              };
 
             }catch(e){
               if(reason==="ok"){ reason="data_error"; }
-              metaExtra.error=(e?.message||String(e)).slice(0,180);
+              metaExtra = { ...(metaExtra||{}), error:(e?.message||String(e)).slice(0,180) };
               log("error", metaExtra.error);
             }
 
-            // ---------- Always push (even with 0 ideas) ----------
+            // ---------- Always push ----------
             const payload={ ts:new Date().toISOString(), mode:"normal", source:"external_pusher",
               meta:{ origin:"github_actions", reason, ...(metaExtra||{}) },
               top_n:Array.isArray(picks)?picks.length:0, ideas:Array.isArray(picks)?picks:[] };
