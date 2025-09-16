@@ -12,7 +12,7 @@ jobs:
     concurrency:
       group: send-trade-ideas-elite
       cancel-in-progress: true
-    # If your repo Variables live in a specific Environment, uncomment:
+    # If your repo Variables live under an Environment, uncomment:
     # environment: production
 
     steps:
@@ -21,14 +21,16 @@ jobs:
         with:
           node-version: 20
 
-      # Preflight to ensure the CF proxy is set and reachable (fast failure on misconfig)
+      # Preflight: require CF proxy and verify it’s reachable (trim trailing slash)
       - name: Verify Cloudflare proxy connectivity
         run: |
           set -euo pipefail
-          echo "BINANCE_BASE=${{ vars.BINANCE_BASE }}"
-          test -n "${{ vars.BINANCE_BASE }}" || (echo "ERROR: Set repo Variable BINANCE_BASE to your Cloudflare Worker URL (e.g., https://binance-proxy.YOUR.workers.dev)" && exit 1)
-          curl -fsS "${{ vars.BINANCE_BASE }}/api/v3/ping?nocache=1" >/dev/null
-          curl -fsS "${{ vars.BINANCE_BASE }}/api/v3/ticker/24hr?symbol=BTCUSDT&nocache=1" | head -c 200
+          BASE="${{ vars.BINANCE_BASE }}"
+          BASE="${BASE%/}"  # strip trailing slash if present
+          echo "BINANCE_BASE=$BASE"
+          test -n "$BASE" || (echo "ERROR: Set repo Variable BINANCE_BASE to your Cloudflare Worker URL (e.g., https://binance-proxy.YOUR.workers.dev)" && exit 1)
+          curl -fsS "$BASE/api/v3/ping?nocache=1" >/dev/null
+          curl -fsS "$BASE/api/v3/ticker/24hr?symbol=BTCUSDT&nocache=1" | head -c 200
 
       - name: Push Ideas (ELITE)
         env:
@@ -36,10 +38,10 @@ jobs:
           WORKER_PUSH_URL: ${{ secrets.WORKER_PUSH_URL }}   # e.g., https://exchange-server.YOUR.workers.dev/signals/push
           PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
 
-          # Force all market data through your CF proxy (REQUIRED)
-          BINANCE_BASE: ${{ vars.BINANCE_BASE }}            # e.g., https://binance-proxy.abdo-xchg-61892.workers.dev
+          # Force all market data through your CF proxy (repo → Settings → Variables)
+          BINANCE_BASE: ${{ vars.BINANCE_BASE }}            # e.g., https://binance-proxy.YOUR.workers.dev
 
-          # Optional tuning (repo Variables; sensible defaults below)
+          # Optional tuning (repo Variables; sensible defaults baked in)
           FEES_BPS: ${{ vars.FEES_BPS }}
           NOTIONAL_USD: ${{ vars.NOTIONAL_USD }}
           MIN_QV_USD: ${{ vars.MIN_QV_USD }}
@@ -49,7 +51,7 @@ jobs:
           ACTIVE_UTC_START: ${{ vars.ACTIVE_UTC_START }}
           ACTIVE_UTC_END: ${{ vars.ACTIVE_UTC_END }}
 
-          # Optional state for DD throttle + pending eval
+          # Optional state (DD throttle + pending eval)
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
 
@@ -99,9 +101,6 @@ jobs:
 
             const TP_ATR_MIN=0.40, TP_ATR_MAX=2.00;
             const SL_ATR_MIN=0.30, SL_ATR_MAX=1.50;
-            const TP_TREND_BASE=1.08, SL_TREND_BASE=0.56;
-            const TP_MR_BASE=0.60,  SL_MR_BASE=0.55;
-            const TP_BO_BASE=1.25,  SL_BO_BASE=0.55;
 
             const S_H = process.env.ACTIVE_UTC_START? Number(process.env.ACTIVE_UTC_START): null;
             const E_H = process.env.ACTIVE_UTC_END?   Number(process.env.ACTIVE_UTC_END):   null;
@@ -120,8 +119,9 @@ jobs:
             if(!PUSH_URL||!PUSH_TOKEN){ console.error("[gha] Missing WORKER_PUSH_URL or PUSH_TOKEN"); process.exit(1); }
             const HEALTH_URL=(()=>{ try{ const u=new URL(PUSH_URL); return `${u.origin}${u.pathname.replace(/\/signals\/push(\?.*)?$/,"/health")}`;}catch{return PUSH_URL.replace(/\/signals\/push(\?.*)?$/,"/health");}})();
 
-            // Mandatory: CF proxy base
-            const PROXY_BASE = process.env.BINANCE_BASE || "";
+            // Mandatory: CF proxy base (sanitize trailing slash)
+            const PROXY_BASE_RAW = process.env.BINANCE_BASE || "";
+            const PROXY_BASE = PROXY_BASE_RAW.replace(/\/+$/,"");
             if(!PROXY_BASE){ console.error("[gha] Missing BINANCE_BASE (must be your Cloudflare proxy URL)"); process.exit(1); }
 
             // ---------- guaranteed call to Worker (health) ----------
@@ -216,7 +216,6 @@ jobs:
               const { pnl24_bps, peak_dd_bps } = equityStats(state.equity);
               const throttle = (pnl24_bps<=DD_24H_LIMIT_BPS) || (peak_dd_bps<=DD_PEAK_LIMIT_BPS);
               const baseMax = Number.isFinite(Number(process.env.TOP_N)) ? Number(process.env.TOP_N) : 10;
-              const maxIdeas = Math.min(baseMax, throttle?5:(regime.uncertain?6:baseMax));
 
               // Liquidity percentile map
               const liqPct=new Map(); for(let i=0;i<universe.length;i++){ liqPct.set(universe[i].symbol,(universe.length===1)?1:1 - i/(universe.length-1)); }
@@ -261,14 +260,14 @@ jobs:
                 const rHi = style==="breakout" ? 2.7 : 2.5;
                 let prefR = clamp(baseR, rLo, rHi);
 
-                let slATR = style==="trend" ? SL_TREND_BASE : style==="mr" ? SL_MR_BASE : SL_BO_BASE;
+                let slATR = style==="trend" ? 0.56 : style==="mr" ? 0.55 : 0.55;
                 slATR *= (1 + 0.25*(1-adxF));
                 if(spread_bps>12) slATR*=1.10;
                 if(style==="trend" && trend_align && adxF>0.6 && p>0.62) slATR*=0.90;
-                slATR=clamp(slATR, SL_ATR_MIN, SL_ATR_MAX);
+                slATR=clamp(slATR, 0.30, 1.50);
 
-                const tpMax=TP_ATR_MAX*atr_bps, tpMin=TP_ATR_MIN*atr_bps;
-                const slMin=SL_ATR_MIN*atr_bps, slMax=SL_ATR_MAX*atr_bps;
+                const tpMax=2.00*atr_bps, tpMin=0.40*atr_bps;
+                const slMin=0.30*atr_bps, slMax=1.50*atr_bps;
                 let sl=clamp(Math.round(slATR*atr_bps), Math.round(slMin), Math.round(slMax));
 
                 for(let i=0;i<4;i++){
@@ -345,9 +344,6 @@ jobs:
                   const absBps = avgAbsRetBps(c5, 40);
                   const compress = absBps ? (atr_bps < 0.75*absBps) : false;
 
-                  const nearEMA21 = Math.abs((last-em21)/(atr5||1)) <= 0.40;
-                  const pullbackOK = (upF && upS && nearEMA21) || (!upF && !upS && nearEMA21);
-
                   const slipObi = await depthSlipAndObi(c.symbol, NOTIONAL, book);
                   const obi = slipObi.obi || 0;
 
@@ -383,7 +379,6 @@ jobs:
                   const pLong  = clamp(wT*(sideTrend==="long"?pTrend:1-pTrend) + wM*(sideMR==="long"?pMR:1-pMR) + wB*(sideBO==="long"?pBO:1-pBO), 0.30, 0.97);
                   const pShort = clamp(wT*(sideTrend==="short"?pTrend:1-pTrend) + wM*(sideMR==="short"?pMR:1-pMR) + wB*(sideBO==="short"?pBO:1-pBO), 0.30, 0.97);
 
-                  const spreadBps=Math.round(((book.ask-book.bid)/mid)*10000);
                   const costLong=COST_BPS + Math.max(Math.round(spreadBps/2), slipObi.longBps);
                   const costShort=COST_BPS + Math.max(Math.round(spreadBps/2), slipObi.shortBps);
 
@@ -409,10 +404,10 @@ jobs:
                   const betaPenalty = clamp(beta - 0.7, 0, 0.3);
 
                   let confl=0;
-                  confl += trendAlign ? 0.25 : 0;
-                  confl += (Math.abs(z_vwap)<=0.5) ? 0.15 : 0;
-                  confl += (side==="long" && slipObi.obi>0) || (side==="short" && slipObi.obi<0) ? 0.20 : 0;
                   confl += (side==="long" && boUp) || (side==="short" && boDn) ? 0.20 : 0;
+                  confl += (Math.abs(z_vwap)<=0.5) ? 0.15 : 0;
+                  confl += (side==="long" && obi>0) || (side==="short" && obi<0) ? 0.20 : 0;
+                  confl += trendAlign ? 0.25 : 0;
                   confl = clamp(confl, 0, 1);
 
                   const liq = liqPct.get(c.symbol)||0.5;
@@ -439,7 +434,7 @@ jobs:
                     spread_bps: spreadBps, cost_bps: costSide,
                     adx:+(adx5||0).toFixed(1), atr_bps,
                     regime: regime.regime, style: side==="long"?styleLong:styleShort,
-                    score, beta:+beta.toFixed(2), n_conf:nConf, obi:+(slipObi.obi||0).toFixed(3), confl:+confl.toFixed(2),
+                    score, beta:+beta.toFixed(2), n_conf:nConf, obi:+obi.toFixed(3), confl:+confl.toFixed(2),
                     hold_sec,
                     ret5: ret5.slice(-36),
                     liq_pct:+liq.toFixed(3)
@@ -455,7 +450,7 @@ jobs:
               }
               if(!analyzed.length){ reason="no_candidates"; }
 
-              // Correlation clustering + diversification
+              // Diversification
               const clusterMap=new Map(), leaders=[];
               const retCmp=(a,b)=>corr(a.ret5||[],b.ret5||[]);
               const CLUSTER_THRESH=0.80, CLUSTER_MAX_PICKS=3, CORR_MAX=0.85;
@@ -503,7 +498,7 @@ jobs:
                 size_bps: x.sl_bps>0 ? Math.min(200, Math.round(wExp[i]*TARGET_PORT_RISK_BPS/x.sl_bps*100)) : 0
               }));
 
-              // Cooldown + pending eval queue
+              // State save: cooldown + pending eval
               try{
                 const nowMs=Date.now(); const ideasTs=new Date(nowMs).toISOString();
                 for(const p of picks){
