@@ -26,13 +26,12 @@ jobs:
         run: |
           set -euo pipefail
           BASE="${{ vars.BINANCE_BASE }}"
-          BASE="${BASE%/}"  # strip trailing slash if present
+          BASE="${BASE%/}"
           echo "BINANCE_BASE=$BASE"
           if [ -z "$BASE" ]; then
             echo "::error::Set repo Variable BINANCE_BASE to your Worker URL (e.g., https://binance-proxy.YOUR.workers.dev)"
             exit 1
           fi
-          # Ask proxy to re-pick a reachable upstream for this POP
           curl -sS -o /dev/null "$BASE/api/v3/ping?rebase=1&nocache=1" || true
           S1=$(curl -sS -o /dev/null -w '%{http_code}' "$BASE/api/v3/ping?nocache=1" || echo ERR)
           S2=$(curl -sS -o /dev/null -w '%{http_code}' "$BASE/api/v3/ticker/24hr?symbol=BTCUSDT&nocache=1" || echo ERR)
@@ -40,6 +39,12 @@ jobs:
           if [ "$S1" != "200" ] || [ "$S2" != "200" ]; then
             echo "::warning::Preflight not 200; continuing to main step…"
           fi
+
+      # Show which upstream the Worker actually used (requires Worker to set X-Upstream-Base)
+      - name: Show upstream
+        run: |
+          BASE="${{ vars.BINANCE_BASE }}"; BASE="${BASE%/}"
+          curl -i "$BASE/api/v3/ping?nocache=1" | grep -Ei '^(HTTP|X-Upstream-Base)'
 
       - name: Push Ideas (ELITE)
         env:
@@ -90,7 +95,7 @@ jobs:
             const log=(...a)=>console.log("[gha]",...a);
 
             // ---------- Config ----------
-            let MIN_QV = Number(process.env.MIN_QV_USD||"0") || 25_000_000; // default for .com liquidity
+            let MIN_QV = Number(process.env.MIN_QV_USD||"0") || 25_000_000;
             const TOP_N = Number(process.env.TOP_N||"10");
             const MAX_SPREAD_BPS = Number(process.env.MAX_SPREAD_BPS||"15");
             const EXP_LCB_MIN_BPS = Number(process.env.EXP_LCB_MIN_BPS||"2");
@@ -138,12 +143,11 @@ jobs:
               log("health status", r?.status||"ERR");
             }catch(e){ log("health error", e?.message||e); }
 
-            // ---------- Ask proxy to re-pick a reachable upstream for this GH POP ----------
+            // ---------- Ask proxy to re-pick upstream for this GH POP ----------
             try { await fetchWithTimeout(`${BASE}/api/v3/ping?rebase=1`, {}, 6000); } catch {}
 
-            // ---------- API helpers via proxy ----------
+            // ---------- API via proxy ----------
             async function pickBaseAnd24hr(){
-              // Try once; if blocked, rebase and retry once
               let r = await fetchWithTimeout(`${BASE}/api/v3/ticker/24hr`,{},10000);
               if(!r.ok){
                 try { await fetchWithTimeout(`${BASE}/api/v3/ping?rebase=1`, {}, 6000); } catch {}
@@ -196,7 +200,7 @@ jobs:
 
               if(!todOK){ reason="tod_gate"; throw new Error("time-of-day gate"); }
 
-              // Universe (liquidity-first) with dynamic MIN_QV fallback (handles .us fallback at proxy)
+              // Universe with dynamic MIN_QV fallback (handles .us fallback at proxy)
               const QUOTES = ["USDT","FDUSD","BUSD","TUSD","USDC","USD"];
               const split=(sym)=>{ for(const q of QUOTES){ if(sym.endsWith(q)) return { base: sym.slice(0,-q.length), quote:q }; } return null; };
               function buildUniverse(minQV){
@@ -212,14 +216,8 @@ jobs:
               }
               let lowered=false, minTried=MIN_QV;
               let universe = buildUniverse(MIN_QV);
-              if(!universe.length){
-                MIN_QV = 3_000_000; lowered=true;
-                universe = buildUniverse(MIN_QV);
-              }
-              if(!universe.length){
-                MIN_QV = 1_000_000; lowered=true;
-                universe = buildUniverse(MIN_QV);
-              }
+              if(!universe.length){ MIN_QV = 3_000_000; lowered=true; universe = buildUniverse(MIN_QV); }
+              if(!universe.length){ MIN_QV = 1_000_000; lowered=true; universe = buildUniverse(MIN_QV); }
               if(!universe.length){ reason="no_universe"; throw new Error("no liquid symbols"); }
               if(lowered) metaExtra.min_qv_lowered_from = minTried;
 
@@ -332,7 +330,6 @@ jobs:
               // Analyze one symbol
               async function analyze(c){
                 try{
-                  // cooldown
                   const lastTs=state.cooldown?.[c.base]; const now=Date.now();
                   if(lastTs && (now-lastTs) < COOLDOWN_MS) return null;
 
@@ -341,7 +338,6 @@ jobs:
                   const spreadBps=Math.round(((book.ask-book.bid)/mid)*10000);
                   if(spreadBps>MAX_SPREAD_BPS) return null;
 
-                  // Klines
                   const k5 = await fetchK(c.symbol,"5m",K5M); if(!k5||k5.length<Math.max(EMA_SLOW+5,ATR_P+5)) return null;
                   const k15= await fetchK(c.symbol,"15m",K15M);
                   const k1h= await fetchK(c.symbol,"1h",K1H);
