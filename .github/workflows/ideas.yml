@@ -1,4 +1,4 @@
-name: Ideas Pusher (MEXC strict→fallback 1–3)
+name: Ideas Pusher (MEXC strict→fallback 1–3, adaptive SL + flexible EV)
 
 on:
   workflow_dispatch:
@@ -48,7 +48,6 @@ jobs:
 
             // ---------------- Utils ----------------
             const clamp=(x,a,b)=>Math.max(a,Math.min(b,x));
-            const tanh=(x)=>Math.tanh(x);
             const sigmoid=(x)=>1/(1+Math.exp(-x));
             const ema=(arr,p)=>{ if(arr.length<p) return null; const k=2/(p+1); let e=arr.slice(0,p).reduce((a,b)=>a+b,0)/p; for(let i=p;i<arr.length;i++) e=arr[i]*k+e*(1-k); return e; };
             const rsi=(cl,p=14)=>{ if(cl.length<=p) return null; let g=0,l=0; for(let i=1;i<=p;i++){ const d=cl[i]-cl[i-1]; g+=Math.max(d,0); l+=Math.max(-d,0); } let ag=g/p, al=l/p; for(let i=p+1;i<cl.length;i++){ const d=cl[i]-cl[i-1]; ag=(ag*(p-1)+Math.max(d,0))/p; al=(al*(p-1)+Math.max(-d,0))/p; } const rs=al===0?100:ag/al; return 100-100/(1+rs); };
@@ -59,7 +58,7 @@ jobs:
             const log=(...a)=>console.log("[gha]",...a);
 
             // ---------------- Net ----------------
-            const UA="gh-actions-ideas-mexc-strict-fallback/1.0 (+https://github.com/)";
+            const UA="gh-actions-ideas-mexc-strict-fallback/1.1 (+https://github.com/)";
             async function fetchWithTimeout(url,opts={},ms=12000){
               const ac=new AbortController(); const t=setTimeout(()=>ac.abort(),ms);
               try{ return await fetch(url,{...opts,signal:ac.signal,headers:{ "User-Agent":UA, ...(opts.headers||{}) }}); }
@@ -76,59 +75,58 @@ jobs:
             // ---------------- Config (no repo vars required) ----------------
             const PUSH_URL = process.env.WORKER_PUSH_URL;
             const PUSH_TOKEN= process.env.PUSH_TOKEN;
-
             const IS_MANUAL = (process.env.GITHUB_EVENT_NAME||"").toLowerCase()==="workflow_dispatch";
 
-            // Exchange defaults (MEXC)
+            // Exchange
             const MEXC_BASES=["https://api.mexc.com","https://www.mexc.com"];
 
-            // 2.1 strict defaults
-            const MIN_QV = 30_000_000; // 24h quote volume
+            // Strict defaults
+            const MIN_QV = 30_000_000;
             const MAX_SPREAD_BPS = 12;
-            const EXP_LCB_MIN_BPS = 5;
+            const EXP_LCB_MIN_BPS = 5;   // base floor (before context)
             const COST_BPS = 10;
 
-            // Fallback (always 1–3) targets if strict=0
+            // Fallback goals
             const MIN_IDEAS = 1;
             const MAX_IDEAS_TARGET = 3;
 
             // Selection sizes (strict)
-            const TOP_N = 10;             // core
-            const EXTRA_IDEAS_MAX = 3;    // overflow
+            const TOP_N = 10;
+            const EXTRA_IDEAS_MAX = 3;
 
-            // Signal notional for slip/fill (executor may trade larger)
+            // Slip/fill modeling size
             const SIGNAL_NOTIONAL = 300;
 
             // Depth/OBI
             const DEPTH_LIMIT = 50;
             const OBI_TOPN = 12;
 
-            // Time-of-day gate off by default; manual runs ignore gates
+            // ToD off; manual ignores gates
             const S_H=null, E_H=null;
             const nowH = new Date().getUTCHours();
             const todOK = (S_H==null || E_H==null) ? true : (S_H<=E_H ? (nowH>=S_H && nowH<=E_H) : (nowH>=S_H || nowH<=E_H));
             const TOD_OK = IS_MANUAL ? true : todOK;
 
-            // Cooldown/DD (graceful if no Gist)
+            // Cooldown / DD
             const COOLDOWN_MS = 3*60*60*1000;
             const DD_24H_LIMIT_BPS=-150, DD_PEAK_LIMIT_BPS=-300;
             const WILSON_Z=1.34;
 
-            // ATR targets
+            // ATR targets (raised SL bounds)
             const TP_ATR_MIN=0.40, TP_ATR_MAX=2.10;
-            const SL_ATR_MIN=0.28, SL_ATR_MAX=1.50;
-            const TP_TREND_BASE=1.12, SL_TREND_BASE=0.55;
-            const TP_MR_BASE=0.62,  SL_MR_BASE=0.54;
-            const TP_BO_BASE=1.30,  SL_BO_BASE=0.55;
+            const SL_ATR_MIN=0.35, SL_ATR_MAX=1.70;   // raised
+            const TP_TREND_BASE=1.12, SL_TREND_BASE=0.62; // raised base SL
+            const TP_MR_BASE=0.62,  SL_MR_BASE=0.60;
+            const TP_BO_BASE=1.30,  SL_BO_BASE=0.60;
 
-            // Kline windows
+            // Windows
             const EMA_FAST=21, EMA_SLOW=50, ADX_P=14;
             const K1M=240, K5M=120, K15M=96, K1H=96;
             const VWAP_5M_WIN=36;
 
             const STABLES=new Set(["USDT","USDC","USD","BUSD","FDUSD","TUSD","DAI","USDP","PAX","USTC","USDE","USDD"]);
 
-            // ---------------- Worker health + heartbeat ----------------
+            // ---------------- Health + heartbeat ----------------
             const HEALTH_URL=(()=>{ try{ const u=new URL(PUSH_URL); return `${u.origin}${u.pathname.replace(/\/signals\/push(\?.*)?$/,"/health")}`;}catch{return PUSH_URL.replace(/\/signals\/push(\?.*)?$/,"/health");}})();
             try{
               const r=await fetchWithTimeout(HEALTH_URL,{ headers:{ "Authorization":`Bearer ${PUSH_TOKEN}` }},5000);
@@ -176,7 +174,7 @@ jobs:
             // ---------------- Gist (optional) ----------------
             async function loadState(){
               const token=process.env.GIST_TOKEN, id=process.env.GIST_ID;
-              const init={ v:"strict-fb-1-3", cooldown:{}, pending:[], equity:[] };
+              const init={ v:"strict-fb-1-3-sl-ev", cooldown:{}, pending:[], equity:[] };
               if(!token||!id) return { state:init, persist:null };
               try{
                 const r=await fetchWithTimeout(`https://api.github.com/gists/${id}`,{ headers:{Authorization:`Bearer ${token}`,"Accept":"application/vnd.github+json","User-Agent":UA}});
@@ -239,24 +237,21 @@ jobs:
             try{
               if(!TOD_OK) { reason="tod_gate"; throw new Error("time-of-day gate"); }
 
-              // State / DD
               const { state, persist } = await loadState();
               try{ await evalPending(state); }catch{}
               const { pnl24_bps, peak_dd_bps } = equityStats(state.equity);
               const throttle = (pnl24_bps<=DD_24H_LIMIT_BPS) || (peak_dd_bps<=DD_PEAK_LIMIT_BPS);
 
-              // Universe + books
               const ALL24 = await getJSON(api("/api/v3/ticker/24hr"), 10000, 2) || await fetchAll24hr();
               const booksRaw=await getJSON(api("/api/v3/ticker/bookTicker"),10000,2) || [];
               const bookMap=new Map(booksRaw.map(b=>[b.symbol,{ bid:+b.bidPrice, ask:+b.askPrice }]));
 
-              // Liquidity-first universe
               const QUOTES=["USDT","USDC","USD"];
               const split=(sym)=>{ for(const q of QUOTES){ if(sym.endsWith(q)) return { base: sym.slice(0,-q.length), quote:q }; } return null; };
               const all=[];
               for(const t of ALL24||[]){
                 const sym=t.symbol||t.s; if(!sym) continue; const sq=split(sym); if(!sq) continue;
-                const base=sq.base; if(STABLES.has(base.toUpperCase())) continue;
+                const base=sq.base; if(["USDT","USDC","USD","BUSD","FDUSD","TUSD","DAI","USDP","PAX","USTC","USDE","USDD"].includes(base.toUpperCase())) continue;
                 const qv=+(t.quoteVolume||t.q||0); if(!(qv>0)) continue;
                 all.push({ symbol:sym, base, quote:sq.quote, qv });
               }
@@ -265,7 +260,6 @@ jobs:
               console.log(`[gha] universe: ${universe.length}`);
               if(!universe.length) { reason="no_universe"; throw new Error("no liquid symbols"); }
 
-              // Regime (BTC/ETH)
               const BTC="BTCUSDT", ETH="ETHUSDT";
               const kBTC15=await fetchK(BTC,"15m",K15M), kETH15=await fetchK(ETH,"15m",K15M);
               const kBTC1H=await fetchK(BTC,"1h",K1H), kETH1H=await fetchK(ETH,"1h",K1H);
@@ -278,10 +272,9 @@ jobs:
               })();
               log("regime", regime.regime, "adxAvg", regime.adxAvg?.toFixed?.(1)||"");
 
-              // Liquidity percentile
               const liqPct=new Map(); for(let i=0;i<universe.length;i++){ liqPct.set(universe[i].symbol,(universe.length===1)?1:1 - i/(universe.length-1)); }
 
-              // -------- Prefilter (strict path) --------
+              // -------- Prefilter (strict) --------
               const pre=[]; const B=8;
               for(let i=0;i<universe.length;i+=B){
                 const part=await Promise.all(universe.slice(i,i+B).map(async c=>{
@@ -299,7 +292,9 @@ jobs:
                     const k1h= await fetchK(c.symbol,"1h",K1H); if(!k1h) return null;
 
                     const h5=k5.map(x=>+x[2]), l5=k5.map(x=>+x[3]), c5=k5.map(x=>+x[4]), v5=k5.map(x=>+x[5]);
-                    const c15=k15.map(x=>+x[4]); const c1h=k1h.map(x=>+x[4]);
+                    const c15=k15.map(x=>+x[4]), h15=k15.map(x=>+x[2]), l15=k15.map(x=>+x[3]);
+                    const c1h=k1h.map(x=>+x[4]);
+
                     const em21_5=ema(c5,EMA_FAST), em50_5=ema(c5,EMA_SLOW);
                     const em21_15=ema(c15,EMA_FAST), em50_15=ema(c15,EMA_SLOW);
                     const { adx:adx5, atr:atr5 } = computeADX_ATR(h5,l5,c5,ADX_P)||{}; if(!(adx5&&atr5)) return null;
@@ -308,44 +303,47 @@ jobs:
                     const roc5=(c5.at(-1)/c5.at(-2)-1), roc15=(c15.at(-1)/c15.at(-4)-1), roc1h=(c1h.at(-1)/c1h.at(-2)-1);
                     const vwap5=vwapAnchored(h5,l5,c5,v5,VWAP_5M_WIN);
                     const z_vwap=(c5.at(-1)-vwap5)/(atr5||1);
-                    const vwapSlope=(vwapAnchored(h5,l5,c5,v5,VWAP_5M_WIN)-vwapAnchored(h5.slice(0,-3),l5.slice(0,-3),c5.slice(0,-3),v5.slice(0,-3),VWAP_5M_WIN))/(c5.at(-1)||1);
-                    const rsi14=rsi(c5,14)||50;
+
+                    // Squeeze proxy
+                    const slice=c5.slice(-20); const bbWidth= 2*std(slice)/(c5.at(-1)||1);
+                    const kelWidth= (atr5/(c5.at(-1)||1))*2;
+                    const squeezeRatio = kelWidth>0? bbWidth/kelWidth : 1;
+
+                    // 15m Donchian(10) levels (for structure floor later)
+                    let donchHigh10=null, donchLow10=null;
+                    if(h15.length>=10 && l15.length>=10){
+                      donchHigh10=Math.max(...h15.slice(-10));
+                      donchLow10=Math.min(...l15.slice(-10));
+                    }
 
                     const trendAlign5=(c5.at(-1)>em21_5 && em21_5>em50_5) ? 1 : (c5.at(-1)<em21_5 && em21_5<em50_5) ? -1 : 0;
                     const trendAlign15=(c15.at(-1)>em21_15 && em21_15>em50_15)?1:(c15.at(-1)<em21_15 && em21_15<em50_15)?-1:0;
-                    const sTrend = 0.5*trendAlign5 + 0.35*trendAlign15 + 0.15*Math.sign(roc1h) + 0.15*Math.sign(vwapSlope);
+                    const sTrend = 0.5*trendAlign5 + 0.35*trendAlign15 + 0.15*Math.sign(roc1h);
                     const p_up_trend = sigmoid(1.2*sTrend + 0.03*(adx5-20) + 0.35*Math.sign(regime.dir));
 
-                    const squeezeRatio=( ()=>{
-                      if(c5.length<21) return 1;
-                      const slice=c5.slice(-20); const bbWidth=2*std(slice)/(c5.at(-1)||1);
-                      const kelWidth=(atr5/(c5.at(-1)||1))*2; return kelWidth>0? bbWidth/kelWidth : 1;
-                    })();
-                    const sMR = -Math.tanh(z_vwap)*0.9 + (-Math.sign(rsi14-50))*0.2 + (1-clamp((adx5-16)/14,0,1))*0.3 + (1/Math.max(0.5,squeezeRatio))*0.1;
+                    const sMR = -Math.tanh(z_vwap)*0.9 + (1-clamp((adx5-16)/14,0,1))*0.3 + (1/Math.max(0.5,squeezeRatio))*0.1;
                     const p_up_mr = sigmoid(sMR);
 
-                    let pHigh=null,pLow=null; if(k15.length>40){ const highs=k15.map(x=>+x[2]), lows=k15.map(x=>+x[3]); const w=40; pHigh=Math.max(...highs.slice(-w)); pLow=Math.min(...lows.slice(-w)); }
-                    const boUp=pHigh? (c5.at(-1)>pHigh):false, boDn=pLow? (c5.at(-1)<pLow):false;
-                    const boBase = (boUp?+1:boDn?-1:Math.sign(0.6*roc5+0.4*roc15)) * (0.6+0.4*clamp((adx5-16)/14,0,1)) * (1+0.3*clamp((1.15 - squeezeRatio)/0.45, 0, 1));
+                    const boBase = Math.sign(0.6*roc5+0.4*roc15) * (0.6+0.4*clamp((adx5-16)/14,0,1)) * (1+0.3*clamp((1.15 - squeezeRatio)/0.45,0,1));
                     const p_up_bo = sigmoid(0.9*boBase);
 
                     const regVec = [(regime.regime==="trend"?1.0:0.6),(regime.regime==="trend"?0.6:1.0),0.8];
                     const eReg=regVec.map(x=>Math.exp(x)); const sReg=eReg.reduce((a,b)=>a+b,0)||1; const wT=eReg[0]/sReg, wM=eReg[1]/sReg, wB=eReg[2]/sReg;
+
                     const pLong0=clamp(wT*p_up_trend + wM*p_up_mr + wB*p_up_bo, 0.05, 0.95);
                     const pShort0=clamp(wT*(1-p_up_trend) + wM*(1-p_up_mr) + wB*(1-p_up_bo), 0.05, 0.95);
 
-                    const styleLong = trendAlign5>0||trendAlign15>0?"trend":(boUp?"breakout":"mr");
-                    const styleShort= trendAlign5<0||trendAlign15<0?"trend":(boDn?"breakout":"mr");
+                    const styleLong = trendAlign5>0||trendAlign15>0?"trend": "mr";
+                    const styleShort= trendAlign5<0||trendAlign15<0?"trend": "mr";
 
-                    return { c, spreadBps, atr_bps:Math.round((atr5/(c5.at(-1)||1))*10000), adx5,
-                             pLong0, pShort0, styleLong, styleShort, z_vwap, k5, c5 };
+                    return { c, spreadBps, atr_bps, adx5, pLong0, pShort0, styleLong, styleShort, z_vwap, squeezeRatio, c5, donchLow10, donchHigh10 };
                   }catch{ return null; }
                 }));
                 for(const x of part) if(x) pre.push(x);
               }
               console.log(`[gha] pre candidates: ${pre.length}`);
 
-              // -------- Refine with depth (strict) --------
+              // -------- Refine with depth (strict + adaptive SL + flexible EV) --------
               pre.sort((a,b)=> Math.max(b.pLong0,b.pShort0) - Math.max(a.pLong0,a.pShort0));
               const REFINE_M = Math.min(96, pre.length);
               const refined=[];
@@ -353,6 +351,7 @@ jobs:
                 const p=pre[i]; const c=p.c;
                 const bk=bookMap.get(c.symbol); if(!bk?.bid||!bk?.ask) continue;
                 const mid=(bk.bid+bk.ask)/2;
+                const last=p.c5.at(-1)||mid;
 
                 const depth=await fetchDepth(c.symbol);
                 let obi=0, slipL=p.spreadBps/2, slipS=p.spreadBps/2, fillL=0, fillS=0;
@@ -371,44 +370,72 @@ jobs:
                   fillL = Math.min(1, buy.filledUSD/Math.max(1,SIGNAL_NOTIONAL));
                   fillS = Math.min(1, sell.filledUSD/Math.max(1,SIGNAL_NOTIONAL));
                 }
-                const obiAdj = clamp(obi*0.08, -0.06, +0.06);
-                let pLong=p.pLong0, pShort=p.pShort0;
-                pLong = clamp(pLong + (obi>0?+obiAdj:-obiAdj), 0.05, 0.95);
-                pShort= clamp(pShort+ (obi<0?+(-obiAdj):+(obiAdj))*(-1), 0.05, 0.95);
-
                 const costLong=COST_BPS + Math.max(Math.round(p.spreadBps/2), slipL);
                 const costShort=COST_BPS + Math.max(Math.round(p.spreadBps/2), slipS);
 
-                // ATR targets (strict)
-                const tpATR_L = (p.styleLong==="trend"? TP_TREND_BASE : p.styleLong==="breakout"? TP_BO_BASE : TP_MR_BASE) * p.atr_bps;
-                const slATR_L = (p.styleLong==="trend"? SL_TREND_BASE : p.styleLong==="breakout"? SL_BO_BASE : SL_MR_BASE) * p.atr_bps;
-                const tpATR_S = (p.styleShort==="trend"? TP_TREND_BASE : p.styleShort==="breakout"? TP_BO_BASE : TP_MR_BASE) * p.atr_bps;
-                const slATR_S = (p.styleShort==="trend"? SL_TREND_BASE : p.styleShort==="breakout"? SL_BO_BASE : SL_MR_BASE) * p.atr_bps;
+                // Base TP/SL from ATR (style-aware)
+                let tp_bps_L = Math.round(clamp((p.styleLong==="trend"? TP_TREND_BASE : p.styleLong==="mr"? TP_MR_BASE : TP_BO_BASE) * p.atr_bps, TP_ATR_MIN*p.atr_bps, TP_ATR_MAX*p.atr_bps));
+                let sl_bps_L = Math.round(clamp((p.styleLong==="trend"? SL_TREND_BASE : p.styleLong==="mr"? SL_MR_BASE : SL_BO_BASE) * p.atr_bps, SL_ATR_MIN*p.atr_bps, SL_ATR_MAX*p.atr_bps));
 
-                const tp_bps_L = Math.round(clamp(tpATR_L, TP_ATR_MIN*p.atr_bps, TP_ATR_MAX*p.atr_bps));
-                const sl_bps_L = Math.round(clamp(slATR_L, SL_ATR_MIN*p.atr_bps, SL_ATR_MAX*p.atr_bps));
-                const tp_bps_S = Math.round(clamp(tpATR_S, TP_ATR_MIN*p.atr_bps, TP_ATR_MAX*p.atr_bps));
-                const sl_bps_S = Math.round(clamp(slATR_S, SL_ATR_MIN*p.atr_bps, SL_ATR_MAX*p.atr_bps));
+                let tp_bps_S = Math.round(clamp((p.styleShort==="trend"? TP_TREND_BASE : p.styleShort==="mr"? TP_MR_BASE : TP_BO_BASE) * p.atr_bps, TP_ATR_MIN*p.atr_bps, TP_ATR_MAX*p.atr_bps));
+                let sl_bps_S = Math.round(clamp((p.styleShort==="trend"? SL_TREND_BASE : p.styleShort==="mr"? SL_MR_BASE : SL_BO_BASE) * p.atr_bps, SL_ATR_MIN*p.atr_bps, SL_ATR_MAX*p.atr_bps));
 
+                // Structure floors (15m Donchian(10) + 0.15*ATR)
+                if(p.donchLow10!=null){ const structL = Math.max(0, Math.round(((last - p.donchLow10)/last)*10000)) + Math.round(0.15*p.atr_bps); sl_bps_L = Math.max(sl_bps_L, structL); }
+                if(p.donchHigh10!=null){ const structS = Math.max(0, Math.round(((p.donchHigh10 - last)/last)*10000)) + Math.round(0.15*p.atr_bps); sl_bps_S = Math.max(sl_bps_S, structS); }
+
+                // Friction buffer (push SL beyond noise)
+                sl_bps_L = Math.max(sl_bps_L, costLong + 2);
+                sl_bps_S = Math.max(sl_bps_S, costShort + 2);
+
+                // Regime-based widening/tightening
+                const widenChop = (p.adx5<20 || p.squeezeRatio>0.60) ? 1.25 : 1.0;
+                const tightenStrongTrendLong = (p.adx5>28 && p.styleLong==="trend") ? 0.95 : 1.0;
+                const tightenStrongTrendShort= (p.adx5>28 && p.styleShort==="trend")? 0.95 : 1.0;
+                sl_bps_L = Math.round(clamp(sl_bps_L * widenChop * tightenStrongTrendLong, SL_ATR_MIN*p.atr_bps, SL_ATR_MAX*p.atr_bps));
+                sl_bps_S = Math.round(clamp(sl_bps_S * widenChop * tightenStrongTrendShort, SL_ATR_MIN*p.atr_bps, SL_ATR_MAX*p.atr_bps));
+
+                // OBI micro nudge: against side widens SL 10%
+                if(obi < -0.15) sl_bps_L = Math.round(clamp(sl_bps_L*1.10, SL_ATR_MIN*p.atr_bps, SL_ATR_MAX*p.atr_bps));
+                if(obi > +0.15) sl_bps_S = Math.round(clamp(sl_bps_S*1.10, SL_ATR_MIN*p.atr_bps, SL_ATR_MAX*p.atr_bps));
+
+                // Confidence n
                 const liq = liqPct.get(c.symbol)||0.5;
                 const adxF=clamp((p.adx5-16)/14,0,1);
-                let nConf = 46 + 26*adxF + 22*liq + 10*Math.abs(obi) - 8*Math.abs(pLong-pShort);
+                let nConf = 46 + 26*adxF + 22*liq + 10*Math.abs(obi) - 8*Math.abs(p.pLong0-p.pShort0);
                 nConf = Math.round(clamp(nConf, 32, 132));
 
-                const pL_lcb=wilsonLCB(pLong, nConf, WILSON_Z);
-                const pS_lcb=wilsonLCB(pShort, nConf, WILSON_Z);
+                const pL_lcb=wilsonLCB(p.pLong0, nConf, WILSON_Z);
+                const pS_lcb=wilsonLCB(p.pShort0, nConf, WILSON_Z);
 
+                // EVs
                 const expL = Math.round(pL_lcb*tp_bps_L - (1-pL_lcb)*sl_bps_L - costLong);
                 const expS = Math.round(pS_lcb*tp_bps_S - (1-pS_lcb)*sl_bps_S - costShort);
 
-                let side="long", p_win=pLong, p_lcb=pL_lcb, tp_bps=tp_bps_L, sl_bps=sl_bps_L, cost_bps=costLong, style=p.styleLong;
-                if(expS>expL){ side="short"; p_win=pShort; p_lcb=pS_lcb; tp_bps=tp_bps_S; sl_bps=sl_bps_S; cost_bps=costShort; style=p.styleShort; }
+                // Choose side
+                let side="long", p_win=p.pLong0, p_lcb=pL_lcb, tp_bps=tp_bps_L, sl_bps=sl_bps_L, cost_bps=costLong, style=p.styleLong, fillProb=0;
+                fillProb = side==="long"? (fillProb||0) : (fillProb||0); // placeholder; we set below based on side
+                if(expS>expL){ side="short"; p_win=p.pShort0; p_lcb=pS_lcb; tp_bps=tp_bps_S; sl_bps=sl_bps_S; cost_bps=costShort; style=p.styleShort; }
+                const fpL = (fillL||0), fpS = (fillS||0); fillProb = side==="long"? fpL : fpS;
+
+                // Flexible EV gate (context-aware)
+                const hardFloor = 2;  // never below this
+                let dyn = EXP_LCB_MIN_BPS
+                          + (1 - liq)*2
+                          + Math.max(0, 12 - p.spreadBps)/12
+                          + (fillProb < 0.70 ? 8*(0.70 - fillProb) : 0)
+                          + (regime.regime === "trend" ? -1 : +1);
+                if (liq >= 0.80 && p.spreadBps <= 6 && fillProb >= 0.85) dyn -= 1;
+                dyn = Math.max(hardFloor, Math.round(dyn));
+                const costBound = Math.round(COST_BPS * (regime.regime === "trend" ? 0.6 : 0.8));
+                const floor = Math.max(dyn, costBound);
+                const softBand = (p_lcb >= 0.60 && p.spreadBps <= 6 && fillProb >= 0.85) ? 1 : 0;
 
                 const exp_lcb_bps = Math.round(p_lcb*tp_bps - (1-p_lcb)*sl_bps - cost_bps);
-                const fillProb = side==="long"? fillL : fillS;
-                const dynFloor = Math.max(EXP_LCB_MIN_BPS, Math.round(EXP_LCB_MIN_BPS + (1-liq)*2 + Math.max(0,12-p.spreadBps)/12 + (fillProb<0.70? (8*(0.70-fillProb)) : 0)));
-                if(exp_lcb_bps <= dynFloor) continue;
-                if(fillProb < 0.65) continue;
+                if (exp_lcb_bps < floor - softBand) continue;
+
+                const minFill = (liq >= 0.80 && p.spreadBps <= 6) ? 0.60 : 0.65;
+                if (fillProb < minFill) continue;
 
                 const hold_base = (regime.regime==="trend"?760:560) + 240*adxF;
                 const hold_sec = Math.round(clamp(hold_base, 480, 2000));
@@ -431,11 +458,12 @@ jobs:
               }
               console.log(`[gha] refined: ${refined.length}`);
 
-              // -------- Strict selection (2.1) --------
+              // -------- Strict selection --------
               refined.sort((a,b)=> b.exp_lcb_bps!==a.exp_lcb_bps ? b.exp_lcb_bps-a.exp_lcb_bps
                               : b.exp_bps!==a.exp_bps ? b.exp_bps-a.exp_bps
                               : b.p_lcb!==a.p_lcb ? b.p_lcb-a.p_lcb
                               : b.qv-a.qv);
+
               const CORE_CORR_MAX=0.84, OF_CORR_MAX=0.90;
               const core=[], overflow=[];
               const rho=(a,b)=>corr(a.ret5||[],b.ret5||[]);
@@ -460,7 +488,7 @@ jobs:
               selectedFinal=[...core,...overflow];
               console.log(`[gha] selected(strict): ${selectedFinal.length}`);
 
-              // -------- Fallback Tier 1 (if strict=0) --------
+              // -------- Fallback Tier 1 (gentle relax) if strict=0 --------
               if(selectedFinal.length < MIN_IDEAS){
                 const need = Math.min(MAX_IDEAS_TARGET, Math.max(MIN_IDEAS, MIN_IDEAS));
                 const relaxed = refined.filter(x=>
@@ -481,7 +509,7 @@ jobs:
                 if(selectedFinal.length>=MIN_IDEAS){ forcedMode=true; reason = reason==="ok"?"fallback_min_ideas":reason; }
               }
 
-              // -------- Fallback Tier 2 (mega-caps) --------
+              // -------- Fallback Tier 2 (mega-caps) if still 0 --------
               if(selectedFinal.length < MIN_IDEAS){
                 const MEGA=["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","DOGEUSDT"];
                 for(const sym of MEGA){
@@ -490,11 +518,11 @@ jobs:
                   const mid=(bk.bid+bk.ask)/2; const spreadBps=Math.round(((bk.ask-bk.bid)/mid)*10000);
                   if(spreadBps>Math.max(14,MAX_SPREAD_BPS+2)) continue;
                   const k5=await fetchK(sym,"5m",K5M); if(!k5) continue;
-                  const h5=k5.map(x=>+x[2]), l5=k5.map(x=>+x[3]), c5=k5.map(x=>+x[4]), v5=k5.map(x=>+x[5]);
+                  const h5=k5.map(x=>+x[2]), l5=k5.map(x=>+x[3]), c5=k5.map(x=>+x[4]);
                   const { adx:adx5, atr:atr5 } = computeADX_ATR(h5,l5,c5,ADX_P)||{}; if(!(adx5&&atr5)) continue;
                   const atr_bps=Math.round((atr5/(c5.at(-1)||1))*10000);
                   const em21=ema(c5,EMA_FAST), em50=ema(c5,EMA_SLOW);
-                  const trend=(c5.at(-1)>em21 && em21>em50) ? "long" : (c5.at(-1)<em21 && em21<em50) ? "short" : (regime.dir>=0?"long":"short");
+                  const trend=(c5.at(-1)>em21 && em21>em50) ? "long" : (c5.at(-1)<em21 && em21<em50) ? "short" : "long";
                   const p_win=0.52, p_lcb=0.50;
                   const tp_bps=Math.round(clamp(1.0*atr_bps, TP_ATR_MIN*atr_bps, TP_ATR_MAX*atr_bps));
                   const sl_bps=Math.round(clamp(0.7*atr_bps, SL_ATR_MIN*atr_bps, SL_ATR_MAX*atr_bps));
@@ -540,7 +568,6 @@ jobs:
                 quality_tag: x.forced ? "forced_low_conf" : "strict"
               }));
 
-              // Save cooldown + pending
               try{
                 const nowMs=Date.now(); const ideasTs=new Date(nowMs).toISOString();
                 for(const p of picks){
@@ -569,7 +596,6 @@ jobs:
               }
 
             }catch(e){
-              // Minimal POST on error
               const payload={ ts:new Date().toISOString(), mode:"normal", source:"external_pusher",
                 meta:{ origin:"github_actions", reason: reason==="ok"?"data_error":reason, error:(e?.message||String(e)).slice(0,240) },
                 top_n:0, ideas:[] };
@@ -592,7 +618,7 @@ jobs:
             now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
             payload='{"ts":"'"$now"'","mode":"normal","source":"external_pusher","meta":{"origin":"github_actions","reason":"fallback_node_error"},"top_n":0,"ideas":[]}'
             http_code=$(curl -sS -o /tmp/push_resp.txt -w "%{http_code}" -X POST \
-              -H "Content-Type: application/json" -H "Authorization: Bearer ${PUSH_TOKEN}" \
+              -H "Content-Type": "application/json" -H "Authorization": "Bearer ${PUSH_TOKEN}" \
               --data "${payload}" --max-time 12 "${WORKER_PUSH_URL}" || true)
             body="$(head -c 400 /tmp/push_resp.txt || true)"
             echo "[gha] push status ${http_code} ${body}"
