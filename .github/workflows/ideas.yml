@@ -1,4 +1,4 @@
-name: Send Trade Ideas ELITE (multi-expert, microstructure, auto-RRR, EV LCB, 3h cooldown)
+name: Send Trade Ideas ELITE (proxy-first, always-push)
 
 on:
   schedule:
@@ -12,6 +12,8 @@ jobs:
     concurrency:
       group: send-trade-ideas-elite
       cancel-in-progress: true
+    # If your repo Variables live in a specific Environment, uncomment:
+    # environment: production
 
     steps:
       - uses: actions/checkout@v4
@@ -19,43 +21,35 @@ jobs:
         with:
           node-version: 20
 
-      # Preflight is non-blocking so market hiccups won't fail the run
-      - name: Preflight: Cloudflare proxy connectivity (non-blocking)
-        continue-on-error: true
+      # Preflight to ensure the CF proxy is set and reachable (fast failure on misconfig)
+      - name: Verify Cloudflare proxy connectivity
         run: |
+          set -euo pipefail
           echo "BINANCE_BASE=${{ vars.BINANCE_BASE }}"
-          if [ -n "${{ vars.BINANCE_BASE }}" ]; then
-            echo "[gha] Checking CF proxy..."
-            curl -fsS --max-time 6 "${{ vars.BINANCE_BASE }}/api/v3/ping?nocache=1" >/dev/null \
-              && echo "[gha] CF ping ok" \
-              || echo "[gha] WARN: CF ping failed (continuing)"
-            curl -fsS --max-time 6 "${{ vars.BINANCE_BASE }}/api/v3/ticker/24hr?symbol=BTCUSDT&nocache=1" | head -c 200 || true
-          else
-            echo "[gha] BINANCE_BASE not set; proceeding with direct exchange endpoints."
-          fi
+          test -n "${{ vars.BINANCE_BASE }}" || (echo "ERROR: Set repo Variable BINANCE_BASE to your Cloudflare Worker URL (e.g., https://binance-proxy.YOUR.workers.dev)" && exit 1)
+          curl -fsS "${{ vars.BINANCE_BASE }}/api/v3/ping?nocache=1" >/dev/null
+          curl -fsS "${{ vars.BINANCE_BASE }}/api/v3/ticker/24hr?symbol=BTCUSDT&nocache=1" | head -c 200
 
       - name: Push Ideas (ELITE)
         env:
           # Required (ingestion Worker)
-          WORKER_PUSH_URL: ${{ secrets.WORKER_PUSH_URL }}
+          WORKER_PUSH_URL: ${{ secrets.WORKER_PUSH_URL }}   # e.g., https://exchange-server.YOUR.workers.dev/signals/push
           PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
 
-          # Use the CF proxy (repo → Settings → Variables)
-          BINANCE_BASE: ${{ vars.BINANCE_BASE }}  # e.g., https://binance-proxy.abcd.workers.dev
-          # Optional: allow .us fallback only if you explicitly want it (default 0 = disabled)
-          ALLOW_US: ${{ vars.ALLOW_US }}
+          # Force all market data through your CF proxy (REQUIRED)
+          BINANCE_BASE: ${{ vars.BINANCE_BASE }}            # e.g., https://binance-proxy.abdo-xchg-61892.workers.dev
 
-          # Recommended (tuning)
-          FEES_BPS: ${{ vars.FEES_BPS }}           # e.g., 12–20 (spot), 4 (futures)
-          NOTIONAL_USD: ${{ vars.NOTIONAL_USD }}   # e.g., 150–200
-          MIN_QV_USD: ${{ vars.MIN_QV_USD }}       # e.g., 20_000_000–40_000_000 for .com via proxy
-          TOP_N: ${{ vars.TOP_N }}                 # optional cap (default 10)
+          # Optional tuning (repo Variables; sensible defaults below)
+          FEES_BPS: ${{ vars.FEES_BPS }}
+          NOTIONAL_USD: ${{ vars.NOTIONAL_USD }}
+          MIN_QV_USD: ${{ vars.MIN_QV_USD }}
+          TOP_N: ${{ vars.TOP_N }}
           MAX_SPREAD_BPS: ${{ vars.MAX_SPREAD_BPS }}
           EXP_LCB_MIN_BPS: ${{ vars.EXP_LCB_MIN_BPS }}
           ACTIVE_UTC_START: ${{ vars.ACTIVE_UTC_START }}
           ACTIVE_UTC_END: ${{ vars.ACTIVE_UTC_END }}
 
-          # Optional state (DD throttle + pending eval)
+          # Optional state for DD throttle + pending eval
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
 
@@ -103,14 +97,12 @@ jobs:
             const DD_24H_LIMIT_BPS=-150, DD_PEAK_LIMIT_BPS=-300;
             const WILSON_Z=1.28;
 
-            // Auto-RRR bounds (ATR multiples)
             const TP_ATR_MIN=0.40, TP_ATR_MAX=2.00;
             const SL_ATR_MIN=0.30, SL_ATR_MAX=1.50;
             const TP_TREND_BASE=1.08, SL_TREND_BASE=0.56;
             const TP_MR_BASE=0.60,  SL_MR_BASE=0.55;
             const TP_BO_BASE=1.25,  SL_BO_BASE=0.55;
 
-            // Time-of-day gating
             const S_H = process.env.ACTIVE_UTC_START? Number(process.env.ACTIVE_UTC_START): null;
             const E_H = process.env.ACTIVE_UTC_END?   Number(process.env.ACTIVE_UTC_END):   null;
             const nowH = new Date().getUTCHours();
@@ -119,7 +111,7 @@ jobs:
             const STABLES=new Set(["USDT","BUSD","USDC","TUSD","FDUSD","DAI","USDP","PAX","USTC","USD"]);
 
             // ---------- Net ----------
-            const UA="gh-actions-ideas-elite/1.1 (+https://github.com/)";
+            const UA="gh-actions-ideas-elite/1.2 (+https://github.com/)";
             async function fetchWithTimeout(url,opts={},ms=12000){ const ac=new AbortController(); const t=setTimeout(()=>ac.abort(),ms); try{ return await fetch(url,{...opts,signal:ac.signal,headers:{"User-Agent":UA,...(opts.headers||{})}});} finally{ clearTimeout(t);} }
             async function getJSON(url,ms=12000){ const r=await fetchWithTimeout(url,{},ms); if(!r?.ok) return null; try{ return await r.json(); }catch{return null;} }
 
@@ -128,38 +120,25 @@ jobs:
             if(!PUSH_URL||!PUSH_TOKEN){ console.error("[gha] Missing WORKER_PUSH_URL or PUSH_TOKEN"); process.exit(1); }
             const HEALTH_URL=(()=>{ try{ const u=new URL(PUSH_URL); return `${u.origin}${u.pathname.replace(/\/signals\/push(\?.*)?$/,"/health")}`;}catch{return PUSH_URL.replace(/\/signals\/push(\?.*)?$/,"/health");}})();
 
-            // Health ping to ingestion Worker (guaranteed tail line early)
+            // Mandatory: CF proxy base
+            const PROXY_BASE = process.env.BINANCE_BASE || "";
+            if(!PROXY_BASE){ console.error("[gha] Missing BINANCE_BASE (must be your Cloudflare proxy URL)"); process.exit(1); }
+
+            // ---------- guaranteed call to Worker (health) ----------
             log("health GET", HEALTH_URL);
             try{
-              const r=await fetchWithTimeout(HEALTH_URL,{ headers:{ "Authorization":`Bearer ${PUSH_TOKEN}`, "User-Agent":UA }},5000);
+              const r=await fetchWithTimeout(HEALTH_URL,{ headers:{ "Authorization":`Bearer ${PUSH_TOKEN}`, "User-Agent":UA }},6000);
               log("health status", r?.status||"ERR");
             }catch(e){
               log("health error", e?.message||e);
             }
 
-            // ---------- Exchange base selection ----------
-            // IMPORTANT: If BINANCE_BASE is set (your CF proxy), we ONLY use it. No fallback to binance.us.
-            const allowUSFallback = (process.env.ALLOW_US||"0")==="1";
-            const baseCandidates = process.env.BINANCE_BASE
-              ? [process.env.BINANCE_BASE]
-              : [
-                  "https://api.binance.com",
-                  "https://api-gcp.binance.com",
-                  "https://api1.binance.com",
-                  "https://api2.binance.com",
-                  "https://api3.binance.com",
-                  ...(allowUSFallback?["https://api.binance.us"]:[]),
-                ];
-
-            let BASE=null, ALL24=null;
+            // ---------- Base + API helpers (proxy-first, no fallback) ----------
+            const BASE = PROXY_BASE; // force proxy usage
             async function pickBaseAnd24hr(){
-              for(const b of baseCandidates){
-                try{
-                  const r=await fetchWithTimeout(`${b}/api/v3/ticker/24hr`,{},10000);
-                  if(r.ok){ return { base:b, data: await r.json() }; }
-                }catch{}
-              }
-              throw new Error("24hr fetch failed for all bases");
+              const r = await fetchWithTimeout(`${BASE}/api/v3/ticker/24hr`,{},10000);
+              if(!r.ok) throw new Error(`24hr fetch failed via proxy (${r.status})`);
+              return { base: BASE, data: await r.json() };
             }
             const api=(path,params={})=>{ const u=new URL(path,BASE); for(const [k,v] of Object.entries(params)){ if(v!==undefined&&v!==null) u.searchParams.set(k,String(v)); } return u.toString(); };
             const fetchK=async(sym,interval,limit,startTime,endTime)=>{ try{ const r=await getJSON(api("/api/v3/klines",{symbol:sym,interval,limit,startTime,endTime})); return Array.isArray(r)?r:null; }catch{return null;} };
@@ -170,7 +149,6 @@ jobs:
               try{ const r=await fetchWithTimeout(`https://api.github.com/gists/${id}`,{ headers:{Authorization:`Bearer ${token}`,"Accept":"application/vnd.github+json","User-Agent":UA}}); if(!r.ok) return { state:init, persist:null };
                 const g=await r.json(); const c=g.files?.["state.json"]?.content; return { state: c?JSON.parse(c):init, persist:{id,token} }; }catch{ return { state:init, persist:null }; } }
             async function saveState(persist,state){ if(!persist) return; try{ await fetchWithTimeout(`https://api.github.com/gists/${persist.id}`,{ method:"PATCH", headers:{Authorization:`Bearer ${persist.token}`,"Accept":"application/vnd.github+json","Content-Type":"application/json","User-Agent":UA}, body: JSON.stringify({ files:{ "state.json":{ content: JSON.stringify(state) } } }) }); }catch{} }
-
             async function evalPending(state){
               const now=Date.now(); const keep=[];
               for(const p of state.pending||[]){
@@ -198,33 +176,30 @@ jobs:
             };
 
             // ---------- Main ----------
-            let reason="ok", metaExtra={};
+            let picks=[], reason="ok", metaExtra={};
 
             try{
-              const picked=await pickBaseAnd24hr(); BASE=picked.base; ALL24=picked.data;
-              const host=new URL(BASE).host;
-              const isUS = /binance\.us$/i.test(host);
-              if(isUS && !process.env.MIN_QV_USD) MIN_QV=3_000_000;
-              log("base", BASE, "MIN_QV", MIN_QV, "allowUSFallback", (process.env.ALLOW_US||"0"));
+              const picked=await pickBaseAnd24hr(); const ALL24=picked.data;
+              log("base", picked.base, "MIN_QV", MIN_QV);
 
               if(!todOK){ reason="tod_gate"; throw new Error("time-of-day gate"); }
 
-              // Universe (liquidity-first)
-              const QUOTES = isUS ? ["USD","USDT","USDC"] : ["USDT","FDUSD","BUSD","TUSD","USDC"];
+              // Universe build (liquidity-first)
+              const QUOTES = ["USDT","FDUSD","BUSD","TUSD","USDC","USD"];
               const split=(sym)=>{ for(const q of QUOTES){ if(sym.endsWith(q)) return { base: sym.slice(0,-q.length), quote:q }; } return null; };
               const all=[]; for(const t of ALL24){ const sym=t.symbol||""; const sq=split(sym); if(!sq) continue; const base=sq.base; if(STABLES.has(base)) continue; const qv=+(t.quoteVolume||0); if(!isFinite(qv)||qv<=0) continue; all.push({ symbol:sym, base, quote:sq.quote, qv }); }
               all.sort((a,b)=>b.qv-a.qv);
               const universe = all.filter(x=>x.qv>=MIN_QV).slice(0,60);
               if(!universe.length){ reason="no_universe"; throw new Error("no liquid symbols"); }
 
-              // Books + regime
+              // Books and regime
               const books=await getJSON(api("/api/v3/ticker/bookTicker"))||[];
               const bookMap=new Map(books.map(b=>[b.symbol,{ bid:+b.bidPrice, ask:+b.askPrice }]));
 
-              const kBTC15=await fetchK(isUS?"BTCUSD":"BTCUSDT","15m",96);
-              const kETH15=await fetchK(isUS?"ETHUSD":"ETHUSDT","15m",96);
-              const kBTC1H=await fetchK(isUS?"BTCUSD":"BTCUSDT","1h",96);
-              const kETH1H=await fetchK(isUS?"ETHUSD":"ETHUSDT","1h",96);
+              const kBTC15=await fetchK("BTCUSDT","15m",96);
+              const kETH15=await fetchK("ETHUSDT","15m",96);
+              const kBTC1H=await fetchK("BTCUSDT","1h",96);
+              const kETH1H=await fetchK("ETHUSDT","1h",96);
               const regime=(()=>{
                 const f=(k)=>{ if(!k||k.length<ADX_P+5) return null; const h=k.map(x=>+x[2]), l=k.map(x=>+x[3]), c=k.map(x=>+x[4]); const { adx }=computeADX_ATR(h,l,c,ADX_P)||{}; const roc=((c.at(-1)/c.at(-5)) - 1); return { adx:adx||0, roc }; };
                 const b=f(kBTC15)||{adx:0,roc:0}, e=f(kETH15)||{adx:0,roc:0};
@@ -240,13 +215,13 @@ jobs:
               try{ await evalPending(state); }catch{}
               const { pnl24_bps, peak_dd_bps } = equityStats(state.equity);
               const throttle = (pnl24_bps<=DD_24H_LIMIT_BPS) || (peak_dd_bps<=DD_PEAK_LIMIT_BPS);
+              const baseMax = Number.isFinite(Number(process.env.TOP_N)) ? Number(process.env.TOP_N) : 10;
+              const maxIdeas = Math.min(baseMax, throttle?5:(regime.uncertain?6:baseMax));
 
               // Liquidity percentile map
               const liqPct=new Map(); for(let i=0;i<universe.length;i++){ liqPct.set(universe[i].symbol,(universe.length===1)?1:1 - i/(universe.length-1)); }
 
-              const btc5 = (kBTC15||[]).slice(1).map((x,i,arr)=>Math.log((+arr[i+0]?.[4])/(+arr[i-1]?.[4]))).slice(-36).filter(Boolean);
-              const eth5 = (kETH15||[]).slice(1).map((x,i,arr)=>Math.log((+arr[i+0]?.[4])/(+arr[i-1]?.[4]))).slice(-36).filter(Boolean);
-
+              // Depth + OBI
               async function depthSlipAndObi(symbol, notionalUSD, book){
                 const depth=await getJSON(api("/api/v3/depth",{symbol,limit:20}));
                 const mid=(book.bid+book.ask)/2;
@@ -324,29 +299,22 @@ jobs:
               const mkt5 = (k)=>{ if(!k) return []; const c=k.map(x=>+x[4]); const r=[]; for(let i=1;i<c.length;i++) r.push(Math.log(c[i]/c[i-1])); return r.slice(-36); };
               const btc5 = mkt5(kBTC15), eth5 = mkt5(kETH15);
 
+              // Analyze one symbol
               async function analyze(c){
                 try{
                   const lastTs=state.cooldown?.[c.base]; const now=Date.now();
                   if(lastTs && (now-lastTs) < COOLDOWN_MS) return null;
 
-                  const book={}; // hydrated later
-                  // We'll fetch bookTicker map below in parent scope and pass it down
-                  // ... but to keep this inline, we'll re-hydrate here if needed
-                  // (left as-is from your original script)
-
-                  // Reuse bookMap from parent scope:
-                  // eslint-disable-next-line no-undef
-                  const bm = bookMap.get(c.symbol);
-                  if(!bm?.bid||!bm?.ask) return null;
-                  const mid=(bm.bid+bm.ask)/2; if(!(mid>0)) return null;
-                  const spreadBps=Math.round(((bm.ask-bm.bid)/mid)*10000);
+                  const book=bookMap.get(c.symbol); if(!book?.bid||!book?.ask) return null;
+                  const mid=(book.bid+book.ask)/2; if(!(mid>0)) return null;
+                  const spreadBps=Math.round(((book.ask-book.bid)/mid)*10000);
                   if(spreadBps>MAX_SPREAD_BPS) return null;
 
-                  const k5 = await fetchK(c.symbol,"5m",120); if(!k5||k5.length<Math.max(EMA_SLOW+5,ATR_P+5)) return null;
-                  const k15= await fetchK(c.symbol,"15m",96);
-                  const k1h= await fetchK(c.symbol,"1h",96);
+                  const k5 = await fetchK(c.symbol,"5m",K5M); if(!k5||k5.length<Math.max(EMA_SLOW+5,ATR_P+5)) return null;
+                  const k15= await fetchK(c.symbol,"15m",K15M);
+                  const k1h= await fetchK(c.symbol,"1h",K1H);
 
-                  const o5=k5.map(x=>+x[1]), h5=k5.map(x=>+x[2]), l5=k5.map(x=>+x[3]), c5=k5.map(x=>+x[4]), v5=k5.map(x=>+x[5]);
+                  const h5=k5.map(x=>+x[2]), l5=k5.map(x=>+x[3]), c5=k5.map(x=>+x[4]), v5=k5.map(x=>+x[5]);
                   const em21=ema(c5,EMA_FAST), em50=ema(c5,EMA_SLOW);
                   const { adx:adx5, atr:atr5 } = computeADX_ATR(h5,l5,c5,ADX_P)||{};
                   if(!(adx5&&atr5)) return null;
@@ -356,7 +324,7 @@ jobs:
                   const em15fast=c15.length?ema(c15,EMA_FAST):null, em15slow=c15.length?ema(c15,EMA_SLOW):null;
                   const em1hfast=c1h.length?ema(c1h,EMA_FAST):null, em1hslow=c1h.length?ema(c1h,EMA_SLOW):null;
 
-                  const vwap5=vwapAnchored(h5,l5,c5,v5,36);
+                  const vwap5=vwapAnchored(h5,l5,c5,v5,VWAP_5M_WIN);
                   const last=c5.at(-1), prev=c5.at(-2), prev3=c5.at(-4);
                   const roc5=(last/prev)-1, roc15=(last/prev3)-1;
                   const adxF=clamp((adx5-16)/14,0,1);
@@ -380,7 +348,7 @@ jobs:
                   const nearEMA21 = Math.abs((last-em21)/(atr5||1)) <= 0.40;
                   const pullbackOK = (upF && upS && nearEMA21) || (!upF && !upS && nearEMA21);
 
-                  const slipObi = await depthSlipAndObi(c.symbol, NOTIONAL, bm);
+                  const slipObi = await depthSlipAndObi(c.symbol, NOTIONAL, book);
                   const obi = slipObi.obi || 0;
 
                   const sideTrend= (0.6*roc5+0.4*roc15)>=0 ? "long":"short";
@@ -415,6 +383,7 @@ jobs:
                   const pLong  = clamp(wT*(sideTrend==="long"?pTrend:1-pTrend) + wM*(sideMR==="long"?pMR:1-pMR) + wB*(sideBO==="long"?pBO:1-pBO), 0.30, 0.97);
                   const pShort = clamp(wT*(sideTrend==="short"?pTrend:1-pTrend) + wM*(sideMR==="short"?pMR:1-pMR) + wB*(sideBO==="short"?pBO:1-pBO), 0.30, 0.97);
 
+                  const spreadBps=Math.round(((book.ask-book.bid)/mid)*10000);
                   const costLong=COST_BPS + Math.max(Math.round(spreadBps/2), slipObi.longBps);
                   const costShort=COST_BPS + Math.max(Math.round(spreadBps/2), slipObi.shortBps);
 
@@ -441,17 +410,16 @@ jobs:
 
                   let confl=0;
                   confl += trendAlign ? 0.25 : 0;
-                  confl += pullbackOK ? 0.20 : 0;
+                  confl += (Math.abs(z_vwap)<=0.5) ? 0.15 : 0;
                   confl += (side==="long" && slipObi.obi>0) || (side==="short" && slipObi.obi<0) ? 0.20 : 0;
                   confl += (side==="long" && boUp) || (side==="short" && boDn) ? 0.20 : 0;
-                  confl += (Math.abs(z_vwap)<=0.5) ? 0.15 : 0;
                   confl = clamp(confl, 0, 1);
 
                   const liq = liqPct.get(c.symbol)||0.5;
                   let nConf = 40 + 25*clamp((adx5-16)/14,0,1) + 20*liq + 20*confl - 20*betaPenalty;
                   nConf = Math.round(clamp(nConf, 35, 120));
 
-                  const p_lcb=wilsonLCB(p_final, nConf, 1.28);
+                  const p_lcb=wilsonLCB(p_final, nConf, WILSON_Z);
                   const exp_lcb_bps=Math.round(p_lcb*rrr.tp_bps - (1-p_lcb)*rrr.sl_bps - costSide);
 
                   const dynFloor = Math.max(EXP_LCB_MIN_BPS, Math.round(EXP_LCB_MIN_BPS + (1-liq)*2 + Math.max(0,12-spreadBps)/12));
@@ -479,19 +447,15 @@ jobs:
                 }catch{ return null; }
               }
 
-              // Analyze batch
-              const books=await getJSON(api("/api/v3/ticker/bookTicker"))||[];
-              const bookMap=new Map(books.map(b=>[b.symbol,{ bid:+b.bidPrice, ask:+b.askPrice }]));
-
-              const analyzed=[];
-              const B=8;
+              // Batch analyze
+              const B=8, analyzed=[];
               for(let i=0;i<universe.length;i+=B){
                 const part=await Promise.all(universe.slice(i,i+B).map(analyze));
                 for(const x of part){ if(x) analyzed.push(x); }
               }
               if(!analyzed.length){ reason="no_candidates"; }
 
-              // Diversification
+              // Correlation clustering + diversification
               const clusterMap=new Map(), leaders=[];
               const retCmp=(a,b)=>corr(a.ret5||[],b.ret5||[]);
               const CLUSTER_THRESH=0.80, CLUSTER_MAX_PICKS=3, CORR_MAX=0.85;
@@ -509,10 +473,8 @@ jobs:
                                 : b.qv-a.qv);
 
               const selected=[], usedC=new Map();
-              const baseMax = Number.isFinite(Number(process.env.TOP_N)) ? Number(process.env.TOP_N) : 10;
-              const maxIdeas = Math.min(baseMax, throttle?5:(regime.uncertain?6:baseMax));
               for(const cand of analyzed){
-                if(selected.length>=maxIdeas) break;
+                if(selected.length>=Math.min(TOP_N, throttle?5:(regime.uncertain?6:TOP_N))) break;
                 let ok=true; for(const s of selected){ if(corr(cand.ret5,s.ret5)>CORR_MAX){ ok=false; break; } }
                 if(!ok) continue;
                 const cid=cand.cluster, cCnt=usedC.get(cid)||0;
@@ -524,7 +486,7 @@ jobs:
               const wExp=softmax(selected.map(x=>x.exp_lcb_bps),25);
               const TARGET_PORT_RISK_BPS=50;
 
-              const picks = selected.map((x,i)=>({
+              picks = selected.map((x,i)=>({
                 symbol: x.base,
                 symbol_full: x.symbol,
                 quote: x.quote,
@@ -557,33 +519,40 @@ jobs:
                 await saveState(persist,state);
               }catch(e){ log("state save warn", e?.message||e); }
 
+              const { pnl24_bps, peak_dd_bps } = equityStats(state.equity);
               metaExtra = {
                 exchange_base: BASE,
-                filters:{ min_qv:MIN_QV, top_n:TOP_N, max_spread_bps:MAX_SPREAD_BPS, ema_fast:EMA_FAST, ema_slow:EMA_SLOW, adx_p:ADX_P, atr_p:ATR_P, vwap_5m_win:36, corr_win:36, corr_max:0.85, cluster_thresh:0.80, cluster_max_picks:3, cooldown_min: COOLDOWN_MS/60000, cost_bps:COST_BPS, notional_usd:NOTIONAL, exp_lcb_min_bps:EXP_LCB_MIN_BPS, wilson_z:WILSON_Z },
-                dd_gate:{ ...(equityStats(state.equity)) , throttle },
+                filters:{
+                  min_qv:MIN_QV, top_n:TOP_N, max_spread_bps:MAX_SPREAD_BPS,
+                  ema_fast:EMA_FAST, ema_slow:EMA_SLOW, adx_p:ADX_P, atr_p:ATR_P,
+                  vwap_5m_win:VWAP_5M_WIN, corr_win:36, corr_max:0.85,
+                  cluster_thresh:0.80, cluster_max_picks:3,
+                  cooldown_min: COOLDOWN_MS/60000,
+                  cost_bps:COST_BPS, notional_usd:NOTIONAL,
+                  exp_lcb_min_bps:EXP_LCB_MIN_BPS, wilson_z:WILSON_Z
+                },
+                dd_gate:{ pnl24_bps, peak_dd_bps, throttle },
                 tod: { active: S_H!=null && E_H!=null, start:S_H, end:E_H }
               };
 
-              // POST (even if 0 ideas)
-              const payload={ ts:new Date().toISOString(), mode:"normal", source:"external_pusher", meta:{ origin:"github_actions", reason, ...(metaExtra||{}) }, top_n:picks.length||0, ideas:picks||[] };
-              console.log(`[gha] pushing ${picks.length} ideas to ${PUSH_URL}`);
-              try{
-                const r=await fetchWithTimeout(PUSH_URL,{ method:"POST", headers:{ "Content-Type":"application/json","Authorization":`Bearer ${PUSH_TOKEN}` }, body: JSON.stringify(payload) },15000);
-                let txt=""; try{ txt=await r.text(); }catch{}
-                console.log(`[gha] push status ${r?.status||"ERR"} ${txt.slice(0,400)}`);
-              }catch(e){ console.log(`[gha] push failed ${e?.message||e}`); }
-
             }catch(e){
-              if(reason==="ok") reason="data_error";
-              console.log("[gha] error", e?.message||String(e));
-              // Push empty payload so you still get a heartbeat
-              const payload={ ts:new Date().toISOString(), mode:"normal", source:"external_pusher", meta:{ origin:"github_actions", reason, error:String(e?.message||e) }, top_n:0, ideas:[] };
-              try{
-                console.log(`[gha] pushing 0 ideas to ${PUSH_URL}`);
-                const r=await fetchWithTimeout(PUSH_URL,{ method:"POST", headers:{ "Content-Type":"application/json","Authorization":`Bearer ${PUSH_TOKEN}` }, body: JSON.stringify(payload) },15000);
-                let txt=""; try{ txt=await r.text(); }catch{}
-                console.log(`[gha] push status ${r?.status||"ERR"} ${txt.slice(0,400)}`);
-              }catch(_){}
+              if(reason==="ok"){ reason="data_error"; }
+              metaExtra.error=(e?.message||String(e)).slice(0,180);
+              log("error", metaExtra.error);
+            }
+
+            // ---------- Always push (even with 0 ideas) ----------
+            const payload={ ts:new Date().toISOString(), mode:"normal", source:"external_pusher",
+              meta:{ origin:"github_actions", reason, ...(metaExtra||{}) },
+              top_n:Array.isArray(picks)?picks.length:0, ideas:Array.isArray(picks)?picks:[] };
+
+            console.log(`[gha] pushing ${payload.top_n} ideas to ${PUSH_URL}`);
+            try{
+              const r=await fetchWithTimeout(PUSH_URL,{ method:"POST", headers:{ "Content-Type":"application/json","Authorization":`Bearer ${PUSH_TOKEN}` }, body: JSON.stringify(payload) },15000);
+              let txt=""; try{ txt=await r.text(); }catch{}
+              console.log(`[gha] push status ${r?.status||"ERR"} ${txt.slice(0,400)}`);
+            }catch(e){
+              console.log(`[gha] push failed ${e?.message||e}`);
             }
           })();
           NODE
