@@ -3,7 +3,7 @@ name: Ideas Pusher (MEXC 2.1)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/20 * * * *" # runs every 20 minutes
+    - cron: "*/10 * * * *" # runs every 20 minutes
 
 permissions:
   contents: read
