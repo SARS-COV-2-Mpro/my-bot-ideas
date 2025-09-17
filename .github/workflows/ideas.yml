@@ -87,7 +87,7 @@ jobs:
             const avgAbsRetBps=(c,win=40)=>{ if(c.length<win+1) return null; let s=0; for(let i=c.length-win;i<c.length;i++){ s += Math.abs((c[i]/c[i-1])-1); } return (s/win)*10000; };
             const sum=(a)=>a.reduce((x,y)=>x+y,0);
             const matMulT=(X,y)=>{ const k=X[0].length; const XtY=new Array(k).fill(0); for(let i=0;i<X.length;i++){ const row=X[i]; const yi=y[i]; for(let j=0;j<k;j++) XtY[j]+=row[j]*yi; } return XtY; };
-            const matTXmat=(X)=>{ const k=X[0].length; const XtX=Array.from({length:k},()=>new Array(k).fill(0)); for(let i=0;i<X.length;i++){ const row=X[i]; for(let a=0;a<k;a++) for(let b=0;b<b.length; b++); } return XtX; };
+            const matTXmat=(X)=>{ const k=X[0].length; const XtX=Array.from({length:k},()=>new Array(k).fill(0)); for(let i=0;i<X.length;i++){ const row=X[i]; for(let a=0;a<k;a++) for(let b=0;b<k;b++) XtX[a][b]+=row[a]*row[b]; } return XtX; };
             const solveRidge=(A,b,lam=1e-6)=>{ const k=A.length; const M=Array.from({length:k},(_,i)=>A[i].slice()); for(let i=0;i<k;i++) M[i][i]+=lam;
               const aug=M.map((row,i)=>row.concat([b[i]]));
               for(let i=0;i<k;i++){
@@ -338,7 +338,7 @@ jobs:
                 const rLo = style==="mr" ? 0.96 : 1.12;
                 const rHi = style==="breakout" ? 2.8 : 2.55;
                 let prefR = clamp(baseR, rLo, rHi);
-                let slATR = style==="trend" ? SL_TREND_BASE : SL_MR_BASE : SL_BO_BASE;
+                let slATR = style==="trend" ? SL_TREND_BASE : style==="mr" ? SL_MR_BASE : SL_BO_BASE;
                 slATR *= (1 + 0.24*(1-adxF));
                 if(spread_bps>12) slATR*=1.08;
                 if(style==="trend" && trend_align && adxF>0.65 && p>0.64) slATR*=0.88;
@@ -629,13 +629,11 @@ jobs:
               const wExp=softmax(selected.map(x=>x.exp_lcb_bps),20);
               const TARGET_PORT_RISK_BPS=52;
 
-              // Build picks and flip side (buy<->sell), keep TP/SL/RRR and everything else unchanged
               const picks = selected.map((x,i)=>({
                 symbol: x.base,
                 symbol_full: x.symbol,
                 quote: x.quote,
-                side: x.side === "long" ? "short" : "long",
-                score: x.score, rank:i+1,
+                side: x.side, score: x.score, rank:i+1,
                 ttl_sec: clamp(Math.round(x.hold_sec + i*12), 480, 2000),
                 p_win:x.p_win, p_lcb:x.p_lcb,
                 exp_bps:x.exp_bps, exp_lcb_bps:x.exp_lcb_bps,
