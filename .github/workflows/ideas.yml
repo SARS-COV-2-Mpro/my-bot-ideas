@@ -3,7 +3,7 @@ name: Ideas Pusher (MEXC 2.1)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * *" # adjust as needed
+    - cron: "*/10 * * * *" # adjust as needed
 
 permissions:
   contents: read
