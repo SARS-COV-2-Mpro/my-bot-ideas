@@ -243,23 +243,63 @@ jobs:
                 });
               }catch{}
             }
+
+            // UPDATED: evalPending with fill-first for limit-at-SL entry
             async function evalPending(state){
               const now=Date.now(); const keep=[];
               for(const p of state.pending||[]){
                 if(now < p.ts_ms + p.hold_sec*1000 + 5000){ keep.push(p); continue; }
                 const k = await fetchK(p.symbolFull,"1m",K1M, p.ts_ms-60*1000, p.ts_ms+p.hold_sec*1000+60*1000);
                 if(!k){ keep.push(p); continue; }
-                const highs=k.map(x=>+x[2]), lows=k.map(x=>+x[3]), closes=k.map(x=>+x[4]);
+
+                const ts=k.map(x=>+x[0]), highs=k.map(x=>+x[2]), lows=k.map(x=>+x[3]), closes=k.map(x=>+x[4]);
                 const entry=p.entry_price, long=p.side==="long", tp=p.tp_bps/10000, sl=p.sl_bps/10000;
-                let exitPx=closes.at(-1);
-                for(let i=0;i<k.length;i++){
-                  const hi=highs[i], lo=lows[i];
-                  if(long){ if(hi>=entry*(1+tp)){ exitPx=entry*(1+tp); break; } if(lo<=entry*(1-sl)){ exitPx=entry*(1-sl); break; } }
-                  else    { if(lo<=entry*(1-tp)){ exitPx=entry*(1-tp); break; } if(hi>=entry*(1+sl)){ exitPx=entry*(1+sl); break; } }
+
+                // Use fill-first logic if this was a limit-at-old-SL policy
+                const limitAtSL = p.entry_policy==="limit_at_old_sl";
+
+                if(limitAtSL){
+                  const t0=p.ts_ms, tEnd=t0 + p.hold_sec*1000;
+                  // 1) Find fill (touch of entry)
+                  let iFill=-1;
+                  for(let i=0;i<k.length;i++){
+                    const t=ts[i]; if(t < t0-1000) continue; if(t > tEnd) break;
+                    if(long ? (lows[i] <= entry) : (highs[i] >= entry)){ iFill=i; break; }
+                  }
+                  if(iFill===-1){
+                    // No fill within the hold window: treat as no-trade (drop without equity update)
+                    continue;
+                  }
+                  // 2) From fill forward, check TP/SL first-touch
+                  let exitPx=closes.at(-1);
+                  const tpPx = long ? entry*(1+tp) : entry*(1-tp);
+                  const slPx = long ? entry*(1-sl) : entry*(1+sl);
+                  for(let i=iFill;i<k.length;i++){
+                    const t=ts[i]; if(t > tEnd) break;
+                    const hi=highs[i], lo=lows[i];
+                    if(long){
+                      if(hi>=tpPx){ exitPx=tpPx; break; }
+                      if(lo<=slPx){ exitPx=slPx; break; }
+                    }else{
+                      if(lo<=tpPx){ exitPx=tpPx; break; }
+                      if(hi>=slPx){ exitPx=slPx; break; }
+                    }
+                  }
+                  const ret = long? (exitPx/entry - 1) : (entry/exitPx - 1);
+                  const pnl_bps = Math.round(ret*10000) - (p.cost_bps||0);
+                  state.equity.push({ ts_ms:p.ts_ms, pnl_bps });
+                }else{
+                  // Original behavior (not used now, but kept for backward compatibility)
+                  let exitPx=closes.at(-1);
+                  for(let i=0;i<k.length;i++){
+                    const hi=highs[i], lo=lows[i];
+                    if(long){ if(hi>=entry*(1+tp)){ exitPx=entry*(1+tp); break; } if(lo<=entry*(1-sl)){ exitPx=entry*(1-sl); break; } }
+                    else    { if(lo<=entry*(1-tp)){ exitPx=entry*(1-tp); break; } if(hi>=entry*(1+sl)){ exitPx=entry*(1+sl); break; } }
+                  }
+                  const ret = long? (exitPx/entry - 1) : (entry/exitPx - 1);
+                  const pnl_bps = Math.round(ret*10000) - (p.cost_bps||0);
+                  state.equity.push({ ts_ms:p.ts_ms, pnl_bps });
                 }
-                const ret = long? (exitPx/entry - 1) : (entry/exitPx - 1);
-                const pnl_bps = Math.round(ret*10000) - (p.cost_bps||0);
-                state.equity.push({ ts_ms:p.ts_ms, pnl_bps });
               }
               state.pending = keep;
               if(state.equity.length>6000) state.equity = state.equity.slice(-6000);
@@ -722,11 +762,25 @@ jobs:
                 const nowMs=Date.now(); const ideasTs=new Date(nowMs).toISOString();
                 for(const p of picks){
                   const bk=bookMap.get(p.symbol_full); const mid=bk? (bk.bid+bk.ask)/2 : 0;
+
+                  // UPDATED: entry at old SL price (limit), TP/SL recalculated around new entry during eval
+                  let entry_mid = mid;
+                  let entry_new = mid;
+                  if(p.side==="long"){
+                    entry_new = entry_mid * (1 - p.sl_bps/10000);
+                  }else{
+                    entry_new = entry_mid * (1 + p.sl_bps/10000);
+                  }
+
                   state.cooldown[p.symbol]=nowMs;
                   state.cooldown_side[p.symbol]={ side:p.side, ts_ms:nowMs };
                   state.pending.push({
                     ts:ideasTs, ts_ms:nowMs, symbolFull:p.symbol_full, base:p.symbol, quote:p.quote, side:p.side,
-                    entry_price:mid, hold_sec:p.ttl_sec, tp_bps:p.tp_bps, sl_bps:p.sl_bps, regime:p.regime, cost_bps:p.cost_bps
+                    // entry hinting
+                    entry_policy:"limit_at_old_sl",
+                    entry_mid: entry_mid,
+                    entry_price: entry_new,
+                    hold_sec:p.ttl_sec, tp_bps:p.tp_bps, sl_bps:p.sl_bps, regime:p.regime, cost_bps:p.cost_bps
                   });
                 }
                 if(state.pending.length>550) state.pending=state.pending.slice(-550);
@@ -749,7 +803,8 @@ jobs:
                 },
                 dd_gate:{ pnl24_bps, peak_dd_bps, throttle },
                 tod: { active: S_H!=null && E_H!=null, start:S_H, end:E_H },
-                tier: selectionTier
+                tier: selectionTier,
+                entry_policy: "limit_at_old_sl"
               };
               const payload={ ts:new Date().toISOString(), mode:"normal", source:"external_pusher", meta:{ origin:"github_actions", reason, ...(metaExtra||{}) }, top_n:selected.length||0, ideas:picks||[] };
 
