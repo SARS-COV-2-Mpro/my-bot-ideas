@@ -1,418 +1,262 @@
-/**
-  Ideas Pusher — MEXC (strict → 1–3), Worker EV-aligned (no env)
-  - Node 20+ (uses global fetch)
-  - Set PUSH_URL and PUSH_TOKEN below (or leave blank to print payload)
-  - Aligns to Worker gate: SL=25 bps, R=1.45 (TP≈36 bps), EV floor=5 bps
-*/
+name: Ideas Pusher (MEXC strict→1–3, Worker EV aligned)
 
-'use strict';
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/20 * * * *"
 
-// ====== CONFIG (edit these two) ======
-const PUSH_URL   = ""; // e.g., "https://your-worker.example.com/signals/push"
-const PUSH_TOKEN = ""; // e.g., "your-bearer-token"; leave blank to only log
+permissions:
+  contents: read
 
-// ====== Universe target ======
-const DESIRED_UNIVERSE = 80;    // target symbols
-const MIN_QV_START     = 30e6;  // start 24h quote volume floor (USD)
-const MIN_QV_MIN       = 10e6;  // minimum floor
-const MIN_QV_STEP      = 5e6;   // step down
-const UNIVERSE_CAP     = 200;   // safety cap
+concurrency:
+  group: ideas-mexc
+  cancel-in-progress: true
 
-// ====== Worker EV (alignment) ======
-const WORKER_SL_BPS    = 25;     // default SL the Worker uses
-const WORKER_R         = 1.45;   // TP/SL ratio
-const WORKER_FLOOR_BPS = 5;      // EV floor after costs
-const BASE_COST_BPS    = 10;     // fees before spread/slippage
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
 
-// ====== Other gates ======
-const MAX_SPREAD_BPS   = 12;
-const SIGNAL_NOTIONAL  = 300;    // USD for slip/fill modeling
-const MIN_IDEAS        = 1;
-const MAX_IDEAS        = 3;
+    env:
+      WORKER_PUSH_URL: ${{ secrets.WORKER_PUSH_URL }}
+      PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
 
-const MEXC_BASES = ["https://api.mexc.com","https://www.mexc.com"];
-const QUOTES     = ["USDT","USDC","USD"];
-const STABLES    = new Set(["USDT","USDC","USD","BUSD","FDUSD","TUSD","DAI","USDP","PAX","USTC","USDE","USDD"]);
+    steps:
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
 
-// ====== Helpers ======
-const clamp = (x,a,b)=>Math.max(a,Math.min(b,x));
-const sigmoid = (x)=>1/(1+Math.exp(-x));
-const std = (x)=>{ const n=x.length; if(n<=1) return 0; const m=x.reduce((a,b)=>a+b,0)/n; let v=0; for(const xi of x) v+=(xi-m)*(xi-m); return Math.sqrt(v/(n-1)); };
-const ema=(arr,p)=>{ if(arr.length<p) return null; const k=2/(p+1); let e=arr.slice(0,p).reduce((a,b)=>a+b,0)/p; for(let i=p;i<arr.length;i++) e=arr[i]*k+e*(1-k); return e; };
-const wilsonLCB=(p,n,z=1.34)=>{ if(n<=0) return p; const z2=z*z; const a=p+z2/(2*n); const b=z*Math.sqrt((p*(1-p)+z2/(4*n))/n); const c=1+z2/n; return clamp((a-b)/c,0,1); };
-const corr=(a,b)=>{ const n=Math.min(a?.length||0,b?.length||0); if(n<5) return 0; const as=a.slice(-n), bs=b.slice(-n); const ma=as.reduce((x,y)=>x+y,0)/n, mb=bs.reduce((x,y)=>x+y,0)/n; let num=0,da=0,db=0; for(let i=0;i<n;i++){ const xa=as[i]-ma, xb=bs[i]-mb; num+=xa*xb; da+=xa*xa; db+=xb*xb; } const den=Math.sqrt(da*db); return den===0?0:num/den; };
+      - name: Run pusher (strict → Worker EV aligned 1–3)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${WORKER_PUSH_URL:-}" || -z "${PUSH_TOKEN:-}" ]]; then
+            echo "[gha] Missing WORKER_PUSH_URL or PUSH_TOKEN"
+            exit 1
+          fi
 
-// ADX+ATR
-function computeADX_ATR(h,l,c,p=14){
-  const n=c.length; if(n<p+2) return null;
-  const TR=[],plusDM=[],minusDM=[];
-  for(let i=1;i<n;i++){
-    const up=h[i]-h[i-1], down=l[i-1]-l[i];
-    plusDM.push((up>down&&up>0)?up:0);
-    minusDM.push((down>up&&down>0)?down:0);
-    TR.push(Math.max(h[i]-l[i], Math.abs(h[i]-c[i-1]), Math.abs(l[i]-c[i-1])));
-  }
-  let trN=0,pdmN=0,ndmN=0;
-  for(let i=0;i<p;i++){ trN+=TR[i]; pdmN+=plusDM[i]; ndmN+=minusDM[i]; }
-  let pDI=100*(pdmN/(trN||1)), nDI=100*(ndmN/(trN||1));
-  let dx=100*Math.abs(pDI-nDI)/((pDI+nDI)||1), adx=dx;
-  for(let i=p;i<TR.length;i++){
-    trN=trN-(trN/p)+TR[i];
-    pdmN=pdmN-(pdmN/p)+plusDM[i];
-    ndmN=ndmN-(ndmN/p)+minusDM[i];
-    pDI=100*(pdmN/(trN||1)); nDI=100*(ndmN/(trN||1));
-    dx=100*Math.abs(pDI-nDI)/((pDI+nDI)||1);
-    adx=((adx*(p-1))+dx)/p;
-  }
-  const atr=trN/p;
-  return { adx, atr };
-}
+          set +e
+          node - <<'NODE'
+          (async ()=>{
+            'use strict';
+            const log=(...a)=>console.log("[gha]",...a);
 
-const vwapAnchored=(h,l,c,v,win)=>{
-  const n=c.length, s=Math.max(0,n-win); let pv=0, vv=0;
-  for(let i=s;i<n;i++){ const tp=(h[i]+l[i]+c[i])/3; const vol=+v[i]||0; pv+=tp*vol; vv+=vol; }
-  return vv>0? pv/vv : c.at(-1);
-};
+            // Worker-aligned EV config (no repo vars required)
+            const DESIRED_UNIVERSE = 80;
+            const MIN_QV_START = 30_000_000, MIN_QV_MIN = 10_000_000, MIN_QV_STEP = 5_000_000, UNIVERSE_CAP = 200;
+            const WORKER_SL_BPS = 25, WORKER_R = 1.45, WORKER_FLOOR_BPS = 5;
+            const BASE_COST_BPS = 10, MAX_SPREAD_BPS = 12, SIGNAL_NOTIONAL = 300;
+            const MIN_IDEAS = 1, MAX_IDEAS = 3;
 
-// ====== HTTP ======
-const UA="ideas-pusher/worker-aligned-ev/1.0";
-async function fetchWithTimeout(url,opts={},ms=12000){
-  const ac=new AbortController(); const t=setTimeout(()=>ac.abort(),ms);
-  try{ return await fetch(url,{...opts,signal:ac.signal,headers:{ "User-Agent":UA, ...(opts.headers||{}) }}); }
-  finally{ clearTimeout(t); }
-}
-async function getJSON(url,ms=12000,tries=2){
-  for(let i=0;i<tries;i++){
-    try{ const r=await fetchWithTimeout(url,{},ms); if(r?.ok) return await r.json(); }catch{}
-    await new Promise(r=>setTimeout(r,200+Math.random()*120));
-  }
-  return null;
-}
+            const MEXC_BASES=["https://api.mexc.com","https://www.mexc.com"];
+            const QUOTES=["USDT","USDC","USD"];
+            const STABLES=new Set(["USDT","USDC","USD","BUSD","FDUSD","TUSD","DAI","USDP","PAX","USTC","USDE","USDD"]);
 
-// ====== MEXC API ======
-async function pickMexcBase(){
-  for(const b of MEXC_BASES){
-    try{ const r=await fetchWithTimeout(`${b}/api/v3/time`,{},4000); if(r?.ok) return b; }catch{}
-  }
-  throw new Error("No healthy MEXC base");
-}
-const api=(base,p,params={})=>{
-  const u=new URL(p,base);
-  for(const [k,v] of Object.entries(params)){ if(v!==undefined && v!==null) u.searchParams.set(k,String(v)); }
-  return u.toString();
-};
-async function fetchK(base,sym,intv,lim){ return await getJSON(api(base,"/api/v3/klines",{symbol:sym,interval:intv,limit:lim}),10000,2); }
-async function fetchDepth(base,sym,limit=50){ return await getJSON(api(base,"/api/v3/depth",{symbol:sym,limit}),10000,2); }
-async function fetchAll24hr(base){
-  let all=await getJSON(api(base,"/api/v3/ticker/24hr"),10000,2);
-  if(Array.isArray(all)&&all.length) return all;
-  const exi=await getJSON(api(base,"/api/v3/exchangeInfo"),10000,2);
-  const syms=(exi?.symbols||[]).filter(s=>s.status==="TRADING").map(s=>s.symbol).slice(0,250);
-  const out=[];
-  for(let i=0;i<syms.length;i+=24){
-    const chunk=syms.slice(i,i+24);
-    const got=await Promise.all(chunk.map(s=>getJSON(api(base,"/api/v3/ticker/24hr",{symbol:s}),6000,1)));
-    for(const x of got) if(x) out.push(x);
-    await new Promise(r=>setTimeout(r,150));
-  }
-  return out;
-}
+            const clamp=(x,a,b)=>Math.max(a,Math.min(b,x));
+            const sigmoid=(x)=>1/(1+Math.exp(-x));
+            const std=(x)=>{ const n=x.length; if(n<=1) return 0; const m=x.reduce((a,b)=>a+b,0)/n; let v=0; for(const xi of x) v+=(xi-m)*(xi-m); return Math.sqrt(v/(n-1)); };
+            const ema=(arr,p)=>{ if(arr.length<p) return null; const k=2/(p+1); let e=arr.slice(0,p).reduce((a,b)=>a+b,0)/p; for(let i=p;i<arr.length;i++) e=arr[i]*k+e*(1-k); return e; };
+            const wilsonLCB=(p,n,z=1.34)=>{ if(n<=0) return p; const z2=z*z; const a=p+z2/(2*n); const b=z*Math.sqrt((p*(1-p)+z2/(4*n))/n); const c=1+z2/n; return clamp((a-b)/c,0,1); };
+            const corr=(a,b)=>{ const n=Math.min(a?.length||0,b?.length||0); if(n<5) return 0; const as=a.slice(-n), bs=b.slice(-n); const ma=as.reduce((x,y)=>x+y,0)/n, mb=bs.reduce((x,y)=>x+y,0)/n; let num=0,da=0,db=0; for(let i=0;i<n;i++){ const xa=as[i]-ma, xb=bs[i]-mb; num+=xa*xb; da+=xa*xa; db+=xb*xb; } const den=Math.sqrt(da*db); return den===0?0:num/den; };
 
-// ====== Universe builder (adaptive) ======
-function splitSymbol(s){
-  for(const q of QUOTES){ if(s.endsWith(q)) return { base:s.slice(0,-q.length), quote:q }; }
-  return null;
-}
-function buildUniverse(all24, desired, minQVstart, minQVmin, step, cap){
-  let minQV=minQVstart; let pool=[];
-  while(minQV>=minQVmin){
-    pool=[];
-    for(const t of all24||[]){
-      const sym=t.symbol||t.s; if(!sym) continue;
-      const sq=splitSymbol(sym); if(!sq) continue;
-      if(STABLES.has(sq.base.toUpperCase())) continue;
-      const qv=+(t.quoteVolume||t.q||0); if(qv>=minQV) pool.push({ symbol:sym, base:sq.base, quote:sq.quote, qv });
-    }
-    pool.sort((a,b)=>b.qv-a.qv);
-    if(pool.length>=desired) break;
-    minQV -= step;
-  }
-  if(pool.length===0){
-    for(const t of all24||[]){
-      const sym=t.symbol||t.s; if(!sym) continue;
-      const sq=splitSymbol(sym); if(!sq) continue;
-      if(STABLES.has(sq.base.toUpperCase())) continue;
-      const qv=+(t.quoteVolume||t.q||0);
-      pool.push({ symbol:sym, base:sq.base, quote:sq.quote, qv });
-    }
-    pool.sort((a,b)=>b.qv-a.qv);
-  }
-  return pool.slice(0,cap);
-}
+            function computeADX_ATR(h,l,c,p=14){
+              const n=c.length; if(n<p+2) return null;
+              const TR=[],plusDM=[],minusDM=[];
+              for(let i=1;i<n;i++){
+                const up=h[i]-h[i-1], down=l[i-1]-l[i];
+                plusDM.push((up>down&&up>0)?up:0);
+                minusDM.push((down>up&&down>0)?down:0);
+                TR.push(Math.max(h[i]-l[i], Math.abs(h[i]-c[i-1]), Math.abs(l[i]-c[i-1])));
+              }
+              let trN=0,pdmN=0,ndmN=0;
+              for(let i=0;i<p;i++){ trN+=TR[i]; pdmN+=plusDM[i]; ndmN+=minusDM[i]; }
+              let pDI=100*(pdmN/(trN||1)), nDI=100*(ndmN/(trN||1)); let dx=100*Math.abs(pDI-nDI)/((pDI+nDI)||1), adx=dx;
+              for(let i=p;i<TR.length;i++){
+                trN=trN-(trN/p)+TR[i];
+                pdmN=pdmN-(pdmN/p)+plusDM[i];
+                ndmN=ndmN-(ndmN/p)+minusDM[i];
+                pDI=100*(pdmN/(trN||1)); nDI=100*(ndmN/(trN||1));
+                dx=100*Math.abs(pDI-nDI)/((pDI+nDI)||1);
+                adx=((adx*(p-1))+dx)/p;
+              }
+              const atr=trN/p; return { adx, atr };
+            }
+            const vwapAnchored=(h,l,c,v,win)=>{ const n=c.length,s=Math.max(0,n-win); let pv=0,vv=0; for(let i=s;i<n;i++){ const tp=(h[i]+l[i]+c[i])/3; const vol=+v[i]||0; pv+=tp*vol; vv+=vol; } return vv>0?pv/vv:c.at(-1); };
 
-// ====== Regime ======
-async function getRegime(base){
-  const K15=96, K1H=96, ADX_P=14;
-  const BTC="BTCUSDT", ETH="ETHUSDT";
-  const kBTC15=await fetchK(base,BTC,"15m",K15), kETH15=await fetchK(base,ETH,"15m",K15);
-  const kBTC1H=await fetchK(base,BTC,"1h",K1H), kETH1H=await fetchK(base,ETH,"1h",K1H);
-  const f=(k)=>{ if(!k||k.length<ADX_P+5) return { adx:0, roc:0 }; const h=k.map(x=>+x[2]), l=k.map(x=>+x[3]), c=k.map(x=>+x[4]); const { adx }=computeADX_ATR(h,l,c,ADX_P)||{}; const roc=(c.at(-1)/c.at(-5)-1)||0; return { adx:adx||0, roc }; };
-  const b=f(kBTC15), e=f(kETH15), b1=f(kBTC1H), e1=f(kETH1H);
-  const adxAvg=(b.adx+e.adx)/2; const dir=Math.sign((b.roc+e.roc)+(b1.roc+e1.roc));
-  const isTrend=adxAvg>=22 && Math.abs(b.roc)>0.001 && Math.abs(e.roc)>0.001;
-  return { regime: isTrend?"trend":"chop", adxAvg, dir };
-}
+            const UA="gh-actions-worker-ev-align/1.0 (+github)";
+            async function fetchWithTimeout(url,opts={},ms=12000){ const ac=new AbortController(); const t=setTimeout(()=>ac.abort(),ms); try{ return await fetch(url,{...opts,signal:ac.signal,headers:{"User-Agent":UA,...(opts.headers||{})}});} finally{ clearTimeout(t); } }
+            async function getJSON(url,ms=12000,tries=2){ for(let i=0;i<tries;i++){ try{ const r=await fetchWithTimeout(url,{},ms); if(r?.ok) return await r.json(); }catch{} await new Promise(r=>setTimeout(r,220)); } return null; }
 
-// ====== Scoring (Worker EV-aligned) ======
-async function scoreSymbol(base, sym, book, regime){
-  if(!book?.bid||!book?.ask) return null;
-  const mid=(book.bid+book.ask)/2; if(!(mid>0)) return null;
-  const spreadBps=Math.round(((book.ask-book.bid)/mid)*10000);
-  if(spreadBps>MAX_SPREAD_BPS) return null;
+            const PUSH_URL=process.env.WORKER_PUSH_URL, PUSH_TOKEN=process.env.PUSH_TOKEN;
+            const HEALTH_URL=(()=>{ try{ const u=new URL(PUSH_URL); return `${u.origin}${u.pathname.replace(/\/signals\/push(\?.*)?$/,"/health")}`;}catch{return PUSH_URL.replace(/\/signals\/push(\?.*)?$/,"/health");}})();
 
-  const K5=120, K15=96, K1H=96, EMA_FAST=21, EMA_SLOW=50, ADX_P=14, VWAP_5M_WIN=36;
+            // Health + heartbeat
+            try{ const r=await fetchWithTimeout(HEALTH_URL,{ headers:{ "Authorization":`Bearer ${PUSH_TOKEN}` }},5000); let t=""; try{ t=await r.text(); }catch{}; log("health status", r?.status||"ERR", (t||"").slice(0,160)); }catch(e){ log("health error", e?.message||e); }
+            async function heartbeat(){ const payload={ ts:new Date().toISOString(), mode:"normal", source:"external_pusher", meta:{origin:"github_actions",reason:"heartbeat"}, top_n:0, ideas:[] }; try{ const r=await fetchWithTimeout(PUSH_URL,{ method:"POST", headers:{ "Content-Type":"application/json","Authorization":`Bearer ${PUSH_TOKEN}` }, body: JSON.stringify(payload) },10000); let txt=""; try{ txt=await r.text(); }catch{}; log("heartbeat push", r?.status||"ERR", (txt||"").slice(0,160)); }catch(e){ log("heartbeat failed", e?.message||e); } }
+            await heartbeat();
 
-  // klines
-  const [k5,k15,k1h]=await Promise.all([
-    fetchK(base,sym,"5m",K5),
-    fetchK(base,sym,"15m",K15),
-    fetchK(base,sym,"1h",K1H)
-  ]);
-  if(!k5||!k15||!k1h) return null;
+            async function pickMexcBase(){ for(const b of MEXC_BASES){ try{ const r=await fetchWithTimeout(`${b}/api/v3/time`,{},4000); if(r?.ok) return b; }catch{} } throw new Error("No healthy MEXC base"); }
+            const api=(base,p,params={})=>{ const u=new URL(p,base); for(const [k,v] of Object.entries(params)){ if(v!=null) u.searchParams.set(k,String(v)); } return u.toString(); };
+            async function fetchK(base,sym,intv,lim){ return await getJSON(api(base,"/api/v3/klines",{symbol:sym,interval:intv,limit:lim}),10000,2); }
+            async function fetchDepth(base,sym,limit=50){ return await getJSON(api(base,"/api/v3/depth",{symbol:sym,limit}),10000,2); }
+            async function fetchAll24hr(base){ let all=await getJSON(api(base,"/api/v3/ticker/24hr"),10000,2); if(Array.isArray(all)&&all.length) return all; const exi=await getJSON(api(base,"/api/v3/exchangeInfo"),10000,2); const syms=(exi?.symbols||[]).filter(s=>s.status==="TRADING").map(s=>s.symbol).slice(0,250); const out=[]; for(let i=0;i<syms.length;i+=24){ const chunk=syms.slice(i,i+24); const got=await Promise.all(chunk.map(s=>getJSON(api(base,"/api/v3/ticker/24hr",{symbol:s}),6000,1))); for(const x of got) if(x) out.push(x); await new Promise(r=>setTimeout(r,150)); } return out; }
 
-  const h5=k5.map(x=>+x[2]), l5=k5.map(x=>+x[3]), c5=k5.map(x=>+x[4]), v5=k5.map(x=>+x[5]);
-  const h15=k15.map(x=>+x[2]), l15=k15.map(x=>+x[3]), c15=k15.map(x=>+x[4]);
-  const c1h=k1h.map(x=>+x[4]);
+            const BASE=await pickMexcBase();
+            const ALL24=await getJSON(api(BASE,"/api/v3/ticker/24hr"),10000,2) || await fetchAll24hr(BASE);
+            const booksRaw=await getJSON(api(BASE,"/api/v3/ticker/bookTicker"),10000,2) || [];
+            const bookMap=new Map(booksRaw.map(b=>[b.symbol,{ bid:+b.bidPrice, ask:+b.askPrice }]));
 
-  const { adx:adx5, atr:atr5 }=computeADX_ATR(h5,l5,c5,ADX_P)||{};
-  if(!(adx5&&atr5)) return null;
-  const atr_bps = Math.round((atr5/(c5.at(-1)||1))*10000);
-  if(atr_bps<4 || atr_bps>260) return null;
+            function splitSymbol(s){ for(const q of QUOTES){ if(s.endsWith(q)) return { base:s.slice(0,-q.length), quote:q }; } return null; }
+            function buildUniverse(all24){ let minQV=MIN_QV_START, pool=[]; while(minQV>=MIN_QV_MIN){ pool=[]; for(const t of all24||[]){ const sym=t.symbol||t.s; if(!sym) continue; const sq=splitSymbol(sym); if(!sq) continue; if(STABLES.has(sq.base.toUpperCase())) continue; const qv=+(t.quoteVolume||t.q||0); if(qv>=minQV) pool.push({ symbol:sym, base:sq.base, quote:sq.quote, qv }); } pool.sort((a,b)=>b.qv-a.qv); if(pool.length>=DESIRED_UNIVERSE) break; minQV-=MIN_QV_STEP; } if(pool.length===0){ for(const t of all24||[]){ const sym=t.symbol||t.s; if(!sym) continue; const sq=splitSymbol(sym); if(!sq) continue; if(STABLES.has(sq.base.toUpperCase())) continue; const qv=+(t.quoteVolume||t.q||0); pool.push({ symbol:sym, base:sq.base, quote:sq.quote, qv }); } pool.sort((a,b)=>b.qv-a.qv); } return pool.slice(0,UNIVERSE_CAP); }
 
-  const em21_5=ema(c5,EMA_FAST), em50_5=ema(c5,EMA_SLOW);
-  const em21_15=ema(c15,EMA_FAST), em50_15=ema(c15,EMA_SLOW);
+            async function getRegime(){ const BTC="BTCUSDT", ETH="ETHUSDT"; const K15=96,K1H=96,ADX_P=14; const kB15=await fetchK(BASE,BTC,"15m",K15), kE15=await fetchK(BASE,ETH,"15m",K15), kB1=await fetchK(BASE,BTC,"1h",K1H), kE1=await fetchK(BASE,ETH,"1h",K1H); const f=(k)=>{ if(!k||k.length<ADX_P+5) return {adx:0,roc:0}; const h=k.map(x=>+x[2]), l=k.map(x=>+x[3]), c=k.map(x=>+x[4]); const { adx }=computeADX_ATR(h,l,c,ADX_P)||{}; const roc=(c.at(-1)/c.at(-5)-1)||0; return { adx:adx||0, roc }; }; const b=f(kB15), e=f(kE15), b1=f(kB1), e1=f(kE1); const adxAvg=(b.adx+e.adx)/2; const dir=Math.sign((b.roc+e.roc)+(b1.roc+e1.roc)); const isTrend=adxAvg>=22 && Math.abs(b.roc)>0.001 && Math.abs(e.roc)>0.001; return { regime: isTrend?"trend":"chop", adxAvg, dir }; }
 
-  const roc5=(c5.at(-1)/c5.at(-2)-1)||0;
-  const roc15=(c15.at(-1)/c15.at(-4)-1)||0;
-  const roc1h=(c1h.at(-1)/c1h.at(-2)-1)||0;
+            async function scoreSymbol(sym, book, regime){
+              if(!book?.bid||!book?.ask) return null;
+              const mid=(book.bid+book.ask)/2; const spreadBps=Math.round(((book.ask-book.bid)/mid)*10000);
+              if(spreadBps>MAX_SPREAD_BPS) return null;
 
-  const vwap5=vwapAnchored(h5,l5,c5,v5,VWAP_5M_WIN);
-  const z_vwap=(c5.at(-1)-vwap5)/(atr5||1);
+              const K5=120,K15=96,K1H=96,EMA_FAST=21,EMA_SLOW=50,ADX_P=14,VWAP_5M_WIN=36;
+              const [k5,k15,k1h]=await Promise.all([fetchK(BASE,sym,"5m",K5),fetchK(BASE,sym,"15m",K15),fetchK(BASE,sym,"1h",K1H)]);
+              if(!k5||!k15||!k1h) return null;
 
-  const slice=c5.slice(-20);
-  const bbWidth=2*std(slice)/(c5.at(-1)||1);
-  const kelWidth=(atr5/(c5.at(-1)||1))*2;
-  const squeezeRatio = kelWidth>0 ? bbWidth/kelWidth : 1;
+              const h5=k5.map(x=>+x[2]), l5=k5.map(x=>+x[3]), c5=k5.map(x=>+x[4]), v5=k5.map(x=>+x[5]);
+              const c15=k15.map(x=>+x[4]), h15=k15.map(x=>+x[2]), l15=k15.map(x=>+x[3]);
+              const c1h=k1h.map(x=>+x[4]);
 
-  const trendAlign5=(c5.at(-1)>em21_5 && em21_5>em50_5) ? 1 : (c5.at(-1)<em21_5 && em21_5<em50_5) ? -1 : 0;
-  const trendAlign15=(c15.at(-1)>em21_15 && em21_15>em50_15) ? 1 : (c15.at(-1)<em21_15 && em21_15<em50_15) ? -1 : 0;
+              const { adx:adx5, atr:atr5 }=computeADX_ATR(h5,l5,c5,ADX_P)||{}; if(!(adx5&&atr5)) return null;
+              const atr_bps=Math.round((atr5/(c5.at(-1)||1))*10000); if(atr_bps<4||atr_bps>260) return null;
 
-  // Style probabilities
-  const sTrend = 0.5*trendAlign5 + 0.35*trendAlign15 + 0.15*Math.sign(roc1h);
-  const p_up_trend = sigmoid(1.2*sTrend + 0.03*(adx5-20) + 0.35*Math.sign(regime.dir));
-  const sMR = -Math.tanh(z_vwap)*0.9 + (1-clamp((adx5-16)/14,0,1))*0.3 + (1/Math.max(0.5,squeezeRatio))*0.1;
-  const p_up_mr = sigmoid(sMR);
-  const boBase = Math.sign(0.6*roc5+0.4*roc15) * (0.6+0.4*clamp((adx5-16)/14,0,1)) * (1+0.3*clamp((1.15 - squeezeRatio)/0.45,0,1));
-  const p_up_bo = sigmoid(0.9*boBase);
+              const em21_5=ema(c5,EMA_FAST), em50_5=ema(c5,EMA_SLOW);
+              const em21_15=ema(c15,EMA_FAST), em50_15=ema(c15,EMA_SLOW);
 
-  const regVec = [(regime.regime==="trend"?1.0:0.6),(regime.regime==="trend"?0.6:1.0),0.8];
-  const eReg=regVec.map(x=>Math.exp(x)); const sReg=eReg.reduce((a,b)=>a+b,0)||1;
-  const wT=eReg[0]/sReg, wM=eReg[1]/sReg, wB=eReg[2]/sReg;
+              const roc5=(c5.at(-1)/c5.at(-2)-1)||0, roc15=(c15.at(-1)/c15.at(-4)-1)||0, roc1h=(c1h.at(-1)/c1h.at(-2)-1)||0;
+              const vwap5=vwapAnchored(h5,l5,c5,v5,VWAP_5M_WIN);
+              const z_vwap=(c5.at(-1)-vwap5)/(atr5||1);
 
-  const pLong0 = clamp(wT*p_up_trend + wM*p_up_mr + wB*p_up_bo, 0.05, 0.95);
-  const pShort0= clamp(wT*(1-p_up_trend) + wM*(1-p_up_mr) + wB*(1-p_up_bo), 0.05, 0.95);
+              const slice=c5.slice(-20); const bbWidth=2*std(slice)/(c5.at(-1)||1); const kelWidth=(atr5/(c5.at(-1)||1))*2; const squeezeRatio=kelWidth>0? bbWidth/kelWidth : 1;
 
-  // Depth / OBI / slip / fill
-  const depth=await fetchDepth(base,sym,50);
-  let obi=0, slipL=spreadBps/2, slipS=spreadBps/2, fillL=0, fillS=0;
-  if(depth?.asks?.length && depth?.bids?.length){
-    const OBI_TOPN=12, w=(i)=>Math.exp(-i*0.18);
-    let bidNot=0, askNot=0;
-    for(let j=0;j<Math.min(OBI_TOPN, depth.bids.length); j++){ const pr=+depth.bids[j][0], q=+depth.bids[j][1]; if(pr>0&&q>0) bidNot+=pr*q*w(j); }
-    for(let j=0;j<Math.min(OBI_TOPN, depth.asks.length); j++){ const pr=+depth.asks[j][0], q=+depth.asks[j][1]; if(pr>0&&q>0) askNot+=pr*q*w(j); }
-    obi=(bidNot+askNot>0)? (bidNot-askNot)/(bidNot+askNot) : 0;
+              const trendAlign5=(c5.at(-1)>em21_5 && em21_5>em50_5) ? 1 : (c5.at(-1)<em21_5 && em21_5<em50_5) ? -1 : 0;
+              const trendAlign15=(c15.at(-1)>em21_15 && em21_15>em50_15) ? 1 : (c15.at(-1)<em21_15 && em21_15<em50_15) ? -1 : 0;
 
-    const vwapFill=(levels,targetUSD)=>{ let remain=targetUSD,val=0,qty=0; for(const [ps,qs] of levels){ const pr=+ps,q=+qs; if(!(pr>0&&q>0)) continue; const can=pr*q, take=Math.min(remain,can), tq=take/pr; val+=pr*tq; qty+=tq; remain-=take; if(remain<=1e-6) break; } return { px: qty>0? val/qty : null, filledUSD:(targetUSD-remain) }; };
-    const targ=Math.max(50,SIGNAL_NOTIONAL);
-    const buy=vwapFill(depth.asks,targ), sell=vwapFill(depth.bids,targ);
-    slipL = buy.px? Math.max(0, Math.round((buy.px - mid)/mid*10000)) : slipL;
-    slipS = sell.px? Math.max(0, Math.round((mid - sell.px)/mid*10000)) : slipS;
-    fillL = Math.min(1, buy.filledUSD/Math.max(1,SIGNAL_NOTIONAL));
-    fillS = Math.min(1, sell.filledUSD/Math.max(1,SIGNAL_NOTIONAL));
-  }
+              const sTrend=0.5*trendAlign5 + 0.35*trendAlign15 + 0.15*Math.sign(roc1h);
+              const p_up_trend = sigmoid(1.2*sTrend + 0.03*(adx5-20) + 0.35*Math.sign(regime.dir));
+              const sMR = -Math.tanh(z_vwap)*0.9 + (1-clamp((adx5-16)/14,0,1))*0.3 + (1/Math.max(0.5,squeezeRatio))*0.1;
+              const p_up_mr = sigmoid(sMR);
+              const boBase = Math.sign(0.6*roc5+0.4*roc15) * (0.6+0.4*clamp((adx5-16)/14,0,1)) * (1+0.3*clamp((1.15 - squeezeRatio)/0.45,0,1));
+              const p_up_bo = sigmoid(0.9*boBase);
 
-  // Worker-style EV
-  const costLong = BASE_COST_BPS + Math.max(Math.round(spreadBps/2), slipL);
-  const costShort= BASE_COST_BPS + Math.max(Math.round(spreadBps/2), slipS);
-  const TPw = Math.round(WORKER_SL_BPS * WORKER_R);
-  const SLw = WORKER_SL_BPS;
+              const regVec=[(regime.regime==="trend"?1.0:0.6),(regime.regime==="trend"?0.6:1.0),0.8];
+              const eReg=regVec.map(x=>Math.exp(x)); const sReg=eReg.reduce((a,b)=>a+b,0)||1;
+              const wT=eReg[0]/sReg, wM=eReg[1]/sReg, wB=eReg[2]/sReg;
 
-  // Confidence → Wilson
-  const liqHint = 0.7;
-  let nConf = Math.round(clamp(46 + 26*clamp((adx5-16)/14,0,1) + 22*liqHint + 10*Math.abs(obi), 32, 132));
-  const pL_lcb = wilsonLCB(pLong0,  nConf, 1.34);
-  const pS_lcb = wilsonLCB(pShort0, 1.34*nConf/nConf, 1.34); // same nConf
+              const pLong0=clamp(wT*p_up_trend + wM*p_up_mr + wB*p_up_bo, 0.05, 0.95);
+              const pShort0=clamp(wT*(1-p_up_trend) + wM*(1-p_up_mr) + wB*(1-p_up_bo), 0.05, 0.95);
 
-  const EVw_long  = Math.round(pL_lcb*TPw - (1-pL_lcb)*SLw - costLong);
-  const EVw_short = Math.round(pS_lcb*TPw - (1-pS_lcb)*SLw - costShort);
+              // Depth / OBI / slip / fill
+              const depth=await fetchDepth(BASE,sym,50);
+              let obi=0, slipL=spreadBps/2, slipS=spreadBps/2, fillL=0, fillS=0;
+              if(depth?.asks?.length && depth?.bids?.length){
+                const w=(i)=>Math.exp(-i*0.18); let bidNot=0, askNot=0;
+                for(let j=0;j<Math.min(12, depth.bids.length); j++){ const pr=+depth.bids[j][0], q=+depth.bids[j][1]; if(pr>0&&q>0) bidNot+=pr*q*w(j); }
+                for(let j=0;j<Math.min(12, depth.asks.length); j++){ const pr=+depth.asks[j][0], q=+depth.asks[j][1]; if(pr>0&&q>0) askNot+=pr*q*w(j); }
+                obi=(bidNot+askNot>0)? (bidNot-askNot)/(bidNot+askNot) : 0;
 
-  // Threshold to pass Worker floor
-  const thrLong = (SLw + costLong + WORKER_FLOOR_BPS) / (TPw + SLw);
-  const thrShort= (SLw + costShort+ WORKER_FLOOR_BPS) / (TPw + SLw);
+                const vwapFill=(levels,targetUSD)=>{ let remain=targetUSD,val=0,qty=0; for(const [ps,qs] of levels){ const pr=+ps,q=+qs; if(!(pr>0&&q>0)) continue; const can=pr*q, take=Math.min(remain,can), tq=take/pr; val+=pr*tq; qty+=tq; remain-=take; if(remain<=1e-6) break; } return { px: qty>0? val/qty : null, filledUSD:(targetUSD-remain) }; };
+                const targ=Math.max(50,SIGNAL_NOTIONAL);
+                const buy=vwapFill(depth.asks,targ), sell=vwapFill(depth.bids,targ);
+                slipL = buy.px? Math.max(0, Math.round((buy.px - mid)/mid*10000)) : slipL;
+                slipS = sell.px? Math.max(0, Math.round((mid - sell.px)/mid*10000)) : slipS;
+                fillL = Math.min(1, buy.filledUSD/Math.max(1,SIGNAL_NOTIONAL));
+                fillS = Math.min(1, sell.filledUSD/Math.max(1,SIGNAL_NOTIONAL));
+              }
 
-  let side="long", p0=pLong0, p_lcb=pL_lcb, EVw=EVw_long, cost=costLong, fill=fillL;
-  if(EVw_short>EVw_long){ side="short"; p0=pShort0; p_lcb=pS_lcb; EVw=EVw_short; cost=costShort; fill=fillS; }
+              const costLong=BASE_COST_BPS + Math.max(Math.round(spreadBps/2), slipL);
+              const costShort=BASE_COST_BPS + Math.max(Math.round(spreadBps/2), slipS);
+              const TPw=Math.round(WORKER_SL_BPS*WORKER_R), SLw=WORKER_SL_BPS;
 
-  const pThr = side==="long" ? thrLong : thrShort;
-  const passP = (p_lcb >= pThr + 0.01);
-  const passEV= (EVw >= WORKER_FLOOR_BPS);
-  const passFill = fill >= 0.70;
-  if(!(passP && passEV && passFill && spreadBps<=MAX_SPREAD_BPS)) return null;
+              const liqHint=0.7; let nConf=Math.round(clamp(46 + 26*clamp((adx5-16)/14,0,1) + 22*liqHint + 10*Math.abs(obi), 32, 132));
+              const pL_lcb=wilsonLCB(pLong0, nConf, 1.34);
+              const pS_lcb=wilsonLCB(pShort0, nConf, 1.34);
 
-  // 5m returns for correlation limiting
-  const ret5=[]; for(let i=1;i<c5.length;i++) ret5.push(Math.log(c5[i]/c5[i-1]));
+              const EVw_long=Math.round(pL_lcb*TPw - (1-pL_lcb)*SLw - costLong);
+              const EVw_short=Math.round(pS_lcb*TPw - (1-pS_lcb)*SLw - costShort);
 
-  return {
-    sym, side, p_win:+p0.toFixed(3), p_lcb:+p_lcb.toFixed(3),
-    EVw, // Worker-aligned EV
-    TPw, SLw,
-    spreadBps, cost_bps:cost,
-    adx5:+(adx5||0).toFixed(1), atr_bps,
-    regime:regime.regime, obi:+obi.toFixed(3), fill_prob:+fill.toFixed(2),
-    ret5
-  };
-}
+              let side="long", p0=pLong0, p_lcb=pL_lcb, EVw=EVw_long, cost=costLong, fill=fillL;
+              if(EVw_short>EVw_long){ side="short"; p0=pShort0; p_lcb=pS_lcb; EVw=EVw_short; cost=costShort; fill=fillS; }
 
-// ====== Runner ======
-(async ()=>{
-  try{
-    const BASE = await pickMexcBase();
+              const thr = (SLw + cost + WORKER_FLOOR_BPS) / (TPw + SLw);
+              if(!(p_lcb >= thr + 0.01 && EVw >= WORKER_FLOOR_BPS && fill >= 0.70 && spreadBps<=MAX_SPREAD_BPS)) return null;
 
-    // optional health check
-    if(PUSH_URL && PUSH_TOKEN){
-      try{
-        const health = new URL(PUSH_URL);
-        const healthURL = `${health.origin}${health.pathname.replace(/\/signals\/push(\?.*)?$/,"/health")}`;
-        const r = await fetchWithTimeout(healthURL,{headers:{Authorization:`Bearer ${PUSH_TOKEN}`}},5000);
-        console.log("[pusher] health", r?.status);
-      }catch(e){ console.log("[pusher] health error", e?.message||e); }
-    }
+              const ret5=[]; for(let i=1;i<c5.length;i++) ret5.push(Math.log(c5[i]/c5[i-1]));
+              return { sym, side, p_win:+p0.toFixed(3), p_lcb:+p_lcb.toFixed(3), EVw, TPw, SLw, spreadBps, cost_bps:cost, adx5:+(adx5||0).toFixed(1), atr_bps, regime:regime.regime, obi:+obi.toFixed(3), fill_prob:+fill.toFixed(2), ret5 };
+            }
 
-    const ALL24 = await getJSON(api(BASE,"/api/v3/ticker/24hr"),10000,2) || await fetchAll24hr(BASE);
-    const booksRaw = await getJSON(api(BASE,"/api/v3/ticker/bookTicker"),10000,2) || [];
-    const bookMap = new Map(booksRaw.map(b=>[b.symbol,{ bid:+b.bidPrice, ask:+b.askPrice }]));
+            const BASE = await pickMexcBase();
+            // Universe build
+            const ALL24 = await getJSON(api(BASE,"/api/v3/ticker/24hr"),10000,2) || await fetchAll24hr(BASE);
+            const booksRaw = await getJSON(api(BASE,"/api/v3/ticker/bookTicker"),10000,2) || [];
+            const bookMap = new Map(booksRaw.map(b=>[b.symbol,{ bid:+b.bidPrice, ask:+b.askPrice }]));
+            const universe=(function build(all24){ let minQV=MIN_QV_START, pool=[]; while(minQV>=MIN_QV_MIN){ pool=[]; for(const t of all24||[]){ const sym=t.symbol||t.s; if(!sym) continue; const sq=(function split(s){ for(const q of QUOTES){ if(s.endsWith(q)) return { base:s.slice(0,-q.length), quote:q }; } return null; })(sym); if(!sq) continue; if(STABLES.has(sq.base.toUpperCase())) continue; const qv=+(t.quoteVolume||t.q||0); if(qv>=minQV) pool.push({ symbol:sym, base:sq.base, quote:sq.quote, qv }); } pool.sort((a,b)=>b.qv-a.qv); if(pool.length>=DESIRED_UNIVERSE) break; minQV-=MIN_QV_STEP; } if(pool.length===0){ for(const t of all24||[]){ const sym=t.symbol||t.s; if(!sym) continue; const sq=(function split(s){ for(const q of QUOTES){ if(s.endsWith(q)) return { base:s.slice(0,-q.length), quote:q }; } return null; })(sym); if(!sq) continue; if(STABLES.has(sq.base.toUpperCase())) continue; const qv=+(t.quoteVolume||t.q||0); pool.push({ symbol:sym, base:sq.base, quote:sq.quote, qv }); } pool.sort((a,b)=>b.qv-a.qv); } return pool.slice(0,UNIVERSE_CAP); })(ALL24);
 
-    // Adaptive universe
-    const pool = buildUniverse(ALL24, DESIRED_UNIVERSE, MIN_QV_START, MIN_QV_MIN, MIN_QV_STEP, UNIVERSE_CAP);
-    console.log(`[pusher] universe: ${pool.length} (target ${DESIRED_UNIVERSE})`);
+            log("universe", universe.length, "target", DESIRED_UNIVERSE);
 
-    const regime = await getRegime(BASE);
-    console.log(`[pusher] regime=${regime.regime} adxAvg~${regime.adxAvg?.toFixed?.(1)||''}`);
+            const regime = await (async function getReg() {
+              const BTC="BTCUSDT", ETH="ETHUSDT"; const K15=96,K1H=96,ADX_P=14;
+              const kB15=await fetchK(BASE,BTC,"15m",K15), kE15=await fetchK(BASE,ETH,"15m",K15), kB1=await fetchK(BASE,BTC,"1h",K1H), kE1=await fetchK(BASE,ETH,"1h",K1H);
+              const f=(k)=>{ if(!k||k.length<ADX_P+5) return { adx:0, roc:0 }; const h=k.map(x=>+x[2]), l=k.map(x=>+x[3]), c=k.map(x=>+x[4]); const { adx }=computeADX_ATR(h,l,c,ADX_P)||{}; const roc=(c.at(-1)/c.at(-5)-1)||0; return { adx:adx||0, roc }; };
+              const b=f(kB15), e=f(kE15), b1=f(kB1), e1=f(kE1);
+              const adxAvg=(b.adx+e.adx)/2; const dir=Math.sign((b.roc+e.roc)+(b1.roc+e1.roc));
+              const isTrend=adxAvg>=22 && Math.abs(b.roc)>0.001 && Math.abs(e.roc)>0.001;
+              return { regime: isTrend?"trend":"chop", adxAvg, dir };
+            })();
+            log("regime", regime.regime, "adxAvg", regime.adxAvg?.toFixed?.(1)||"");
 
-    // Score
-    const candidates=[];
-    const BATCH=8, TRY_MAX=Math.min(pool.length, UNIVERSE_CAP);
-    for(let i=0;i<TRY_MAX;i+=BATCH){
-      const part = await Promise.all(pool.slice(i,i+BATCH).map(async r=>{
-        try{ return await scoreSymbol(BASE, r.symbol, bookMap.get(r.symbol), regime); }catch{ return null; }
-      }));
-      for(const x of part) if(x) candidates.push(x);
-    }
-    console.log(`[pusher] candidates passing Worker EV: ${candidates.length}`);
+            // Score batch
+            const candidates=[];
+            const BATCH=8;
+            for(let i=0;i<universe.length;i+=BATCH){
+              const part=await Promise.all(universe.slice(i,i+BATCH).map(async r=>{ try{ return await scoreSymbol(r.symbol, bookMap.get(r.symbol), regime); }catch{ return null; } }));
+              for(const x of part) if(x) candidates.push(x);
+              if(candidates.length>=MAX_IDEAS) break;
+            }
+            log("candidates passing Worker gate:", candidates.length);
 
-    // Fallback: try megacaps if short
-    if(candidates.length < MIN_IDEAS){
-      const MEGAS=["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","DOGEUSDT"];
-      const seen=new Set(candidates.map(x=>x.sym));
-      for(const sym of MEGAS){
-        if(seen.has(sym)) continue;
-        const got=await scoreSymbol(BASE, sym, bookMap.get(sym), regime);
-        if(got){ candidates.push(got); seen.add(sym); }
-        if(candidates.length>=MIN_IDEAS) break;
-      }
-      console.log(`[pusher] after megacaps: ${candidates.length}`);
-    }
+            if(candidates.length<MIN_IDEAS){
+              const MEGAS=["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","DOGEUSDT"];
+              const seen=new Set(candidates.map(x=>x.sym));
+              for(const sym of MEGAS){
+                if(seen.has(sym)) continue;
+                const got=await scoreSymbol(sym, bookMap.get(sym), regime);
+                if(got){ candidates.push(got); seen.add(sym); }
+                if(candidates.length>=MIN_IDEAS) break;
+              }
+              log("after megacaps:", candidates.length);
+            }
 
-    // Rank + correlation limit
-    candidates.sort((a,b)=> b.EVw!==a.EVw ? b.EVw-a.EVw
-                              : b.p_lcb!==a.p_lcb ? b.p_lcb-a.p_lcb
-                              : a.spreadBps-b.spreadBps);
-    const CORE_CORR_MAX=0.88;
-    const picks=[];
-    for(const x of candidates){
-      if(picks.length>=MAX_IDEAS) break;
-      let ok=true; for(const y of picks){ if(corr(x.ret5,y.ret5)>CORE_CORR_MAX){ ok=false; break; } }
-      if(ok) picks.push(x);
-    }
+            candidates.sort((a,b)=> b.EVw!==a.EVw ? b.EVw-a.EVw : b.p_lcb!==a.p_lcb ? b.p_lcb-a.p_lcb : a.spreadBps-b.spreadBps);
+            const CORE_CORR_MAX=0.88; const picks=[];
+            for(const x of candidates){ if(picks.length>=MAX_IDEAS) break; let ok=true; for(const y of picks){ if(corr(x.ret5,y.ret5)>CORE_CORR_MAX){ ok=false; break; } } if(ok) picks.push(x); }
 
-    // Build payload
-    const ideas = picks.map((x,i)=>{
-      const base = x.sym.replace(/(USDT|USDC|USD)$/,"");
-      const quote= x.sym.slice(base.length);
-      const ttl_sec = clamp(900 + i*20, 420, 2000);
-      return {
-        symbol: base,
-        symbol_full: x.sym,
-        quote,
-        side: x.side,
-        rank: i+1,
-        // Worker-style exits to match its EV gate
-        tp_bps: x.TPw,
-        sl_bps: x.SLw,
+            const ideas=picks.map((x,i)=>{ const base=x.sym.replace(/(USDT|USDC|USD)$/,""); const quote=x.sym.slice(base.length); const ttl_sec=clamp(900 + i*20, 420, 2000); return { symbol:base, symbol_full:x.sym, quote, side:x.side, rank:i+1, tp_bps:x.TPw, sl_bps:x.SLw, p_win:x.p_win, p_lcb:x.p_lcb, exp_lcb_bps:x.EVw, ev_bps:x.EVw, spread_bps:x.spreadBps, cost_bps:x.cost_bps, adx:x.adx5, atr_bps:x.atr_bps, regime:x.regime, obi:x.obi, fill_prob:x.fill_prob, ttl_sec, size_bps:100, quality_tag:"strict" }; });
 
-        p_win: x.p_win,
-        p_lcb: x.p_lcb,
+            const payload={ ts:new Date().toISOString(), mode:"normal", source:"external_pusher", meta:{ origin:"github_actions", reason: ideas.length? "ok":"no_ideas", exchange:"mexc" }, top_n:ideas.length, ideas };
+            log(`pushing ${ideas.length} ideas to ${process.env.WORKER_PUSH_URL}`);
+            try{ const r=await fetchWithTimeout(process.env.WORKER_PUSH_URL,{ method:"POST", headers:{ "Content-Type":"application/json","Authorization":`Bearer ${process.env.PUSH_TOKEN}` }, body: JSON.stringify(payload) },15000); let txt=""; try{ txt=await r.text(); }catch{}; log("push status", r?.status||"ERR", (txt||"").slice(0,240)); }catch(e){ log("push failed", e?.message||e); }
+          })().catch(e=>{ console.error("[gha] fatal", e?.message||e); });
+          NODE
 
-        // Worker-aligned EV fields
-        exp_lcb_bps: x.EVw,
-        ev_bps: x.EVw,
-
-        spread_bps: x.spreadBps,
-        cost_bps: x.cost_bps,
-        adx: x.adx5,
-        atr_bps: x.atr_bps,
-        regime: x.regime,
-        obi: x.obi,
-        fill_prob: x.fill_prob,
-        ttl_sec,
-        size_bps: 100, // simple fixed size; your Worker can override
-        quality_tag: "strict"
-      };
-    });
-
-    const payload = {
-      ts: new Date().toISOString(),
-      mode: "normal",
-      source: "external_pusher",
-      meta: { origin: "standalone", reason: ideas.length ? "ok" : "no_ideas", exchange: "mexc" },
-      top_n: ideas.length,
-      ideas
-    };
-
-    if(PUSH_URL && PUSH_TOKEN){
-      console.log(`[pusher] pushing ${ideas.length} ideas to ${PUSH_URL}`);
-      try{
-        const r = await fetchWithTimeout(PUSH_URL,{
-          method:"POST",
-          headers:{ "Content-Type":"application/json", "Authorization":`Bearer ${PUSH_TOKEN}` },
-          body: JSON.stringify(payload)
-        }, 15000);
-        const txt = await r.text().catch(()=> "");
-        console.log("[pusher] push status", r?.status, (txt||"").slice(0,220));
-      }catch(e){ console.log("[pusher] push failed", e?.message||e); }
-    }else{
-      console.log(JSON.stringify(payload,null,2));
-    }
-
-  }catch(e){
-    console.error("[pusher] error", e?.message||e);
-    if(PUSH_URL && PUSH_TOKEN){
-      const payload = { ts:new Date().toISOString(), mode:"normal", source:"external_pusher", meta:{origin:"standalone", reason:"data_error", error:(e?.message||String(e)).slice(0,220)}, top_n:0, ideas:[] };
-      try{
-        const r = await fetchWithTimeout(PUSH_URL,{ method:"POST", headers:{ "Content-Type":"application/json","Authorization":`Bearer ${PUSH_TOKEN}` }, body: JSON.stringify(payload) },15000);
-        const txt = await r.text().catch(()=> "");
-        console.log("[pusher] push status", r?.status, (txt||"").slice(0,220));
-      }catch(e2){}
-    }
-  }
-})();
+          EXIT_CODE=$?
+          set -e
+          if [[ $EXIT_CODE -ne 0 ]]; then
+            echo "[gha] pusher exited code $EXIT_CODE — sending minimal payload"
+            health_url="${WORKER_PUSH_URL/\/signals\/push/\/health}"
+            curl -sS -H "Authorization: Bearer ${PUSH_TOKEN}" --max-time 8 "$health_url" >/dev/null || true
+            now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+            payload='{"ts":"'"$now"'","mode":"normal","source":"external_pusher","meta":{"origin":"github_actions","reason":"fallback_node_error"},"top_n":0,"ideas":[]}'
+            http_code=$(curl -sS -o /tmp/push_resp.txt -w "%{http_code}" -X POST -H "Content-Type: application/json" -H "Authorization: Bearer ${PUSH_TOKEN}" --data "${payload}" --max-time 12 "${WORKER_PUSH_URL}" || true)
+            body="$(head -c 400 /tmp/push_resp.txt || true)"
+            echo "[gha] push status ${http_code} ${body}"
+            exit 0
+          fi
