@@ -1,3 +1,4 @@
+
 name: Ideas Pusher (MEXC 2.1)
 
 on:
@@ -40,6 +41,10 @@ jobs:
       ACTIVE_UTC_END: ${{ vars.ACTIVE_UTC_END }}
       MEXC_BASE: ${{ vars.MEXC_BASE }}
 
+      # New knobs
+      FORCE_SIZE_BPS: ${{ vars.FORCE_SIZE_BPS }}  # e.g., 1000 = 10% per trade; 0 to use risk-based sizing
+      MP_TOP_POOL: ${{ vars.MP_TOP_POOL }}        # fallback pool size for Max-Power, e.g., 20
+
     steps:
       - name: Setup Node 20
         uses: actions/setup-node@v4
@@ -65,7 +70,7 @@ jobs:
             // ---------- Utils ----------
             const clamp=(x,a,b)=>Math.max(a,Math.min(b,x));
             const tanh=(x)=>Math.tanh(x);
-            const ema=(arr,p)=>{ if(arr.length<p) return null; const k=2/(p+1); let e=arr.slice(0,p).reduce((a,b)=>a+b,0)/p; for(let i=p;i<arr.length;i++) e=arr[i]*k+e*(1-k); return e; };
+            const ema=(arr,p)=>{ if(arr.length<p) return null; const k=2/(p+1); let e=arr.slice(0,p).reduce((a,b)=>a+b,0)/p; for(let i=0;i<arr.length;i++) if(i>=p) e=arr[i]*k+e*(1-k); return e; };
             const rsi=(cl,p=14)=>{ if(cl.length<=p) return null; let g=0,l=0; for(let i=1;i<=p;i++){ const d=cl[i]-cl[i-1]; g+=d>0?d:0; l+=d<0?-d:0; } let ag=g/p, al=l/p; for(let i=p+1;i<cl.length;i++){ const d=cl[i]-cl[i-1]; ag=(ag*(p-1)+(d>0?d:0))/p; al=(al*(p-1)+(d<0?-d:0))/p; } const rs=al===0?100:ag/al; return 100-100/(1+rs); };
             const std=(x)=>{ const n=x.length; if(n<=1) return 0; const m=x.reduce((a,b)=>a+b,0)/n; let v=0; for(const xi of x) v+=(xi-m)*(xi-m); return Math.sqrt(v/(n-1)); };
             const computeADX_ATR=(h,l,c,p=14)=>{ const n=c.length; if(n<p+2) return null; const TR=[],plusDM=[],minusDM=[];
@@ -136,7 +141,7 @@ jobs:
             // Defaults tightened for realistic top-10% retail on MEXC
             let MIN_QV = Number(process.env.MIN_QV_USD||"0") || 30_000_000;
             const TOP_N = Number(process.env.TOP_N||"10");              // core ideas target
-            const EXTRA_IDEAS_MAX = Number(process.env.EXTRA_IDEAS_MAX||"6"); // retained but superseded by strict/fallback caps
+            const EXTRA_IDEAS_MAX = Number(process.env.EXTRA_IDEAS_MAX||"6");
             const MAX_SPREAD_BPS = Number(process.env.MAX_SPREAD_BPS||"12");
             const EXP_LCB_MIN_BPS = Number(process.env.EXP_LCB_MIN_BPS||"5");
 
@@ -164,8 +169,12 @@ jobs:
             const SCORE_CUTOFF = 50;         // Step 2 cutoff
             const REFINE_TOPK = 120;         // Step 3 deep analysis limit
             const MAX_STRICT_PICKS = Math.min(3, TOP_N); // Step 4: up to 3 A+ ideas
-            const MAX_FALLBACK_PICKS = 3;    // Step 5: if strict empty, pick 1-3 B- ideas
-            const FALLBACK_SIZE_FACTOR = 0.55; // 40–60% smaller; we use 55%
+            const MAX_FALLBACK_PICKS = 3;    // retained but superseded by strict/fallback logic
+            const FALLBACK_SIZE_FACTOR = 0.55; // 55% sizing for fallback (if used)
+
+            // New knobs
+            const FORCE_SIZE_BPS = Number(process.env.FORCE_SIZE_BPS || "0"); // 1000 => 10%
+            const MP_TOP_POOL = Number(process.env.MP_TOP_POOL || "20");      // top-N to pass through Max-Power
 
             const S_H = process.env.ACTIVE_UTC_START? Number(process.env.ACTIVE_UTC_START): null;
             const E_H = process.env.ACTIVE_UTC_END?   Number(process.env.ACTIVE_UTC_END):   null;
@@ -244,7 +253,7 @@ jobs:
               }catch{}
             }
 
-            // UPDATED: evalPending with fill-first for limit-at-SL entry
+            // UPDATED: evalPending with absolutes support + fill-first
             async function evalPending(state){
               const now=Date.now(); const keep=[];
               for(const p of state.pending||[]){
@@ -253,14 +262,15 @@ jobs:
                 if(!k){ keep.push(p); continue; }
 
                 const ts=k.map(x=>+x[0]), highs=k.map(x=>+x[2]), lows=k.map(x=>+x[3]), closes=k.map(x=>+x[4]);
-                const entry=p.entry_price, long=p.side==="long", tp=p.tp_bps/10000, sl=p.sl_bps/10000;
+                const long = p.side==="long";
+                const entry = Number.isFinite(p.entry_limit) ? p.entry_limit : p.entry_price;
+                const tpB = (p.tp_bps||0)/10000, slB=(p.sl_bps||0)/10000;
 
-                // Use fill-first logic if this was a limit-at-old-SL policy
                 const limitAtSL = p.entry_policy==="limit_at_old_sl";
 
                 if(limitAtSL){
                   const t0=p.ts_ms, tEnd=t0 + p.hold_sec*1000;
-                  // 1) Find fill (touch of entry)
+                  // Find fill (touch of entry_limit)
                   let iFill=-1;
                   for(let i=0;i<k.length;i++){
                     const t=ts[i]; if(t < t0-1000) continue; if(t > tEnd) break;
@@ -270,10 +280,12 @@ jobs:
                     // No fill within the hold window: treat as no-trade (drop without equity update)
                     continue;
                   }
-                  // 2) From fill forward, check TP/SL first-touch
+                  // Determine TP/SL absolute targets
+                  const tpPx = Number.isFinite(p.tp_abs) ? p.tp_abs : (long ? entry*(1+tpB) : entry*(1-tpB));
+                  const slPx = Number.isFinite(p.sl_abs) ? p.sl_abs : (long ? entry*(1-slB) : entry*(1+slB));
+
+                  // From fill forward, check TP/SL first-touch
                   let exitPx=closes.at(-1);
-                  const tpPx = long ? entry*(1+tp) : entry*(1-tp);
-                  const slPx = long ? entry*(1-sl) : entry*(1+sl);
                   for(let i=iFill;i<k.length;i++){
                     const t=ts[i]; if(t > tEnd) break;
                     const hi=highs[i], lo=lows[i];
@@ -289,12 +301,12 @@ jobs:
                   const pnl_bps = Math.round(ret*10000) - (p.cost_bps||0);
                   state.equity.push({ ts_ms:p.ts_ms, pnl_bps });
                 }else{
-                  // Original behavior (not used now, but kept for backward compatibility)
+                  // Legacy
                   let exitPx=closes.at(-1);
                   for(let i=0;i<k.length;i++){
                     const hi=highs[i], lo=lows[i];
-                    if(long){ if(hi>=entry*(1+tp)){ exitPx=entry*(1+tp); break; } if(lo<=entry*(1-sl)){ exitPx=entry*(1-sl); break; } }
-                    else    { if(lo<=entry*(1-tp)){ exitPx=entry*(1-tp); break; } if(hi>=entry*(1+sl)){ exitPx=entry*(1+sl); break; } }
+                    if(long){ if(hi>=entry*(1+tpB)){ exitPx=entry*(1+tpB); break; } if(lo<=entry*(1-slB)){ exitPx=entry*(1-slB); break; } }
+                    else    { if(lo<=entry*(1-tpB)){ exitPx=entry*(1-tpB); break; } if(hi>=entry*(1+slB)){ exitPx=entry*(1+slB); break; } }
                   }
                   const ret = long? (exitPx/entry - 1) : (entry/exitPx - 1);
                   const pnl_bps = Math.round(ret*10000) - (p.cost_bps||0);
@@ -309,7 +321,7 @@ jobs:
               return { pnl24_bps:Math.round(pnl24), peak_dd_bps:Math.round(dd) };
             };
 
-            // ---------- Main (strict-first then fallback) ----------
+            // ---------- Main (strict-first then MP fallback) ----------
             let reason="ok", tier="none";
             try{
               const ALL24 = await fetchAll24hr();
@@ -387,7 +399,6 @@ jobs:
                 let slATR = style==="trend" ? SL_TREND_BASE : style==="mr" ? SL_MR_BASE : SL_BO_BASE;
                 slATR *= (1 + 0.24*(1-adxF));
                 if(spread_bps>12) slATR*=1.08;
-                // widen a touch if adverse OB pressure (obi_adj in 0..1)
                 slATR *= (1 + 0.08*clamp(obi_adj,0,1));
                 if(style==="trend" && trend_align && adxF>0.65 && p>0.64) slATR*=0.88;
                 slATR=clamp(slATR, SL_ATR_MIN, SL_ATR_MAX);
@@ -475,12 +486,12 @@ jobs:
                     const boUp = pHigh ? (last>pHigh) : false;
                     const boDn = pLow  ? (last<pLow ) : false;
 
-                    // Squeeze: BB width vs Keltner-ish width (ATR)
+                    // Squeeze: BB width vs ATR
                     const winS=20; const retW=[]; for(let i=c5.length-winS;i<c5.length;i++){ retW.push((c5[i]/c5[i-1])-1); }
-                    const bbWidth = std(retW)*Math.sqrt(winS); // approx
+                    const bbWidth = std(retW)*Math.sqrt(winS);
                     const kelWidth = (atr5/last);
                     const squeezeRatio = kelWidth>0 ? (bbWidth/kelWidth) : 1;
-                    const squeezeScore = clamp((1.15 - squeezeRatio)/0.45, 0, 1); // >0 when BB < ~1.15x Keltner
+                    const squeezeScore = clamp((1.15 - squeezeRatio)/0.45, 0, 1);
 
                     // Experts
                     const sideTrend= (0.6*roc5+0.4*roc15)>=0 ? "long":"short";
@@ -562,7 +573,7 @@ jobs:
               picksRaw.sort((a,b)=> b.signalScore - a.signalScore);
               const REFINE_M = Math.min(REFINE_TOPK, picksRaw.length);
               const refined=[];
-              function retLog(arr){ const r=[]; for(let i=1;i<arr.length;i++) r.push(Math.log(arr[i]/arr[i-1])); return r; }
+              function retLog(arr){ const r=[]; for(let i=1;i<arr.length;i++) r.push(Math.log(arr[i]/arr[i-1])); return r.slice(-36); }
 
               for(let idx=0; idx<REFINE_M; idx++){
                 const p=picksRaw[idx];
@@ -607,7 +618,9 @@ jobs:
                 const expShort= rrrShort? Math.round(pShort*rrrShort.tp_bps - (1-pShort)*rrrShort.sl_bps - costShort): -1e9;
 
                 // Multi-factor beta (BTC/ETH/SOL)
-                const y = retLog(p.c5.slice(-61));
+                const y = (()=>{
+                  const arr=[]; for(let i=1;i<p.c5.length;i++) arr.push(Math.log(p.c5[i]/p.c5[i-1])); return arr.slice(-61);
+                })();
                 const X1=fBTC.slice(-y.length), X2=fETH.slice(-y.length), X3=fSOL.slice(-y.length);
                 const {R2} = olsR2(y,[X1,X2,X3]);
                 const liq = liqPct.get(c.symbol)||0.5;
@@ -665,7 +678,15 @@ jobs:
                   ret5:(()=>{ const r=[]; for(let i=1;i<p.c5.length;i++) r.push(Math.log(p.c5[i]/p.c5[i-1])); return r.slice(-36); })(),
                   fill_prob: +fillSide.toFixed(2),
                   dyn_floor: dynFloor,
-                  signal_score: p.signalScore
+                  signal_score: p.signalScore,
+
+                  // For Max-Power overlay
+                  p_long_adj: pLong, p_short_adj: pShort,
+                  cost_long: costLong, cost_short: costShort,
+                  style_long: p.styleLong, style_short: p.styleShort,
+                  lvl_gap_long_bps: p.lvl_gap_long_bps, lvl_gap_short_bps: p.lvl_gap_short_bps,
+                  trend_align_long: (p.upF&&p.upS&&p.up15&&p.up1h),
+                  trend_align_short: (!p.upF&&!p.upS&&(!p.up15||!p.up1h))
                 });
               }
 
@@ -677,8 +698,8 @@ jobs:
                               : b.signal_score!==a.signal_score ? b.signal_score-a.signal_score
                               : b.qv-a.qv);
 
-              // Selection framework: Strict first (A+), then Fallback (B-) if none
-              const CORE_CORR_MAX=0.84, OF_CORR_MAX=0.90; // correlation caps
+              // Selection framework: Strict first, then Max-Power top-20 with exactly 3 picks
+              const CORE_CORR_MAX=0.84, OF_CORR_MAX=0.90;
               const rho=(a,b)=>corr(a.ret5||[],b.ret5||[]);
 
               const strictOk=(cand)=>{
@@ -689,16 +710,8 @@ jobs:
                   && cand.spread_bps<=MAX_SPREAD_BPS
                   && cand.beta_r2<=0.75;
               };
-              const fallbackOk=(cand)=>{
-                return cand.p_lcb>=0.52
-                  && cand.exp_lcb_bps>=Math.max(EXP_LCB_MIN_BPS-2, 2)
-                  && cand.fill_prob>=0.55
-                  && cand.cost_bps<=Math.max(COST_BPS+12, 22)
-                  && cand.spread_bps<=Math.min(MAX_SPREAD_BPS+4, 24)
-                  && cand.beta_r2<=0.88;
-              };
 
-              // Strict picks (up to 1–3)
+              // Strict picks (up to 3), apply correlation cap, no fill-to-3
               const picksStrict=[];
               for(const cand of refined){
                 if(picksStrict.length>=MAX_STRICT_PICKS) break;
@@ -709,77 +722,165 @@ jobs:
               }
 
               let selected=[], selectionTier="none";
+
               if(picksStrict.length>0){
-                selected=picksStrict;
+                selected=picksStrict;                         // exactly however many passed strict (1–3)
                 selectionTier="strict";
                 reason = (reason!=="ok"?reason:"strict");
               }else{
-                // Fallback (1–3 best) if strict found nothing
-                const picksFallback=[];
-                for(const cand of refined){
-                  if(picksFallback.length>=MAX_FALLBACK_PICKS) break;
-                  if(!fallbackOk(cand)) continue;
+                // Max‑Power fallback: take top-20 by score, compute conservative side/RRR, rank by EV LCB, push 3 best
+                const pool = Array.from(refined)
+                  .sort((a,b)=> b.score!==a.score ? (b.score-a.score) : (b.signal_score-a.signal_score))
+                  .slice(0, Math.max(3, MP_TOP_POOL||20));
+
+                function mpEnhance(c){
+                  const pL_long  = wilsonLCB(c.p_long_adj||0.5, c.n_conf||60, WILSON_Z);
+                  const pL_short = wilsonLCB(c.p_short_adj||0.5, c.n_conf||60, WILSON_Z);
+                  const obiAdjLong  = Math.max(0, -(c.obi||0));
+                  const obiAdjShort = Math.max(0, +(c.obi||0));
+
+                  const rrrL = computeAutoRRR({
+                    p:pL_long, adx:+c.adx||0, atr_bps:c.atr_bps, cost_bps:c.cost_long||c.cost_bps,
+                    spread_bps:c.spread_bps, trend_align:!!c.trend_align_long,
+                    style:c.style_long||"trend", lvl_gap_bps:c.lvl_gap_long_bps||0, obi_adj:obiAdjLong
+                  });
+                  const rrrS = computeAutoRRR({
+                    p:pL_short, adx:+c.adx||0, atr_bps:c.atr_bps, cost_bps:c.cost_short||c.cost_bps,
+                    spread_bps:c.spread_bps, trend_align:!!c.trend_align_short,
+                    style:c.style_short||"trend", lvl_gap_bps:c.lvl_gap_short_bps||0, obi_adj:obiAdjShort
+                  });
+
+                  const expL = rrrL ? Math.round(pL_long*rrrL.tp_bps - (1-pL_long)*rrrL.sl_bps - (c.cost_long||c.cost_bps)) : -1e9;
+                  const expS = rrrS ? Math.round(pL_short*rrrS.tp_bps - (1-pL_short)*rrrS.sl_bps - (c.cost_short||c.cost_bps)) : -1e9;
+
+                  let mp_side="long", mp_tp_bps=0, mp_sl_bps=0, mp_rrr=0, mp_exp_lcb_bps=-1e9, mp_exp_bps=-1e9;
+                  if(expL>=expS && rrrL){
+                    mp_side="long"; mp_tp_bps=rrrL.tp_bps; mp_sl_bps=rrrL.sl_bps; mp_rrr=rrrL.r_used;
+                    mp_exp_lcb_bps=expL; mp_exp_bps = Math.round((c.p_long_adj||pL_long)*rrrL.tp_bps - (1-(c.p_long_adj||pL_long))*rrrL.sl_bps - (c.cost_long||c.cost_bps));
+                  }else if(rrrS){
+                    mp_side="short"; mp_tp_bps=rrrS.tp_bps; mp_sl_bps=rrrS.sl_bps; mp_rrr=rrrS.r_used;
+                    mp_exp_lcb_bps=expS; mp_exp_bps = Math.round((c.p_short_adj||pL_short)*rrrS.tp_bps - (1-(c.p_short_adj||pL_short))*rrrS.sl_bps - (c.cost_short||c.cost_bps));
+                  }
+                  return { ...c, mp_side, mp_tp_bps, mp_sl_bps, mp_rrr, mp_exp_lcb_bps, mp_exp_bps };
+                }
+
+                const poolMP = pool.map(mpEnhance)
+                                   .sort((a,b)=> (b.mp_exp_lcb_bps - a.mp_exp_lcb_bps) || (b.mp_exp_bps - a.mp_exp_bps) || (b.score - a.score));
+
+                const pickN = 3; // hard-push 3 best when strict is empty
+                const corrMax = OF_CORR_MAX;
+                const take=[];
+                for(const cand of poolMP){
+                  if(take.length>=pickN) break;
                   let ok=true;
-                  for(const s of picksFallback){ if(rho(cand,s)>OF_CORR_MAX){ ok=false; break; } }
-                  if(ok) picksFallback.push(cand);
+                  for(const s of take){ if(rho(cand,s)>corrMax){ ok=false; break; } }
+                  if(ok) take.push(cand);
                 }
-                if(picksFallback.length>0){
-                  selected=picksFallback;
-                  selectionTier="fallback";
-                  reason = (reason!=="ok"?reason:"fallback");
-                }else{
-                  reason = (reason!=="ok"?reason:"filtered_by_caps");
+                // If correlation cap leaves you short, fill ignoring corr to guarantee 3
+                if(take.length<pickN){
+                  for(const cand of poolMP){
+                    if(take.length>=pickN) break;
+                    if(!take.includes(cand)) take.push(cand);
+                  }
                 }
+
+                selected = take;
+                selectionTier = "maxpower_top20";
+                reason = (reason!=="ok"?reason:"maxpower_top20");
               }
 
-              // Sizing (constant risk; fallback downsized)
+              // Sizing + picks build (with absolute prices and activation semantics)
               const softmax=(arr,t=20)=>{ const ex=arr.map(x=>Math.exp(x/t)); const s=ex.reduce((a,b)=>a+b,0)||1; return ex.map(x=>x/s); };
-              const wExp=softmax(selected.map(x=>x.exp_lcb_bps),20);
               const TARGET_PORT_RISK_BPS=52;
-
               const sizeFactor = selectionTier==="fallback" ? FALLBACK_SIZE_FACTOR : 1.0;
+              const wExp=softmax(selected.map(x=>(x.mp_exp_lcb_bps ?? x.exp_lcb_bps)),20);
 
-              const picks = selected.map((x,i)=>({
-                symbol: x.base,
-                symbol_full: x.symbol,
-                quote: x.quote,
-                side: x.side, score: x.score, rank:i+1,
-                ttl_sec: clamp(Math.round(x.hold_sec + i*12), 480, 2000),
-                p_win:x.p_win, p_lcb:x.p_lcb,
-                exp_bps:x.exp_bps, exp_lcb_bps:x.exp_lcb_bps,
-                tp_bps:x.tp_bps, sl_bps:x.sl_bps, rrr:x.rrr,
-                tp_atr_mult:x.tp_atr_mult, sl_atr_mult:x.sl_atr_mult,
-                spread_bps:x.spread_bps, cost_bps:x.cost_bps,
-                adx:x.adx, atr_bps:x.atr_bps, beta_r2:x.beta_r2, n_conf:x.n_conf, obi:x.obi, confl:x.confl,
-                regime:x.regime, style:x.style,
-                liq_pct:x.liq_pct, fill_prob:x.fill_prob,
-                tier: selectionTier,
-                size_bps: x.sl_bps>0 ? Math.min(220, Math.round(sizeFactor * (wExp[i]*TARGET_PORT_RISK_BPS/x.sl_bps*100))) : 0
-              }));
+              const picks = selected.map((x,i)=>{
+                const sideUsed = (selectionTier==="maxpower_top20" && x.mp_side) ? x.mp_side : x.side;
+                const tpUsed = (selectionTier==="maxpower_top20" && x.mp_tp_bps) ? x.mp_tp_bps : x.tp_bps;
+                const slUsed = (selectionTier==="maxpower_top20" && x.mp_sl_bps) ? x.mp_sl_bps : x.sl_bps;
 
-              // Save cooldown + pending
+                const bk = bookMap.get(x.symbol);
+                const mid = (bk?.bid && bk?.ask) ? ( (+bk.bid + +bk.ask) / 2 ) : null;
+
+                const slF = slUsed/10000;
+                const tpF = tpUsed/10000;
+
+                const entry_limit = mid == null ? null
+                  : (sideUsed==="long" ? mid*(1 - slF) : mid*(1 + slF));
+                const tp_abs = entry_limit == null ? null
+                  : (sideUsed==="long" ? entry_limit*(1 + tpF) : entry_limit*(1 - tpF));
+                const sl_abs = entry_limit == null ? null
+                  : (sideUsed==="long" ? entry_limit*(1 - slF) : entry_limit*(1 + slF));
+
+                const ttl = clamp(Math.round(x.hold_sec + i*12), 480, 2000);
+                const entry_expire_ts = new Date(Date.now() + ttl*1000).toISOString();
+
+                // Sizing
+                let size_bps = 0;
+                if(FORCE_SIZE_BPS>0){
+                  size_bps = Math.round(FORCE_SIZE_BPS);
+                }else{
+                  size_bps = slUsed>0 ? Math.min(220, Math.round(sizeFactor * (wExp[i]*TARGET_PORT_RISK_BPS/slUsed*100))) : 0;
+                }
+
+                return {
+                  symbol: x.base,
+                  symbol_full: x.symbol,
+                  quote: x.quote,
+                  side: sideUsed, score: x.score, rank:i+1,
+                  ttl_sec: ttl,
+
+                  // probs and EVs
+                  p_win:x.p_win, p_lcb:x.p_lcb,
+                  exp_bps: x.exp_bps, exp_lcb_bps: (x.mp_exp_lcb_bps ?? x.exp_lcb_bps),
+
+                  // chosen RRR
+                  tp_bps: tpUsed, sl_bps: slUsed, rrr: (selectionTier==="maxpower_top20" && x.mp_rrr) ? x.mp_rrr : x.rrr,
+                  tp_atr_mult: x.tp_atr_mult, sl_atr_mult: x.sl_atr_mult,
+
+                  // micro + risk
+                  spread_bps:x.spread_bps, cost_bps:x.cost_bps,
+                  adx:x.adx, atr_bps:x.atr_bps, beta_r2:x.beta_r2, n_conf:x.n_conf, obi:x.obi, confl:x.confl,
+                  regime:x.regime, style:(selectionTier==="maxpower_top20" ? (x["style_"+sideUsed] || x.style) : x.style),
+                  liq_pct:x.liq_pct, fill_prob:x.fill_prob,
+                  tier: selectionTier,
+                  size_bps,
+
+                  // Absolute prices + activation semantics
+                  entry_policy: "limit_at_old_sl",
+                  entry_type: "limit",
+                  activation: "on_fill",
+                  entry_mid: mid,
+                  entry_limit,
+                  tp_abs,
+                  sl_abs,
+                  entry_expire_ts,
+
+                  // Optional: include mp_* fields for transparency
+                  mp_side: x.mp_side, mp_tp_bps: x.mp_tp_bps, mp_sl_bps: x.mp_sl_bps, mp_rrr: x.mp_rrr
+                };
+              });
+
+              // Save cooldown + pending (persist absolutes)
               try{
                 const nowMs=Date.now(); const ideasTs=new Date(nowMs).toISOString();
                 for(const p of picks){
                   const bk=bookMap.get(p.symbol_full); const mid=bk? (bk.bid+bk.ask)/2 : 0;
-
-                  // UPDATED: entry at old SL price (limit), TP/SL recalculated around new entry during eval
-                  let entry_mid = mid;
-                  let entry_new = mid;
-                  if(p.side==="long"){
-                    entry_new = entry_mid * (1 - p.sl_bps/10000);
-                  }else{
-                    entry_new = entry_mid * (1 + p.sl_bps/10000);
-                  }
+                  const entry_mid = p.entry_mid ?? mid;
+                  const entry_new = p.entry_limit ?? (p.side==="long" ? entry_mid*(1 - p.sl_bps/10000) : entry_mid*(1 + p.sl_bps/10000));
+                  const tp_abs = p.tp_abs ?? (p.side==="long" ? entry_new*(1 + p.tp_bps/10000) : entry_new*(1 - p.tp_bps/10000));
+                  const sl_abs = p.sl_abs ?? (p.side==="long" ? entry_new*(1 - p.sl_bps/10000) : entry_new*(1 + p.sl_bps/10000));
 
                   state.cooldown[p.symbol]=nowMs;
                   state.cooldown_side[p.symbol]={ side:p.side, ts_ms:nowMs };
                   state.pending.push({
                     ts:ideasTs, ts_ms:nowMs, symbolFull:p.symbol_full, base:p.symbol, quote:p.quote, side:p.side,
-                    // entry hinting
                     entry_policy:"limit_at_old_sl",
                     entry_mid: entry_mid,
-                    entry_price: entry_new,
+                    entry_price: entry_new,     // legacy alias
+                    entry_limit: entry_new,     // explicit limit
+                    tp_abs, sl_abs,             // absolutes for eval parity
                     hold_sec:p.ttl_sec, tp_bps:p.tp_bps, sl_bps:p.sl_bps, regime:p.regime, cost_bps:p.cost_bps
                   });
                 }
@@ -799,16 +900,23 @@ jobs:
                   depth_limit: DEPTH_LIMIT, obi_topn: OBI_TOPN,
                   cooldown_min: COOLDOWN_MS/60000, flip_guard_min: FLIP_GUARD_MS/60000,
                   cost_bps:COST_BPS, notional_usd:NOTIONAL,
-                  exp_lcb_min_bps:EXP_LCB_MIN_BPS, wilson_z:WILSON_Z
+                  exp_lcb_min_bps:EXP_LCB_MIN_BPS, wilson_z:WILSON_Z,
+                  mp_top_pool: MP_TOP_POOL
                 },
                 dd_gate:{ pnl24_bps, peak_dd_bps, throttle },
                 tod: { active: S_H!=null && E_H!=null, start:S_H, end:E_H },
                 tier: selectionTier,
-                entry_policy: "limit_at_old_sl"
+                entry_policy: "limit_at_old_sl",
+                execution_profile: selectionTier==="maxpower_top20" ? "max_power" : "standard",
+                activation: "on_fill",
+                abs_prices_in_ideas: true,
+                enforce_abs_prices: false,
+                size_policy: FORCE_SIZE_BPS>0?"fixed":"risk_based",
+                size_bps_fixed: FORCE_SIZE_BPS>0?FORCE_SIZE_BPS:0
               };
-              const payload={ ts:new Date().toISOString(), mode:"normal", source:"external_pusher", meta:{ origin:"github_actions", reason, ...(metaExtra||{}) }, top_n:selected.length||0, ideas:picks||[] };
+              const payload={ ts:new Date().toISOString(), mode:"normal", source:"external_pusher", meta:{ origin:"github_actions", reason, ...(metaExtra||{}) }, top_n:picks.length||0, ideas:picks||[] };
 
-              console.log(`[gha] pushing ${selected.length} ideas (${selectionTier}) to ${PUSH_URL}`);
+              console.log(`[gha] pushing ${picks.length} ideas (${selectionTier}) to ${PUSH_URL}`);
               try{
                 const r=await fetchWithTimeout(PUSH_URL,{ method:"POST", headers:{ "Content-Type":"application/json","Authorization":`Bearer ${PUSH_TOKEN}` }, body: JSON.stringify(payload) },15000);
                 let txt=""; try{ txt=await r.text(); }catch{}
