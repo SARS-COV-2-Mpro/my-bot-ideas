@@ -589,6 +589,9 @@ jobs:
                   beta_r2:+(R2||0).toFixed(2),
                   ev_bps, floor_eff, passEV:(ev_bps>=floor_eff), passFill:((fillSide||0) >= ((liq>=0.8 && p.spreadBps<=6)?0.60:0.65)),
                   score,
+                  hold_sec,                                     // ADDED: persist hold_sec for TTL
+                  trend_align_long: (p.upF&&p.upS&&p.up15&&p.up1h),      // ADDED
+                  trend_align_short: (!p.upF&&!p.upS&&(!p.up15||!p.up1h)),// ADDED
                   ret5: retLog(p.c5),
                   p_long_adj:pLong, p_short_adj:pShort,
                   cost_long:costLong, cost_short:costShort,
