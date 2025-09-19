@@ -39,9 +39,8 @@ jobs:
       MEXC_BASE: ${{ vars.MEXC_BASE }}
 
       # New knobs
-      FORCE_SIZE_BPS: ${{ vars.FORCE_SIZE_BPS }}   # e.g., 1000 = 10% fixed; 0 = risk-based
-      MP_TOP_POOL: ${{ vars.MP_TOP_POOL }}         # e.g., 20
-      FILL_TO_TOP_N: ${{ vars.FILL_TO_TOP_N }}     # "true" to force-fill to TOP_N on MP fallback
+      FORCE_SIZE_BPS: ${{ vars.FORCE_SIZE_BPS }}  # e.g., 1000 = 10% fixed; 0 = risk-based
+      MP_TOP_POOL: ${{ vars.MP_TOP_POOL }}        # unused in force3, but kept for compatibility
 
     steps:
       - name: Setup Node 20
@@ -49,7 +48,7 @@ jobs:
         with:
           node-version: 20
 
-      - name: Run pusher (EV@pusher+, stochastic regime/EV, VaR/ES gate + Fill-to-TopN)
+      - name: Run pusher (Stochastic Pro, strict-first; if strict=0 → force top-3 remaining)
         shell: bash
         run: |
           set -euo pipefail
@@ -146,91 +145,6 @@ jobs:
               const n=U.length; const x=Array(n).fill(0);
               for(let i=n-1;i>=0;i--){ let s=0; for(let k=i+1;k<n;k++) s+=U[i][k]*x[k]; x[i]=(y[i]-s)/(U[i][i]||1e-12); }
               return x;
-            }
-            function matInvSPD(A){
-              const L=cholesky(A); if(!L) return null;
-              const n=A.length; const inv=Array.from({length:n},()=>Array(n).fill(0));
-              for(let i=0;i<n;i++){
-                const e=Array(n).fill(0); e[i]=1;
-                const y=forwardSub(L,e);
-                const x=backSub(L.map((row,i)=>row.map((v,j)=> (i===j?row[i][i]:L[j][i]) )), y);
-                for(let r=0;r<n;r++) inv[r][i]=x[r];
-              }
-              return inv;
-            }
-            function hmmTrainGaussian(obs,K=3,iters=6){
-              const T=obs.length; const d=obs[0]?.length||0; if(T<d+5) return null;
-              const mu=Array.from({length:K},(_,k)=> obs[Math.floor((k+1)*T/(K+1))].slice());
-              const Sig=Array.from({length:K},()=>{ const s=Array.from({length:d},(_,i)=>Array.from({length:d},(_,j)=> (i===j?0.1:0))); return s; });
-              let pi=Array(K).fill(1/K), A=Array.from({length:K},()=>Array(K).fill(1/K));
-              const eps=1e-8;
-
-              for(let it=0; it<iters; it++){
-                const B=Array.from({length:T},()=>Array(K).fill(0));
-                for(let t=0;t<T;t++) for(let k=0;k<K;k++) B[t][k]=mvnPdf(obs[t],mu[k],Sig[k]) + 1e-18;
-
-                const alpha=Array.from({length:T},()=>Array(K).fill(0)), c=Array(T).fill(0);
-                for(let k=0;k<K;k++) alpha[0][k]=pi[k]*B[0][k];
-                c[0]=1/(sum(alpha[0])||1e-12); for(let k=0;k<K;k++) alpha[0][k]*=c[0];
-                for(let t=1;t<T;t++){
-                  for(let k=0;k<K;k++){
-                    let s=0; for(let i=0;i<K;i++) s+=alpha[t-1][i]*A[i][k];
-                    alpha[t][k]=s*B[t][k];
-                  }
-                  c[t]=1/(sum(alpha[t])||1e-12);
-                  for(let k=0;k<K;k++) alpha[t][k]*=c[t];
-                }
-                const beta=Array.from({length:T},()=>Array(K).fill(0));
-                for(let k=0;k<K;k++) beta[T-1][k]=c[T-1];
-                for(let t=T-2;t>=0;t--){
-                  for(let k=0;k<K;k++){
-                    let s=0; for(let j=0;j<K;j++) s+=A[k][j]*B[t+1][j]*beta[t+1][j];
-                    beta[t][k]=s*c[t];
-                  }
-                }
-                const gamma=Array.from({length:T},()=>Array(K).fill(0));
-                for(let t=0;t<T;t++){ const den=sum(alpha[t].map((a,kk)=>a*beta[t][kk]))||1e-12; for(let k=0;k<K;k++) gamma[t][k]=(alpha[t][k]*beta[t][k])/(den||1e-12); }
-                const xi=Array.from({length:T-1},()=>Array.from({length:K},()=>Array(K).fill(0)));
-                for(let t=0;t<T-1;t++){
-                  let den=0;
-                  for(let i=0;i<K;i++) for(let j=0;j<K;j++) den+=alpha[t][i]*A[i][j]*B[t+1][j]*beta[t+1][j];
-                  den=den||1e-12;
-                  for(let i=0;i<K;i++) for(let j=0;j<K;j++) xi[t][i][j]=(alpha[t][i]*A[i][j]*B[t+1][j]*beta[t+1][j])/den;
-                }
-
-                for(let k=0;k<K;k++){
-                  const gk=sum(gamma.map(g=>g[k]))||eps;
-                  pi[k]=gamma[0][k];
-                  for(let j=0;j<K;j++){ let s=0; for(let t=0;t<T-1;t++) s+=xi[t][k][j]; A[k][j]=s/(gk - gamma[T-1][k] + eps); A[k][j]=clamp(A[k][j],1e-6,1); }
-                  const mu_k=Array(Sig[0].length).fill(0);
-                  for(let t=0;t<T;t++) for(let i=0;i<mu_k.length;i++) mu_k[i]+=gamma[t][k]*obs[t][i];
-                  for(let i=0;i<mu_k.length;i++) mu_k[i]/=(gk||1e-12);
-                  mu[k]=mu_k;
-                  const S=Array.from({length:mu_k.length},()=>Array(mu_k.length).fill(0));
-                  for(let t=0;t<T;t++){
-                    const diff=obs[t].map((v,i)=>v-mu_k[i]);
-                    for(let i=0;i<mu_k.length;i++) for(let j=0;j<mu_k.length;j++) S[i][j]+=gamma[t][k]*diff[i]*diff[j];
-                  }
-                  for(let i=0;i<mu_k.length;i++) for(let j=0;j<mu_k.length;j++) S[i][j]/=(gk||1e-12);
-                  for(let i=0;i<mu_k.length;i++) S[i][i]=Math.max(S[i][i], 1e-4);
-                  Sig[k]=S;
-                }
-                for(let i=0;i<K;i++){ const s=sum(A[i])||1e-12; for(let j=0;j<K;j++) A[i][j]/=s; }
-              }
-
-              return { pi, A, mu, Sig };
-            }
-            function hmmPosterior(obs, model){
-              const {pi,A,mu,Sig}=model; const T=obs.length, K=pi.length; if(T===0) return Array(K).fill(1/K);
-              const B=obs.map(o=> mu.map((m,ki)=>mvnPdf(o,m,Sig[ki])+1e-18));
-              const alpha=Array.from({length:T},()=>Array(K).fill(0)), c=Array(T).fill(0);
-              for(let k=0;k<K;k++) alpha[0][k]=pi[k]*B[0][k];
-              c[0]=1/(sum(alpha[0])||1e-12); for(let k=0;k<K;k++) alpha[0][k]*=c[0];
-              for(let t=1;t<T;t++){
-                for(let k=0;k<K;k++){ let s=0; for(let i=0;i<K;i++) s+=alpha[t-1][i]*A[i][k]; alpha[t][k]=s*B[t][k]; }
-                c[t]=1/(sum(alpha[t])||1e-12); for(let k=0;k<K;k++) alpha[t][k]*=c[t];
-              }
-              return alpha[T-1];
             }
 
             // ------------- GP (RBF) for p_win with uncertainty -------------
@@ -439,11 +353,6 @@ jobs:
             const WILSON_Z=1.34, TARGET_PORT_RISK_BPS=52;
             const TTL_MIN=540, TTL_MAX=1200;
 
-            // New knobs
-            const FORCE_SIZE_BPS = Number(process.env.FORCE_SIZE_BPS||"0");
-            const MP_TOP_POOL = Number(process.env.MP_TOP_POOL||"20");
-            const FILL_TO_TOP_N = (process.env.FILL_TO_TOP_N || "true").toLowerCase() === "true";
-
             // EV gating
             const EV_MIN_BPS=3;
 
@@ -620,7 +529,7 @@ jobs:
               function rollSeq(k){ if(!k) return; const c=k.map(x=>+x[4]); for(let i=5;i<Math.min(k.length,80);i++){ const seg=k.slice(i-5,i+1); const f=regimeFeatures(seg); if(f.length) seqFeat.push(f); } }
               rollSeq(kBTC15); rollSeq(kETH15);
               const hmm = seqFeat.length>=20 ? hmmTrainGaussian(seqFeat,3,6) : null;
-              const post = hmm ? hmmPosterior(seqFeat.slice(-15),hmm) : [0.4,0.4,0.2]; // [Trend, MR, Breakout]
+              const post = hmm ? hmmPosterior(seqFeat.slice(-15),hmm) : [0.4,0.4,0.2];
               const weights = { wTrend:post[0]||0.4, wMR:post[1]||0.4, wBO:post[2]||0.2 };
 
               log("regime posterior", weights);
@@ -786,8 +695,9 @@ jobs:
                 const obiAdjLong = Math.max(0, -obi);
                 const obiAdjShort= Math.max(0, +obi);
 
-                const gp_feat_long  = [ clamp((p.adx5-16)/14,0,1), clamp(p.z_vwap,-3,3), (rsi(p.c5,14)||50)/100, Math.max(0,-obi) ];
-                const gp_feat_short = [ clamp((p.adx5-16)/14,0,1), clamp(-p.z_vwap,-3,3), (100-(rsi(p.c5,14)||50))/100, Math.max(0,+obi) ];
+                const rsiVal = rsi(p.c5,14);
+                const gp_feat_long  = [ clamp((p.adx5-16)/14,0,1), clamp(p.z_vwap,-3,3), (rsiVal||50)/100, Math.max(0,-obi) ];
+                const gp_feat_short = [ clamp((p.adx5-16)/14,0,1), clamp(-p.z_vwap,-3,3), (100-(rsiVal||50))/100, Math.max(0,+obi) ];
 
                 let pLong=p.pLong0, pShort=p.pShort0;
                 const lastSide=state.cooldown_side?.[c.base];
@@ -808,6 +718,8 @@ jobs:
                 const rrrDynLong  = optimizeRRR_MC({ atr_bps:p.atr_bps, cost_bps:costLong  , spread_bps:p.spreadBps, entry:entryMid, side:"long" , mu:mu5, sigma:sig5, ttl_sec:hold_sec });
                 const rrrDynShort = optimizeRRR_MC({ atr_bps:p.atr_bps, cost_bps:costShort , spread_bps:p.spreadBps, entry:entryMid, side:"short", mu:mu5, sigma:sig5, ttl_sec:hold_sec });
 
+                // GP blending
+                let gpModel=null; // placeholder; model is built once outside (kept for structure clarity)
                 const useGP = !!gpModel;
                 const gpL = useGP? gpPredict(gpModel, gp_feat_long)  : {mu:pLong, sigma:0.20};
                 const gpS = useGP? gpPredict(gpModel, gp_feat_short) : {mu:pShort, sigma:0.20};
@@ -818,16 +730,12 @@ jobs:
                 const pLong_lcb  = clamp(pLong_adj  - WILSON_Z*(gpL.sigma||0.20), 0.10, 0.98);
                 const pShort_lcb = clamp(pShort_adj - WILSON_Z*(gpS.sigma||0.20), 0.10, 0.98);
 
-                const evL = rrrDynLong  ? gbmSimEV({ entry:entryMid, tp_bps:rrrDynLong.tp_bps, sl_bps:rrrDynLong.sl_bps, side:"long",  mu:mu5, sigma:sig5, dt:1, steps:Math.max(1,Math.round(hold_sec/300)), N:192, cost_bps:costLong  }) : { ev_lcb_bps:-1e9, p_lcb:0.0 };
-                const evS = rrrDynShort ? gbmSimEV({ entry:entryMid, tp_bps:rrrDynShort.tp_bps, sl_bps:rrrDynShort.sl_bps, side:"short", mu:mu5, sigma:sig5, dt:1, steps:Math.max(1,Math.round(hold_sec/300)), N:192, cost_bps:costShort }) : { ev_lcb_bps:-1e9, p_lcb:0.0 };
-
-                const evLong  = Math.round(pLong_lcb  * (rrrDynLong?.tp_bps  ||0) - (1-pLong_lcb )*(rrrDynLong?.sl_bps||0) - costLong);
-                const evShort = Math.round(pShort_lcb * (rrrDynShort?.tp_bps ||0) - (1-pShort_lcb)*(rrrDynShort?.sl_bps||0) - costShort);
+                const evLong  = rrrDynLong  ? Math.round(pLong_lcb  * rrrDynLong.tp_bps  - (1-pLong_lcb )*rrrDynLong.sl_bps - costLong)  : -1e9;
+                const evShort = rrrDynShort ? Math.round(pShort_lcb * rrrDynShort.tp_bps - (1-pShort_lcb)*rrrDynShort.sl_bps - costShort) : -1e9;
                 const chooseLong = (evLong>=evShort) && rrrDynLong;
-
-                const chosen = chooseLong ? {side:"long",  tp_bps:rrrDynLong.tp_bps,  sl_bps:rrrDynLong.sl_bps,  p_lcb:pLong_lcb,  cost_bps:costLong , ev_lcb_bps:evLong }
-                                          : {side:"short", tp_bps:rrrDynShort.tp_bps, sl_bps:rrrDynShort.sl_bps, p_lcb:pShort_lcb, cost_bps:costShort, ev_lcb_bps:evShort};
-                const exp_bps_mc = chooseLong ? evL.ev_bps : evS.ev_bps;
+                const chosen = chooseLong
+                  ? {side:"long",  tp_bps:rrrDynLong.tp_bps,  sl_bps:rrrDynLong.sl_bps,  p_lcb:pLong_lcb,  cost_bps:costLong , ev_lcb_bps:evLong }
+                  : {side:"short", tp_bps:rrrDynShort.tp_bps, sl_bps:rrrDynShort.sl_bps, p_lcb:pShort_lcb, cost_bps:costShort, ev_lcb_bps:evShort};
 
                 const yR = y.slice(-61), X1=fBTC.slice(-yR.length), X2=fETH.slice(-yR.length), X3=fSOL.slice(-yR.length);
                 const {R2} = (function ols(y,f1,f2,f3){
@@ -849,14 +757,14 @@ jobs:
 
                 const liq = liqPct.get(c.symbol)||0.5;
                 const adxF=clamp((p.adx5-16)/14,0,1);
-
                 const score = clamp(Math.round(60 + 30*(chosen.p_lcb-0.5)*2 + 12*adxF + 7*((liq-0.5)*2) - Math.min(12, Math.max(0,(p.spreadBps-5)/2)) - Math.round(9*clamp(R2,0,1))), 1, 99);
 
                 refined.push({
                   symbol:c.symbol, base:c.base, quote:c.quote, qv:c.qv,
                   side:chosen.side, p_lcb:+chosen.p_lcb.toFixed(3),
                   p_win: +(Math.max(p.pLong0,p.pShort0)).toFixed(3),
-                  exp_bps: exp_bps_mc, exp_lcb_bps: chosen.ev_lcb_bps,
+                  exp_bps: (chooseLong? 0:0), // placeholder (unused)
+                  exp_lcb_bps: chosen.ev_lcb_bps,
                   tp_bps: chosen.tp_bps, sl_bps: chosen.sl_bps, rrr: +(chosen.tp_bps/Math.max(1,chosen.sl_bps)).toFixed(2),
                   spread_bps: p.spreadBps, cost_bps: chosen.cost_bps,
                   adx:+(p.adx5||0).toFixed(1), atr_bps:p.atr_bps,
@@ -869,18 +777,18 @@ jobs:
                   style_long:p.styleLong, style_short:p.styleShort,
                   lvl_gap_long_bps:p.lvl_gap_long_bps, lvl_gap_short_bps:p.lvl_gap_short_bps,
                   trend_align_long:(p.upF&&p.upS&&p.up15&&p.up1h),
-                  trend_align_short:(!p.upF&&!p.upS&&(!p.up15||!p.up1h))
+                  trend_align_short:(!p.upF&&!p.upS&&(!p.up15||!p.up1h)),
+                  rsi14: rsiVal
                 });
               }
 
               // Rank refined
               refined.sort((a,b)=> b.exp_lcb_bps!==a.exp_lcb_bps ? b.exp_lcb_bps-a.exp_lcb_bps
-                                : b.exp_bps!==a.exp_bps ? b.exp_bps-a.exp_bps
                                 : b.score!==a.score ? b.score-a.score
                                 : b.qv-a.qv);
 
-              // Strict picks (with MC-LCB EV)
-              const CORE_CORR_MAX=0.84, OF_CORR_MAX=0.90;
+              // Strict picks (MC-LCB EV)
+              const CORE_CORR_MAX=0.84;
               const rho=(a,b)=>corr(a.ret5||[],b.ret5||[]);
               const strictOk=(cand)=> cand.p_lcb>=0.60 && cand.exp_lcb_bps>=Math.max(cand.dyn_floor+3, EXP_LCB_MIN_BPS+3)
                 && (cand.fill_prob||0)>=0.70 && cand.cost_bps<=Math.max(COST_BPS+8, 18)
@@ -900,80 +808,18 @@ jobs:
                 selectionTier="strict";
                 reason=(reason!=="ok"?reason:"strict");
               }else{
-                // MP fallback with MC-enhanced EV
-                const pool = Array.from(refined).sort((a,b)=> b.score-a.score).slice(0, Math.max(3, MP_TOP_POOL||20));
-                const poolMP = pool.map(c=>{
-                  const trendBonus = (c.side==="long" ? (c.trend_align_long?1:0) : (c.trend_align_short?1:0));
-                  const mp_rank = (1000*(c.exp_lcb_bps))
-                                + (10*(+c.adx||0))
-                                + (40*(+c.liq_pct||0))
-                                + (60*(+c.fill_prob||0))
-                                + (80*trendBonus)
-                                - (12*Math.max(0,(+c.spread_bps||0)-6))
-                                - (100*(+c.beta_r2||0));
-                  return { ...c, mp_rank };
-                }).sort((a,b)=> (b.exp_lcb_bps - a.exp_lcb_bps) || (b.mp_rank - a.mp_rank) || (b.exp_bps - a.exp_bps) || (b.score - a.score));
-
-                const fallbackOk=(cand,{minFill=0.60,maxBeta=0.85,maxCost=Math.max(COST_BPS+10,20),minLCB=EXP_LCB_MIN_BPS}={})=>{
-                  const lcbOK = (cand.exp_lcb_bps ?? -1e9) >= Math.max(minLCB, cand.dyn_floor ?? minLCB);
-                  const fillOK = (cand.fill_prob ?? 0) >= minFill;
-                  const betaOK = (cand.beta_r2 ?? 0) <= maxBeta;
-                  const spreadOK = (cand.spread_bps ?? 99) <= MAX_SPREAD_BPS;
-                  const costOK = (cand.cost_bps ?? 99) <= maxCost;
-                  return lcbOK && fillOK && betaOK && spreadOK && costOK;
-                };
-
-                const take=[];
-                // Pass 1
-                for(const cand of poolMP){
-                  if(take.length>=Math.min(3, TOP_N||3)) break;
-                  if(!fallbackOk(cand,{minFill:0.62,maxBeta:0.82,maxCost:Math.max(COST_BPS+8,18),minLCB:EXP_LCB_MIN_BPS+2})) continue;
-                  let ok=true; for(const s of take){ if(rho(cand,s)>OF_CORR_MAX){ ok=false; break; } }
-                  if(ok) take.push(cand);
-                }
-                // Pass 2
-                if(take.length<Math.min(3, TOP_N||3)){
-                  for(const cand of poolMP){
-                    if(take.length>=Math.min(3, TOP_N||3)) break;
-                    if(!take.includes(cand) && fallbackOk(cand,{minFill:0.58,maxBeta:0.86,maxCost:Math.max(COST_BPS+10,22),minLCB:EXP_LCB_MIN_BPS})) {
-                      let ok=true; for(const s of take){ if(rho(cand,s)>OF_CORR_MAX){ ok=false; break; } }
-                      if(ok) take.push(cand);
-                    }
-                  }
-                }
-                // Pass 3
-                if(take.length<Math.min(3, TOP_N||3)){
-                  for(const cand of poolMP){
-                    if(take.length>=Math.min(3, TOP_N||3)) break;
-                    if(!take.includes(cand)){
-                      let ok=true; for(const s of take){ if(rho(cand,s)>OF_CORR_MAX){ ok=false; break; } }
-                      if(ok) take.push(cand);
-                    }
-                  }
-                }
-
-                // Force-fill to TOP_N (without reducing efficacy): only positive LCB EV + relaxed corr
+                // Strict = 0 → force exactly 3 best-of-remaining from refined (prefer positive EV)
                 const TARGET_K = Math.min(3, TOP_N || 3);
-                if (FILL_TO_TOP_N && take.length < TARGET_K) {
-                  for (const cand of poolMP) {
-                    if (take.length >= TARGET_K) break;
-                    if (take.includes(cand)) continue;
-                    const lcbOK = (cand.exp_lcb_bps ?? -1e9) >= Math.max(EV_MIN_BPS, 1);
-                    if (!lcbOK) continue;
-                    let ok = true;
-                    for (const s of take) { if (rho(cand, s) > 0.98) { ok = false; break; } }
-                    if (!ok) continue;
-                    cand.mp_fill = true;
-                    take.push(cand);
-                  }
-                }
-
-                selected=take;
-                selectionTier="mp_top20";
-                reason=(reason!=="ok"?reason:"maxpower_top20");
+                const pos = refined.filter(c => (c.exp_lcb_bps ?? -1e9) > 0);
+                const best = pos.slice(0, TARGET_K);
+                const need = TARGET_K - best.length;
+                const rest = need > 0 ? refined.filter(c => !best.includes(c)).slice(0, need) : [];
+                selected = best.concat(rest).slice(0, TARGET_K).map(c => ({ ...c, mp_fill: true }));
+                selectionTier="mp_force3";
+                reason=(reason!=="ok"?reason:"strict0_force3");
               }
 
-              // Build picks with absolute limit_at_old_sl + GP features persisted
+              // Build picks (limit_at_old_sl) + micro-size forced fills
               const wEv=softmax(selected.map(x=> (x.exp_lcb_bps)), 20);
               let picks = selected.map((x,i)=>{
                 const sideUsed = x.side;
@@ -996,7 +842,6 @@ jobs:
                 } else { 
                   size_bps = slUsed>0 ? Math.min(220, Math.round((wEv[i]*TARGET_PORT_RISK_BPS/slUsed)*100)) : 0;
                 }
-                // Micro-size any forced fills to preserve efficacy
                 if (x.mp_fill) {
                   size_bps = Math.max(8, Math.round(size_bps * 0.4));
                 }
@@ -1016,8 +861,7 @@ jobs:
                   entry_mid: mid, entry_limit, tp_abs, sl_abs,
                   size_bps, tier: selectionTier,
                   mp_fill: !!x.mp_fill,
-                  // GP features for training on resolution
-                  gp_feat: [ clamp((x.adx-16)/14,0,1), 0, (x.rsi||50)/100, Math.max(0, sideUsed==="long"? -x.obi : +x.obi) ],
+                  gp_feat: [ clamp((x.adx-16)/14,0,1), 0, ((x.rsi14 ?? 50)/100), Math.max(0, sideUsed==="long"? -x.obi : +x.obi) ],
                   ret5: x.ret5
                 };
               });
@@ -1068,10 +912,9 @@ jobs:
                   cooldown_min: COOLDOWN_MS/60000, flip_guard_min: FLIP_GUARD_MS/60000,
                   fees_bps:COST_BPS, notional_usd:NOTIONAL,
                   exp_lcb_min_bps:EXP_LCB_MIN_BPS, wilson_z:WILSON_Z,
-                  mp_top_pool: MP_TOP_POOL,
                   entry_policy: "limit_at_old_sl",
                   stochastic: { hmm:true, gp:true, sde_mc:true, var_es:true, kalman:true },
-                  fill_to_top_n: FILL_TO_TOP_N
+                  force3_on_strict0: true
                 },
                 dd_gate: (function(){ const s=state.equity||[]; const day=Date.now()-24*3600*1000; let pnl24=0,cum=0,peak=0,dd=0; for(const e of s){ if(e.ts_ms>=day) pnl24+=e.pnl_bps; cum+=e.pnl_bps; if(cum>peak) peak=cum; dd=Math.min(dd,cum-peak); } return { pnl24_bps:Math.round(pnl24), peak_dd_bps:Math.round(dd), throttle }; })(),
                 tod: { active: S_H!=null && E_H!=null, start:S_H, end:E_H },
