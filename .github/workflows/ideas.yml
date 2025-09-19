@@ -571,7 +571,6 @@ jobs:
                     for(let i=0;i<mu_k.length;i++) mu_k[i]/=(gk||1e-12); mu[k]=mu_k;
                     const S=Array.from({length:mu_k.length},()=>Array(mu_k.length).fill(0));
                     for(let t=0;t<T;t++){ const diff=obs[t].map((v,i)=>v-mu_k[i]); for(let i=0;i<mu_k.length;i++) for(let j=0;j<mu_k.length;j++) S[i][j]+=gamma[t][k]*diff[i]*diff[j]; }
-                    for(let i=0;i<mu_k.length;i++) for(let j=0;j<mu_k.length;j++) S[i][j]/=(gk||1e-12);
                     for(let i=0;i<mu_k.length;i++) S[i][i]=Math.max(S[i][i], 1e-4); Sig[k]=S;
                   }
                   for(let i=0;i<K;i++){ const s=sum(A[i])||1e-12; for(let j=0;j<K;j++) A[i][j]/=s; }
@@ -845,7 +844,8 @@ jobs:
                   lvl_gap_long_bps:p.lvl_gap_long_bps, lvl_gap_short_bps:p.lvl_gap_short_bps,
                   trend_align_long:(p.upF&&p.upS&&p.up15&&p.up1h),
                   trend_align_short:(!p.upF&&!p.upS&&(!p.up15||!p.up1h)),
-                  rsi14: rsiVal
+                  rsi14: rsiVal,
+                  z_vwap: p.z_vwap
                 });
               }
               snapCounts({ refined: refined.length });
@@ -934,12 +934,22 @@ jobs:
                 const ttl = clamp(Math.round((x.hold_sec||720) + i*12), TTL_MIN, TTL_MAX);
 
                 let size_bps = 0;
-                if(Number(process.env.FORCE_SIZE_BPS||"0")>0){ 
+                if(Number(process.env.FORCE_SIZE_BPS||"0")>0){
                   size_bps = Math.round(Number(process.env.FORCE_SIZE_BPS));
-                } else { 
+                } else {
                   size_bps = slUsed>0 ? Math.min(220, Math.round((wEv[i]*TARGET_PORT_RISK_BPS/slUsed)*100)) : 0;
                 }
                 if (x.mp_fill) size_bps = Math.max(8, Math.round(size_bps * 0.4));
+
+                // GP training features: side-consistent and matching inference orientation
+                const r = x.rsi14 ?? 50;
+                const z = x.z_vwap ?? 0;
+                const gp_feat = [
+                  clamp((x.adx - 16) / 14, 0, 1),
+                  clamp(sideUsed === "long" ? z : -z, -3, 3),
+                  sideUsed === "long" ? (r/100) : ((100 - r)/100),
+                  Math.max(0, sideUsed === "long" ? -x.obi : +x.obi)
+                ];
 
                 return {
                   symbol: x.base, symbol_full: x.symbol, quote: x.quote,
@@ -956,7 +966,7 @@ jobs:
                   entry_mid: mid, entry_limit, tp_abs, sl_abs,
                   size_bps, tier: selectionTier,
                   mp_fill: !!x.mp_fill,
-                  gp_feat: [ clamp((x.adx-16)/14,0,1), 0, ((x.rsi14 ?? 50)/100), Math.max(0, sideUsed==="long"? -x.obi : +x.obi) ],
+                  gp_feat,
                   ret5: x.ret5
                 };
               });
@@ -1051,7 +1061,7 @@ jobs:
           set -e
           if [[ $EXIT_CODE -ne 0 ]]; then
             echo "[gha] pusher exited with code $EXIT_CODE — sending minimal payload so tail shows a [push] line"
-            if [[ -n "${WORKER_PUSH_URL:-}" ]]; then
+            if [[ -n "${WORKER_PUSH_URL:-}" ]] ; then
               health_url="${WORKER_PUSH_URL/\/signals\/push/\/health}"
               echo "[gha] fallback health GET ${health_url}"
               curl -sS -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${PUSH_TOKEN}" --max-time 8 "${health_url}" || true
