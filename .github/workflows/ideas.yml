@@ -3,7 +3,7 @@ name: Ideas Pusher (MEXC ULTIMATE EV@Pusher, Strict → MP Top-20 Fallback)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/20 * * * *"
+    - cron: "*/15 * * * *"
 
 permissions:
   contents: read
