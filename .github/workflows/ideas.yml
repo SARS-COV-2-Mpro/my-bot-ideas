@@ -1,4 +1,3 @@
-
 name: Ideas Pusher (MEXC ULTIMATE EV@Pusher, Strict → MP Top-20 Fallback)
 
 on:
@@ -21,8 +20,6 @@ jobs:
       # Required secrets
       WORKER_PUSH_URL: ${{ secrets.WORKER_PUSH_URL }}
       PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
-
-      text
 
       # Optional (state)
       GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
@@ -52,7 +49,7 @@ jobs:
         with:
           node-version: 20
 
-      - name: Run pusher (EV@pusher, strict-first; MP top-20 fallback; absolute limit)
+      - name: Run pusher (EV@pusher, strict-first; MP top-N fallback; absolute limit)
         shell: bash
         run: |
           set -euo pipefail
@@ -206,7 +203,7 @@ jobs:
                     const t=ts[i]; if(t < t0-1000) continue; if(t > tEnd) break;
                     if(long ? (lows[i] <= entry) : (highs[i] >= entry)){ iFill=i; break; }
                   }
-                  if(iFill===-1) continue; // no trade if not filled
+                  if(iFill===-1) continue; // unfilled → keep pending
 
                   const tpPx = Number.isFinite(p.tp_abs) ? p.tp_abs : (long ? entry*(1+tpB) : entry*(1-tpB));
                   const slPx = Number.isFinite(p.sl_abs) ? p.sl_abs : (long ? entry*(1-slB) : entry*(1+slB));
@@ -243,7 +240,7 @@ jobs:
 
             // ---------- Auto-RRR (Ultimate v2 bounds) ----------
             function computeAutoRRR({p,adx,atr_bps,cost_bps,spread_bps,trend_align,style,lvl_gap_bps=0,obi_adj=0}){
-              const SL_ATR_MIN=0.28, SL_ATR_MAX=1.50;  // v2
+              const SL_ATR_MIN=0.28, SL_ATR_MAX=1.50;  // tighter stops allowed
               const TP_ATR_MIN=0.40, TP_ATR_MAX=2.10;
               const BASE_SL = { trend:0.62, mr:0.60, breakout:0.60 };
               const BASE_TP = { trend:1.12, mr:0.62, breakout:1.30 };
@@ -454,27 +451,27 @@ jobs:
                     const pLong0  = clamp(wT*(sideTrend==="long"?pTrend:1-pTrend) + wM*(sideMR==="long"?pMR:1-pMR) + wB*(sideBO==="long"?pBO:1-pBO), 0.30, 0.97);
                     const pShort0 = clamp(wT*(sideTrend==="short"?pTrend:1-pTrend) + wM*(sideMR==="short"?pMR:1-pMR) + wB*(sideBO==="short"?pBO:1-pBO), 0.30, 0.97);
 
-                    // Level-aware gaps (for SL anchoring) + proto RRR
-                    const lvl_gap_long_bps = (pLow && last>0) ? Math.max(0, ((last - pLow)/last)*10000) : 0;
-                    const lvl_gap_short_bps= (pHigh&& last>0) ? Math.max(0, ((pHigh - last)/last)*10000) : 0;
+                    // Level-aware gaps (fixed variable names)
+                    const lvl_gap_long_bps = (pLow15!=null && last>0) ? Math.max(0, ((last - pLow15)/last)*10000) : 0;
+                    const lvl_gap_short_bps= (pHigh15!=null && last>0)? Math.max(0, ((pHigh15 - last)/last)*10000) : 0;
 
                     const styleLong = trendAlign ? "trend" : (squeezeScore>0.25||boUp) ? "breakout" : "mr";
                     const styleShort= !trendAlign ? "trend" : (squeezeScore>0.25||boDn) ? "breakout" : "mr";
                     const costLong0=COST_BPS + Math.round(spreadBps/2);
                     const costShort0=COST_BPS + Math.round(spreadBps/2);
 
-                    const rrrLong0 = computeAutoRRR({ p:pLong0,  adx:adx5, atr_bps:Math.round((atr5/last)*10000), cost_bps:costLong0,  spread_bps:spreadBps, trend_align:(upF&&upS&&up15&&up1h), style:styleLong,  lvl_gap_bps:lvl_gap_long_bps });
-                    const rrrShort0= computeAutoRRR({ p:pShort0, adx:adx5, atr_bps:Math.round((atr5/last)*10000), cost_bps:costShort0, spread_bps:spreadBps, trend_align:(!upF&&!upS&&(!up15||!up1h)), style:styleShort, lvl_gap_bps:lvl_gap_short_bps });
+                    const atrBps = Math.round((atr5/last)*10000);
+                    const rrrLong0 = computeAutoRRR({ p:pLong0,  adx:adx5, atr_bps:atrBps, cost_bps:costLong0,  spread_bps:spreadBps, trend_align:(upF&&upS&&up15&&up1h), style:styleLong,  lvl_gap_bps:lvl_gap_long_bps });
+                    const rrrShort0= computeAutoRRR({ p:pShort0, adx:adx5, atr_bps:atrBps, cost_bps:costShort0, spread_bps:spreadBps, trend_align:(!upF&&!upS&&(!up15||!up1h)), style:styleShort, lvl_gap_bps:lvl_gap_short_bps });
 
                     const expLong0 = rrrLong0 ? Math.round(pLong0*rrrLong0.tp_bps - (1-pLong0)*rrrLong0.sl_bps - costLong0) : -1e9;
                     const expShort0= rrrShort0? Math.round(pShort0*rrrShort0.tp_bps - (1-pShort0)*rrrShort0.sl_bps - costShort0): -1e9;
                     const best0=Math.max(expLong0,expShort0);
                     if(best0<=0) return null;
 
-                    // Lightweight Signal Score 0..100 (reuse spreadBps)
+                    // Lightweight Signal Score 0..100
                     const signalScore = clamp(Math.round(
-                      50
-                      + 30*((Math.max(pLong0,pShort0)-0.5)*2)
+                      50 + 30*((Math.max(pLong0,pShort0)-0.5)*2)
                       + 10*clamp((adx5-18)/14,0,1)
                       + 5*(trendAlign?1:0)
                       + 5*clamp(squeezeScore*1.2,0,1)
@@ -482,7 +479,7 @@ jobs:
                     ), 0, 100);
 
                     return {
-                      c, k5, c5, adx5, atr_bps:Math.round((atr5/last)*10000), spreadBps, pLong0, pShort0,
+                      c, k5, c5, adx5, atr_bps:atrBps, spreadBps, pLong0, pShort0,
                       rrrLong0, rrrShort0, expLong0, expShort0,
                       styleLong, styleShort, upF, upS, up15, up1h, z_vwap, boUp, boDn, trendAlign, squeezeScore,
                       lvl_gap_long_bps, lvl_gap_short_bps, signalScore
@@ -563,13 +560,15 @@ jobs:
 
                 const liq = liqPct.get(c.symbol)||0.5;
                 const adxF=clamp((p.adx5-16)/14,0,1);
-                const p_final = expLong>=expShort ? pLong : pShort;
-                const r_used = expLong>=expShort ? rrrLong : rrrShort;
-                const costSide = expLong>=expShort ? costLong : costShort;
-                const fillSide = expLong>=expShort ? fillL : fillS;
+                const side = (expLong>=expShort? "long":"short");
+                const p_final = side==="long"? pLong : pShort;
+                const r_used  = side==="long"? rrrLong: rrrShort;
+                const costSide= side==="long"? costLong: costShort;
+                const fillSide= side==="long"? fillL  : fillS;
                 if(!r_used) continue;
 
-                const p_lcb=wilsonLCB(p_final, Math.round(clamp(46 + 26*adxF + 22*liq - 34*clamp(R2,0,1), 34, 132)), WILSON_Z);
+                const n_conf = Math.round(clamp(46 + 26*adxF + 22*liq - 34*clamp(R2,0,1), 34, 132));
+                const p_lcb=wilsonLCB(p_final, n_conf, WILSON_Z);
                 const exp_bps = Math.max(expLong, expShort);
                 const exp_lcb_bps=Math.round(p_lcb*r_used.tp_bps - (1-p_lcb)*r_used.sl_bps - costSide);
 
@@ -582,15 +581,14 @@ jobs:
 
                 refined.push({
                   symbol:c.symbol, base:c.base, quote:c.quote, qv:c.qv,
-                  side: (expLong>=expShort? "long":"short"),
-                  p_win:+p_final.toFixed(3), p_lcb:+p_lcb.toFixed(3),
+                  side, p_win:+p_final.toFixed(3), p_lcb:+p_lcb.toFixed(3),
                   exp_bps, exp_lcb_bps,
                   tp_bps: r_used.tp_bps, sl_bps: r_used.sl_bps, rrr: r_used.r_used,
                   tp_atr_mult: r_used.tp_atr, sl_atr_mult: r_used.sl_atr,
                   spread_bps: p.spreadBps, cost_bps: costSide,
                   adx:+(p.adx5||0).toFixed(1), atr_bps:p.atr_bps,
-                  regime: regime.regime, style: (expLong>=expShort? p.styleLong: p.styleShort),
-                  score, beta_r2:+R2.toFixed(2), n_conf: Math.round(clamp(46 + 26*adxF + 22*liq - 34*clamp(R2,0,1), 34, 132)),
+                  regime: regime.regime, style: (side==="long"? p.styleLong: p.styleShort),
+                  score, beta_r2:+R2.toFixed(2), n_conf,
                   obi:+obi.toFixed(3), hold_sec, liq_pct:+liq.toFixed(3),
                   ret5:retLog(p.c5), fill_prob:+(fillSide||0).toFixed(2), dyn_floor: dynFloor,
                   p_long_adj:pLong, p_short_adj:pShort,
@@ -604,9 +602,9 @@ jobs:
 
               // Rank refined
               refined.sort((a,b)=> b.exp_lcb_bps!==a.exp_lcb_bps ? b.exp_lcb_bps-a.exp_lcb_bps
-                              : b.exp_bps!==a.exp_bps ? b.exp_bps-a.exp_bps
-                              : b.score!==a.score ? b.score-a.score
-                              : b.qv-a.qv);
+                                : b.exp_bps!==a.exp_bps ? b.exp_bps-a.exp_bps
+                                : b.score!==a.score ? b.score-a.score
+                                : b.qv-a.qv);
 
               // Strict picks
               const CORE_CORR_MAX=0.84, OF_CORR_MAX=0.90;
@@ -629,8 +627,9 @@ jobs:
                 selectionTier="strict";
                 reason=(reason!=="ok"?reason:"strict");
               }else{
-                // MP fallback: take top-20 by score, recompute conservatively, push 3
+                // MP fallback — upgraded for quality
                 const pool = Array.from(refined).sort((a,b)=> b.score-a.score).slice(0, Math.max(3, MP_TOP_POOL||20));
+
                 function mpEnhance(c){
                   const pL_long  = wilsonLCB(c.p_long_adj||0.5, c.n_conf||60, WILSON_Z);
                   const pL_short = wilsonLCB(c.p_short_adj||0.5, c.n_conf||60, WILSON_Z);
@@ -638,15 +637,67 @@ jobs:
                   const rrrS = computeAutoRRR({ p:pL_short, adx:+c.adx||0, atr_bps:c.atr_bps, cost_bps:c.cost_short||c.cost_bps, spread_bps:c.spread_bps, trend_align:!!c.trend_align_short, style:c.style_short||"trend", lvl_gap_bps:c.lvl_gap_short_bps||0, obi_adj:Math.max(0, +(c.obi||0)) });
                   const evL = rrrL ? Math.round(pL_long*rrrL.tp_bps - (1-pL_long)*rrrL.sl_bps - (c.cost_long||c.cost_bps)) : -1e9;
                   const evS = rrrS ? Math.round(pL_short*rrrS.tp_bps - (1-pL_short)*rrrS.sl_bps - (c.cost_short||c.cost_bps)) : -1e9;
+
                   let mp_side="long", mp_tp_bps=0, mp_sl_bps=0, mp_rrr=0, mp_exp_lcb_bps=-1e9, mp_exp_bps=-1e9;
                   if(evL>=evS && rrrL){ mp_side="long"; mp_tp_bps=rrrL.tp_bps; mp_sl_bps=rrrL.sl_bps; mp_rrr=rrrL.r_used; mp_exp_lcb_bps=evL; mp_exp_bps=Math.round((c.p_long_adj||pL_long)*rrrL.tp_bps - (1-(c.p_long_adj||pL_long))*rrrL.sl_bps - (c.cost_long||c.cost_bps)); }
                   else if(rrrS){ mp_side="short"; mp_tp_bps=rrrS.tp_bps; mp_sl_bps=rrrS.sl_bps; mp_rrr=rrrS.r_used; mp_exp_lcb_bps=evS; mp_exp_bps=Math.round((c.p_short_adj||pL_short)*rrrS.tp_bps - (1-(c.p_short_adj||pL_short))*rrrS.sl_bps - (c.cost_short||c.cost_bps)); }
-                  return { ...c, mp_side, mp_tp_bps, mp_sl_bps, mp_rrr, mp_exp_lcb_bps, mp_exp_bps };
+
+                  // Quality-aware rank for fallback
+                  const trendBonus = (mp_side==="long" ? (c.trend_align_long?1:0) : (c.trend_align_short?1:0));
+                  const mp_rank = (1000*mp_exp_lcb_bps)
+                                + (10*(+c.adx||0))
+                                + (40*(+c.liq_pct||0))
+                                + (60*(+c.fill_prob||0))
+                                + (80*trendBonus)
+                                - (12*Math.max(0,(+c.spread_bps||0)-6))
+                                - (100*(+c.beta_r2||0)); // penalize beta lock-in
+
+                  return { ...c, mp_side, mp_tp_bps, mp_sl_bps, mp_rrr, mp_exp_lcb_bps, mp_exp_bps, mp_rank };
                 }
-                const poolMP = pool.map(mpEnhance).sort((a,b)=> (b.mp_exp_lcb_bps - a.mp_exp_lcb_bps) || (b.mp_exp_bps - a.mp_exp_bps) || (b.score - a.score));
-                const take=[]; for(const cand of poolMP){ if(take.length>=3) break; let ok=true; for(const s of take){ if(rho(cand,s)>OF_CORR_MAX){ ok=false; break; } } if(ok) take.push(cand); }
-                if(take.length<3){ for(const cand of poolMP){ if(take.length>=3) break; if(!take.includes(cand)) take.push(cand); } }
-                selected=take; selectionTier="mp_top20"; reason=(reason!=="ok"?reason:"maxpower_top20");
+
+                const poolMP = pool.map(mpEnhance).sort((a,b)=> (b.mp_exp_lcb_bps - a.mp_exp_lcb_bps) || (b.mp_rank - a.mp_rank) || (b.mp_exp_bps - a.mp_exp_bps) || (b.score - a.score));
+
+                const fallbackOk=(cand, {minFill=0.60, maxBeta=0.85, maxCost=Math.max(COST_BPS+10,20), minLCB=EXP_LCB_MIN_BPS}={})=>{
+                  const lcbOK = (cand.mp_exp_lcb_bps ?? cand.exp_lcb_bps) >= Math.max(minLCB, cand.dyn_floor ?? minLCB);
+                  const fillOK = (cand.fill_prob ?? 0) >= minFill;
+                  const betaOK = (cand.beta_r2 ?? 0) <= maxBeta;
+                  const spreadOK = (cand.spread_bps ?? 99) <= MAX_SPREAD_BPS;
+                  const costOK = (cand.cost_bps ?? 99) <= maxCost;
+                  return lcbOK && fillOK && betaOK && spreadOK && costOK;
+                };
+
+                const take=[];
+                // Pass 1: tight
+                for(const cand of poolMP){
+                  if(take.length>=Math.min(3, TOP_N||3)) break;
+                  if(!fallbackOk(cand,{minFill:0.62,maxBeta:0.82,maxCost:Math.max(COST_BPS+8,18),minLCB:EXP_LCB_MIN_BPS+2})) continue;
+                  let ok=true; for(const s of take){ if(rho(cand,s)>OF_CORR_MAX){ ok=false; break; } }
+                  if(ok) take.push(cand);
+                }
+                // Pass 2: mild relax
+                if(take.length<Math.min(3, TOP_N||3)){
+                  for(const cand of poolMP){
+                    if(take.length>=Math.min(3, TOP_N||3)) break;
+                    if(!take.includes(cand) && fallbackOk(cand,{minFill:0.58,maxBeta:0.86,maxCost:Math.max(COST_BPS+10,22),minLCB:EXP_LCB_MIN_BPS})) {
+                      let ok=true; for(const s of take){ if(rho(cand,s)>OF_CORR_MAX){ ok=false; break; } }
+                      if(ok) take.push(cand);
+                    }
+                  }
+                }
+                // Pass 3: fill any remaining by rank (still enforce corr)
+                if(take.length<Math.min(3, TOP_N||3)){
+                  for(const cand of poolMP){
+                    if(take.length>=Math.min(3, TOP_N||3)) break;
+                    if(!take.includes(cand)){
+                      let ok=true; for(const s of take){ if(rho(cand,s)>OF_CORR_MAX){ ok=false; break; } }
+                      if(ok) take.push(cand);
+                    }
+                  }
+                }
+
+                selected=take;
+                selectionTier="mp_top20";
+                reason=(reason!=="ok"?reason:"maxpower_top20");
               }
 
               // Build picks with absolute limit_at_old_sl
@@ -783,4 +834,3 @@ jobs:
             fi
             exit 0
           fi
-```
