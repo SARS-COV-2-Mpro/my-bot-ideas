@@ -38,8 +38,9 @@ jobs:
       ACTIVE_UTC_END: ${{ vars.ACTIVE_UTC_END }}
       MEXC_BASE: ${{ vars.MEXC_BASE }}
 
-      # New knobs
-      FORCE_SIZE_BPS: ${{ vars.FORCE_SIZE_BPS }}  # e.g., 1000 = 10% fixed; 0 = risk-based
+      # Sizing/behavior knobs
+      FORCE_SIZE_BPS: ${{ vars.FORCE_SIZE_BPS }}       # e.g., 1000 = 10% fixed; 0 = risk-based
+      NO_VIABLE_RANK_FILL: ${{ vars.NO_VIABLE_RANK_FILL }}  # "true" (default) or "false"
 
     steps:
       - name: Setup Node 20
@@ -47,7 +48,7 @@ jobs:
         with:
           node-version: 20
 
-      - name: Run pusher (Stochastic Pro, strict-first; strict=0 → force top-3 spec, with counts snapshot)
+      - name: Run pusher (Stochastic Pro, strict-first; strict=0 → rank-fill + top-up to K + counts snapshot)
         shell: bash
         run: |
           set -euo pipefail
@@ -375,6 +376,9 @@ jobs:
 
             const STABLES=new Set(["USDT","USDC","USD","USDE","USDD","BUSD","FDUSD","TUSD","DAI","USDP","PAX","USTC"]);
 
+            // New toggle: if no viable ideas, should we push top-K ranked (mp_fill)?
+            const NO_VIABLE_RANK_FILL = (process.env.NO_VIABLE_RANK_FILL || "true").toLowerCase() === "true";
+
             // ---------- Worker endpoints ----------
             const PUSH_URL=process.env.WORKER_PUSH_URL||"";
             const PUSH_TOKEN=process.env.PUSH_TOKEN||"";
@@ -541,7 +545,7 @@ jobs:
               const seqFeat=[];
               function rollSeq(k){ if(!k) return; const c=k.map(x=>+x[4]); for(let i=5;i<Math.min(k.length,80);i++){ const seg=k.slice(i-5,i+1); const f=regimeFeatures(seg); if(f.length) seqFeat.push(f); } }
               rollSeq(kBTC15); rollSeq(kETH15);
-              function hmmTrainGaussian(obs,K=3,iters=6){
+              const hmm = seqFeat.length>=20 ? (function hmmTrainGaussian(obs,K=3,iters=6){
                 const T=obs.length, d=obs[0]?.length||0; if(T<d+5) return null;
                 let pi=Array(K).fill(1/K), A=Array.from({length:K},()=>Array(K).fill(1/K));
                 const mu=Array.from({length:K},(_,k)=> obs[Math.floor((k+1)*T/(K+1))].slice());
@@ -573,8 +577,8 @@ jobs:
                   for(let i=0;i<K;i++){ const s=sum(A[i])||1e-12; for(let j=0;j<K;j++) A[i][j]/=s; }
                 }
                 return { pi, A, mu, Sig };
-              }
-              function hmmPosterior(obs, model){
+              })(seqFeat,3,6) : null;
+              const post = (function hmmPosterior(obs, model){
                 if(!model){ return [0.4,0.4,0.2]; }
                 const {pi,A,mu,Sig}=model; const T=obs.length, K=pi.length; if(T===0) return Array(K).fill(1/K);
                 const B=obs.map(o=> mu.map((m,ki)=>mvnPdf(o,m,Sig[ki])+1e-18));
@@ -582,8 +586,7 @@ jobs:
                 for(let k=0;k<K;k++) alpha[0][k]=pi[k]*B[0][k]; c[0]=1/(sum(alpha[0])||1e-12); for(let k=0;k<K;k++) alpha[0][k]*=c[0];
                 for(let t=1;t<T;t++){ for(let k=0;k<K;k++){ let s=0; for(let i=0;i<K;i++) s+=alpha[t-1][i]*A[i][k]; alpha[t][k]=s*B[t][k]; } c[t]=1/(sum(alpha[t])||1e-12); for(let k=0;k<K;k++) alpha[t][k]*=c[t]; }
                 return alpha[T-1];
-              }
-              const post = hmmPosterior((()=>{ const s=[]; const roll=(k)=>{ if(!k) return; for(let i=5;i<Math.min(k.length,80);i++){ const seg=k.slice(i-5,i+1); const f=regimeFeatures(seg); if(f.length) s.push(f);} }; roll(kBTC15); roll(kETH15); return s.slice(-15);} )(), hmmTrainGaussian((()=>{ const s=[]; const roll=(k)=>{ if(!k) return; for(let i=5;i<Math.min(k.length,80);i++){ const seg=k.slice(i-5,i+1); const f=regimeFeatures(seg); if(f.length) s.push(f);} }; roll(kBTC15); roll(kETH15); return s;} )(),3,6));
+              })(seqFeat.slice(-15),hmm);
               const weights = { wTrend:post[0]||0.4, wMR:post[1]||0.4, wBO:post[2]||0.2 };
               log("regime posterior", weights);
 
@@ -608,8 +611,8 @@ jobs:
               const toRet5=(k)=>{ if(!k) return []; const c=k.map(x=>+x[4]); const r=[]; for(let i=1;i<c.length;i++) r.push(Math.log(c[i]/c[i-1])); return r.slice(-60); };
               const fBTC=toRet5(kBTC15), fETH=toRet5(kETH15), fSOL=toRet5(kSOL15);
 
-              // Prefilter
-              const picksRaw=[];
+              // Prefilter (collect both gated and any)
+              const picksRaw=[], picksAny=[];
               const B=10;
               for(let i=0;i<(universe||[]).length;i+=B){
                 const batch=await Promise.all(universe.slice(i,i+B).map(async c=>{
@@ -708,19 +711,28 @@ jobs:
                     };
                   }catch{ return null; }
                 }));
-                for(const x of batch) if(x && x.signalScore > 50) picksRaw.push(x);
+                for(const x of batch){
+                  if(x) picksAny.push(x);
+                  if(x && x.signalScore > 50) picksRaw.push(x);
+                }
               }
-              snapCounts({ pre: picksRaw.length });
-              if(!picksRaw.length){ reason = (reason!=="ok"?reason:"no_candidates"); }
+              snapCounts({ pre: picksRaw.length, pre_any: picksAny.length });
+              if(!picksRaw.length && !picksAny.length){ reason = (reason!=="ok"?reason:"no_candidates"); }
 
               // Refine
-              picksRaw.sort((a,b)=> b.signalScore - a.signalScore);
-              const REFINE_M = Math.min(UNIV_TARGET_MAX, picksRaw.length);
+              const byScoreSort = (arr)=>arr.sort((a,b)=> b.signalScore - a.signalScore);
+              byScoreSort(picksRaw);
+              byScoreSort(picksAny);
+
+              // If rank-fill enabled and no gated picks, refine from the broader pool
+              const REFINE_SRC = (picksRaw.length>0 || !NO_VIABLE_RANK_FILL) ? picksRaw : picksAny;
+
+              const REFINE_M = Math.min(UNIV_TARGET_MAX, REFINE_SRC.length);
               const refined=[];
               function retLog(arr){ const r=[]; for(let i=1;i<arr.length;i++) r.push(Math.log(arr[i]/arr[i-1])); return r.slice(-36); }
 
               for(let idx=0; idx<REFINE_M; idx++){
-                const p=picksRaw[idx];
+                const p=REFINE_SRC[idx];
                 const c=p.c;
                 const book=bookMap.get(c.symbol); if(!book?.bid||!book?.ask) continue;
                 const mid=(book.bid+book.ask)/2;
@@ -851,22 +863,24 @@ jobs:
                 && (cand.fill_prob||0)>=0.70 && cand.cost_bps<=Math.max(COST_BPS+8, 18)
                 && cand.spread_bps<=MAX_SPREAD_BPS && cand.beta_r2<=0.75;
 
+              const TARGET_K = Math.min(3, TOP_N || 3);
+
               const strictPicks=[];
               for(const cand of refined){
-                if(strictPicks.length>=Math.min(3, TOP_N)) break;
+                if(strictPicks.length>=TARGET_K) break;
                 if(!strictOk(cand)) continue;
                 let ok=true; for(const s of strictPicks){ if(rho(cand,s)>CORE_CORR_MAX){ ok=false; break; } }
                 if(ok) strictPicks.push(cand);
               }
 
+              // Selection with fallback and top-up
               let selected=[];
               if(strictPicks.length>0){
-                selected=strictPicks;
+                selected=strictPicks.slice(0, TARGET_K);
                 selectionTier="strict";
                 reason=(reason!=="ok"?reason:"strict");
               }else{
-                // strict=0 → "viable-first" force: >=3 viable → take 3; 1–2 viable → take those; 0 viable → take top 3 by rank (micro-size)
-                const TARGET_K = Math.min(3, TOP_N || 3);
+                // strict=0 → viable-first; optionally rank-fill and top-up if enabled
                 const viable = refined.filter(c => (c.exp_lcb_bps ?? -1e9) > 0);
 
                 if (viable.length >= TARGET_K){
@@ -876,11 +890,33 @@ jobs:
                   selected = viable.slice(0, viable.length);
                   selectionTier="mp_force3_viable12";
                 } else {
-                  selected = refined.slice(0, TARGET_K).map(c=>({ ...c, mp_fill:true }));
-                  selectionTier="mp_force3_rank";
+                  if (NO_VIABLE_RANK_FILL) {
+                    selected = refined.slice(0, TARGET_K).map(c=>({ ...c, mp_fill:true }));
+                    selectionTier="mp_force3_rank";
+                  } else {
+                    selected = [];
+                    selectionTier="mp_force3_none";
+                  }
                 }
                 reason=(reason!=="ok"?reason:"strict0_force3_spec");
               }
+
+              // Top-up to K when rank-fill enabled and we have remaining refined
+              if (NO_VIABLE_RANK_FILL && selected.length < TARGET_K && refined.length > 0){
+                const have = new Set(selected.map(s=>s.symbol));
+                const add=[];
+                for (const c of refined){
+                  if (add.length + selected.length >= TARGET_K) break;
+                  if (have.has(c.symbol)) continue;
+                  add.push({ ...c, mp_fill:true });
+                }
+                if (add.length){
+                  selected = selected.concat(add);
+                  if (selectionTier === "strict") selectionTier = "strict_topup";
+                  else if (selectionTier === "mp_force3_viable12") selectionTier = "mp_force3_viable12_topup";
+                }
+              }
+
               snapCounts({ selected: (selected?.length||0) });
 
               // Build picks (limit_at_old_sl) + micro-size forced negatives
@@ -962,7 +998,7 @@ jobs:
               // POST
               const meta={
                 exchange:"mexc", exchange_base:BASE,
-                counts:{ universe:universe.length, pre:picksRaw.length, refined:refined.length, selected:picks.length },
+                counts:{ universe:universe.length, pre:picksRaw.length, pre_any:picksAny.length, refined:refined.length, selected:picks.length },
                 filters:{
                   dyn_min_qv:dynMinQV, univ_target_min:UNIV_TARGET_MIN, univ_target_max:UNIV_TARGET_MAX,
                   score_cutoff:50, refine_topk:UNIV_TARGET_MAX,
@@ -973,7 +1009,8 @@ jobs:
                   exp_lcb_min_bps:EXP_LCB_MIN_BPS, wilson_z:WILSON_Z,
                   entry_policy: "limit_at_old_sl",
                   stochastic: { hmm:true, gp:true, sde_mc:true, var_es:true, kalman:true },
-                  strict0_force3_spec: true
+                  strict0_force3_spec: true,
+                  strict0_rank_fill_when_no_viable: NO_VIABLE_RANK_FILL
                 },
                 dd_gate: (function(){ const s=state.equity||[]; const day=Date.now()-24*3600*1000; let pnl24=0,cum=0,peak=0,dd=0; for(const e of s){ if(e.ts_ms>=day) pnl24+=e.pnl_bps; cum+=e.pnl_bps; if(cum>peak) peak=cum; dd=Math.min(dd,cum-peak); } return { pnl24_bps:Math.round(pnl24), peak_dd_bps:Math.round(dd), throttle }; })(),
                 tod: { active: S_H!=null && E_H!=null, start:S_H, end:E_H },
