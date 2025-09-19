@@ -1,15 +1,15 @@
-name: Ideas Pusher (MEXC 2.1)
+name: Ideas Pusher (MEXC ULTIMATE EV@Pusher+, Stochastic Pro, GP PRC+)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/10 * * * *" # runs every 20 minutes
+    - cron: "*/20 * * * *"
 
 permissions:
   contents: read
 
 concurrency:
-  group: ideas-mexc
+  group: ideas-mexc-ultimate
   cancel-in-progress: true
 
 jobs:
@@ -17,11 +17,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 12
     env:
-      # Required secrets
       WORKER_PUSH_URL: ${{ secrets.WORKER_PUSH_URL }}
       PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
 
-      # Optional (safe defaults inside the script)
+      # Optional (state)
       GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
       GIST_ID: ${{ secrets.GIST_ID }}
 
@@ -29,7 +28,6 @@ jobs:
       EXCHANGE: mexc
       MIN_QV_USD: ${{ vars.MIN_QV_USD }}
       TOP_N: ${{ vars.TOP_N }}
-      EXTRA_IDEAS_MAX: ${{ vars.EXTRA_IDEAS_MAX }}
       MAX_SPREAD_BPS: ${{ vars.MAX_SPREAD_BPS }}
       EXP_LCB_MIN_BPS: ${{ vars.EXP_LCB_MIN_BPS }}
       FEES_BPS: ${{ vars.FEES_BPS }}
@@ -40,18 +38,21 @@ jobs:
       ACTIVE_UTC_END: ${{ vars.ACTIVE_UTC_END }}
       MEXC_BASE: ${{ vars.MEXC_BASE }}
 
+      # New knobs
+      FORCE_SIZE_BPS: ${{ vars.FORCE_SIZE_BPS }}  # e.g., 1000 = 10% fixed; 0 = risk-based
+      MP_TOP_POOL: ${{ vars.MP_TOP_POOL }}        # optional pool cap (not needed for force3)
+
     steps:
       - name: Setup Node 20
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Run pusher (always-push + clear logs)
+      - name: Run pusher (Stochastic Pro, strict-first; strict=0 → force top-3 spec)
         shell: bash
         run: |
           set -euo pipefail
 
-          # Hard fail only on true misconfig (so setup problems aren't hidden)
           if [[ -z "${WORKER_PUSH_URL:-}" || -z "${PUSH_TOKEN:-}" ]]; then
             echo "[gha] Missing WORKER_PUSH_URL or PUSH_TOKEN"
             exit 1
@@ -62,12 +63,14 @@ jobs:
           (async ()=>{
             'use strict';
 
-            // ---------- Utils ----------
+            // ---------------- Utils ----------------
             const clamp=(x,a,b)=>Math.max(a,Math.min(b,x));
             const tanh=(x)=>Math.tanh(x);
+            const sum=(a)=>a.reduce((x,y)=>x+y,0);
+            const mean=(a)=>a.length?sum(a)/a.length:0;
+            const std=(a)=>{const m=mean(a); let v=0; for(const x of a)v+=(x-m)*(x-m); return a.length>1?Math.sqrt(v/(a.length-1)):0;};
             const ema=(arr,p)=>{ if(arr.length<p) return null; const k=2/(p+1); let e=arr.slice(0,p).reduce((a,b)=>a+b,0)/p; for(let i=p;i<arr.length;i++) e=arr[i]*k+e*(1-k); return e; };
             const rsi=(cl,p=14)=>{ if(cl.length<=p) return null; let g=0,l=0; for(let i=1;i<=p;i++){ const d=cl[i]-cl[i-1]; g+=d>0?d:0; l+=d<0?-d:0; } let ag=g/p, al=l/p; for(let i=p+1;i<cl.length;i++){ const d=cl[i]-cl[i-1]; ag=(ag*(p-1)+(d>0?d:0))/p; al=(al*(p-1)+(d<0?-d:0))/p; } const rs=al===0?100:ag/al; return 100-100/(1+rs); };
-            const std=(x)=>{ const n=x.length; if(n<=1) return 0; const m=x.reduce((a,b)=>a+b,0)/n; let v=0; for(const xi of x) v+=(xi-m)*(xi-m); return Math.sqrt(v/(n-1)); };
             const computeADX_ATR=(h,l,c,p=14)=>{ const n=c.length; if(n<p+2) return null; const TR=[],plusDM=[],minusDM=[];
               for(let i=1;i<n;i++){ const up=h[i]-h[i-1], down=l[i-1]-l[i]; plusDM.push((up>down&&up>0)?up:0); minusDM.push((down>up&&down>0)?down:0);
                 TR.push(Math.max(h[i]-l[i], Math.abs(h[i]-c[i-1]), Math.abs(l[i]-c[i-1]))); }
@@ -79,94 +82,281 @@ jobs:
             };
             const vwapAnchored=(h,l,c,v,win)=>{ const n=c.length,s=Math.max(0,n-win); let pv=0,vv=0; for(let i=s;i<n;i++){ const tp=(h[i]+l[i]+c[i])/3; const vol=+v[i]||0; pv+=tp*vol; vv+=vol; } return vv>0?pv/vv:c.at(-1); };
             const corr=(a,b)=>{ const n=Math.min(a.length,b.length); if(n<5) return 0; const as=a.slice(-n), bs=b.slice(-n);
-              const ma=as.reduce((x,y)=>x+y,0)/n, mb=bs.reduce((x,y)=>x+y,0)/n; let num=0,da=0,db=0;
-              for(let i=0;i<n;i++){ const xa=as[i]-ma, xb=bs[i]-mb; num+=xa*xb; da+=xa*xa; db+=xb*xb; }
-              const den=Math.sqrt(da*db); return den===0?0:num/den;
+              const ma=mean(as), mb=mean(bs); let num=0,da=0,db=0; for(let i=0;i<n;i++){ const xa=as[i]-ma, xb=bs[i]-mb; num+=xa*xb; da+=xa*xa; db+=xb*xb; }
+              const den=Math.sqrt(da*db)||1; return num/den;
             };
             const wilsonLCB=(p,n,z=1.34)=>{ if(n<=0) return p; const z2=z*z; const a=p + z2/(2*n); const b=z*Math.sqrt((p*(1-p)+z2/(4*n))/n); const c=1+z2/n; return clamp((a-b)/c, 0, 1); };
-            const sum=(a)=>a.reduce((x,y)=>x+y,0);
-            const matMulT=(X,y)=>{ const k=X[0].length; const XtY=new Array(k).fill(0); for(let i=0;i<X.length;i++){ const row=X[i]; const yi=y[i]; for(let j=0;j<k;j++) XtY[j]+=row[j]*yi; } return XtY; };
-            const matTXmat=(X)=>{ const k=X[0].length; const XtX=Array.from({length:k},()=>new Array(k).fill(0)); for(let i=0;i<X.length;i++){ const row=X[i]; for(let a=0;a<k;a++) for(let b=0;b<k;b++) XtX[a][b]+=row[a]*row[b]; } return XtX; };
-            const solveRidge=(A,b,lam=1e-6)=>{ const k=A.length; const M=Array.from({length:k},(_,i)=>A[i].slice()); for(let i=0;i<k;i++) M[i][i]+=lam;
-              const aug=M.map((row,i)=>row.concat([b[i]]));
-              for(let i=0;i<k;i++){
-                let p=i; for(let r=i+1;r<k;r++) if(Math.abs(aug[r][i])>Math.abs(aug[p][i])) p=r;
-                if(Math.abs(aug[p][i])<1e-12) return null;
-                if(p!==i){ const t=aug[i]; aug[i]=aug[p]; aug[p]=t; }
-                const piv=aug[i][i]; for(let j=i;j<=k;j++) aug[i][j]/=piv;
-                for(let r=0;r<k;r++){ if(r===i) continue; const f=aug[r][i]; for(let j=i;j<=k;j++) aug[r][j]-=f*aug[i][j]; }
-              }
-              return aug.map(row=>row[k]);
-            };
-            const olsR2=(y,factors)=>{ const n=y.length; if(n<10) return {R2:0,beta:null}; const X=[]; for(let i=0;i<n;i++){ const row=[1]; for(const f of factors) row.push(f[i]||0); X.push(row); }
-              const XtX=matTXmat(X), XtY=matMulT(X,y); const beta=solveRidge(XtX,XtY,1e-6);
-              if(!beta) return {R2:0,beta:null};
-              let ssTot=0, ssRes=0; const ym=sum(y)/n;
-              for(let i=0;i<n;i++){
-                let yhat=0; for(let j=0;j<beta.length;j++) yhat+=X[i][j]*beta[j];
-                ssRes+=(y[i]-yhat)**2; ssTot+=(y[i]-ym)**2;
-              }
-              return {R2: clamp(ssTot>0? (1-ssRes/ssTot):0,0,1), beta};
-            };
-
             const sleep=(ms)=>new Promise(r=>setTimeout(r,ms));
             const jitter=(ms)=>ms + Math.floor(Math.random()*ms*0.25);
+            const softmax=(arr,t=20)=>{ const m=Math.max(...arr,0); const ex=arr.map(x=>Math.exp((x-m)/t)); const s=ex.reduce((a,b)=>a+b,0)||1; return ex.map(x=>x/s); };
             const log=(...a)=>console.log("[gha]",...a);
 
-            // ---------- Config / ENV ----------
-            const UA="gh-actions-ideas-elite-mexc/2.1 (+https://github.com/)";
-            async function fetchWithTimeout(url,opts={},ms=12000){
-              const ac=new AbortController(); const t=setTimeout(()=>ac.abort(),ms);
-              try{ return await fetch(url,{...opts,signal:ac.signal,headers:{"User-Agent":UA,...(opts.headers||{})}}); }
-              finally{ clearTimeout(t); }
-            }
-            async function getJSON(url,ms=12000,tries=2){
-              for(let a=0;a<tries;a++){
-                try{ const r=await fetchWithTimeout(url,{},ms); if(r?.ok){ return await r.json(); } }catch{}
-                await sleep(jitter(220));
+            // RNG
+            let bmSpare=null;
+            const randn=()=>{ if(bmSpare!=null){ const v=bmSpare; bmSpare=null; return v; } let u=0,v=0; while(u===0) u=Math.random(); while(v===0) v=Math.random(); const r=Math.sqrt(-2*Math.log(u)); const th=2*Math.PI*v; bmSpare=r*Math.sin(th); return r*Math.cos(th); };
+
+            // Kalman (1D RW)
+            function kalman1D(obs,{q=1e-5,r=1e-3,x0=null,p0=1e-2}={}){
+              if(!obs?.length) return [];
+              let x=(x0==null?obs[0]:x0), p=p0;
+              const out=[];
+              for(const z of obs){
+                p+=q;
+                const K=p/(p+r);
+                x=x + K*(z-x);
+                p=(1-K)*p;
+                out.push(x);
               }
-              return null;
+              return out;
             }
+
+            // ------------- HMM (3-state Gaussian), EM lite -------------
+            function mvnPdf(x,mu,Sig){
+              const d=x.length;
+              const S=Sig.map((row,i)=>row.map((v,j)=> v + (i===j?1e-6:0)));
+              const L=cholesky(S); if(!L) return 1e-12;
+              const diff=x.map((v,i)=>v-(mu[i]||0));
+              const y=forwardSub(L,diff);
+              const quad = dot(y,y);
+              const logdet = 2*sum(L.map((row,i)=>Math.log(row[i]||1e-12)));
+              const log2pi = d*Math.log(2*Math.PI);
+              const logp = -0.5*(log2pi + logdet + quad);
+              return Math.exp(Math.max(-50, Math.min(50, logp)));
+            }
+            function dot(a,b){ let s=0; for(let i=0;i<a.length;i++) s+=a[i]*(b[i]||0); return s; }
+            function cholesky(A){
+              const n=A.length; const L=Array.from({length:n},()=>Array(n).fill(0));
+              for(let i=0;i<n;i++){
+                for(let j=0;j<=i;j++){
+                  let s=0; for(let k=0;k<j;k++) s+=L[i][k]*L[j][k];
+                  const v=A[i][j]-s;
+                  if(i===j){ if(v<=1e-12) return null; L[i][j]=Math.sqrt(v); }
+                  else { L[i][j]=v/(L[j][j]||1e-12); }
+                }
+              }
+              return L;
+            }
+            function forwardSub(L,b){
+              const n=L.length; const y=Array(n).fill(0);
+              for(let i=0;i<n;i++){ let s=0; for(let k=0;k<i;k++) s+=L[i][k]*y[k]; y[i]=(b[i]-s)/(L[i][i]||1e-12); }
+              return y;
+            }
+            function backSub(U,y){
+              const n=U.length; const x=Array(n).fill(0);
+              for(let i=n-1;i>=0;i--){ let s=0; for(let k=i+1;k<n;k++) s+=U[i][k]*x[k]; x[i]=(y[i]-s)/(U[i][i]||1e-12); }
+              return x;
+            }
+
+            // ------------- GP (RBF) for p_win with uncertainty -------------
+            function medianPairwiseDist(X){
+              const n=X.length; if(n<2) return 1;
+              const sampleIdx=[]; for(let i=0;i<n;i+=Math.max(1,Math.floor(n/20))) sampleIdx.push(i);
+              const dists=[];
+              for(let i=0;i<sampleIdx.length;i++){
+                for(let j=i+1;j<sampleIdx.length;j++){
+                  const a=X[sampleIdx[i]], b=X[sampleIdx[j]];
+                  let d2=0; for(let k=0;k<a.length;k++){ const dv=(a[k]-b[k]); d2+=dv*dv; }
+                  dists.push(Math.sqrt(d2));
+                }
+              }
+              dists.sort((a,b)=>a-b);
+              return dists[Math.floor(dists.length/2)]||1;
+            }
+            function buildGP(X,Y,lam=0.10){
+              const n=X.length; if(n===0) return null;
+              const ell = medianPairwiseDist(X) || 1;
+              const inv2l2 = 1/(2*ell*ell);
+              const K = Array.from({length:n},()=>Array(n).fill(0));
+              for(let i=0;i<n;i++){
+                for(let j=0;j<n;j++){
+                  let d2=0; for(let k=0;k<X[i].length;k++){ const dv=X[i][k]-X[j][k]; d2+=dv*dv; }
+                  K[i][j]=Math.exp(-d2*inv2l2);
+                }
+                K[i][i]+=lam;
+              }
+              const L=cholesky(K); if(!L) return null;
+              const y=Y.slice();
+              const z=forwardSub(L,y);
+              const LT=L.map((row,i)=>row.map((v,j)=> L[j]?.[i]??0));
+              const alpha=backSub(LT,z);
+              return { X, alpha, L, ell, inv2l2 };
+            }
+            function gpPredict(model,x){
+              if(!model) return { mu:0.5, sigma:0.25 };
+              const {X,alpha,L,inv2l2}=model;
+              const n=X.length;
+              const kstar=Array(n).fill(0);
+              for(let i=0;i<n;i++){
+                let d2=0; for(let k=0;k<X[i].length;k++){ const dv=X[i][k]-x[k]; d2+=dv*dv; }
+                kstar[i]=Math.exp(-d2*inv2l2);
+              }
+              let mu=0; for(let i=0;i<n;i++) mu+=kstar[i]*alpha[i];
+              const v=forwardSub(L,kstar);
+              let vtv=0; for(const vi of v) vtv+=vi*vi;
+              let varp=Math.max(1e-6, 1 - vtv);
+              return { mu:clamp(mu,0,1), sigma:Math.sqrt(varp) };
+            }
+
+            // ------------- SDE Monte Carlo (GBM) -------------
+            function gbmSimEV({entry,tp_bps,sl_bps,side,mu, sigma, dt, steps, N=192, cost_bps=10}){
+              let hitTP=0, ev=0;
+              const up=(side==="long");
+              const tpF=tp_bps/10000, slF=sl_bps/10000;
+              for(let n=0;n<N;n++){
+                let S=entry;
+                let tp=up? entry*(1+tpF): entry*(1-tpF);
+                let sl=up? entry*(1-slF): entry*(1+slF);
+                let win=0, pnl_bps=0;
+                for(let t=0;t<steps;t++){
+                  const z=randn();
+                  S = S * Math.exp((mu - 0.5*sigma*sigma)*dt + sigma*Math.sqrt(dt)*z);
+                  if(up){
+                    if(S>=tp){ win=1; pnl_bps=tp_bps - cost_bps; break; }
+                    if(S<=sl){ win=0; pnl_bps=-sl_bps - cost_bps; break; }
+                  }else{
+                    if(S<=tp){ win=1; pnl_bps=tp_bps - cost_bps; break; }
+                    if(S>=sl){ win=0; pnl_bps=-sl_bps - cost_bps; break; }
+                  }
+                  if(t===steps-1){
+                    const ret = up? (S/entry - 1) : (entry/S - 1);
+                    pnl_bps = Math.round(ret*10000) - cost_bps;
+                    win = pnl_bps>0?1:0;
+                  }
+                }
+                hitTP+=win;
+                ev += pnl_bps;
+              }
+              const p=hitTP/N;
+              const p_lcb = wilsonLCB(p, N, 1.34);
+              const ev_mean = ev/N;
+              const ev_lcb = p_lcb*tp_bps - (1-p_lcb)*sl_bps - cost_bps;
+              return { p, p_lcb, ev_bps: Math.round(ev_mean), ev_lcb_bps: Math.round(ev_lcb) };
+            }
+
+            function optimizeRRR_MC({atr_bps,cost_bps,spread_bps,entry,side,mu,sigma,ttl_sec}){
+              const slMults=[0.35,0.5,0.7,1.0,1.3,1.5];
+              const tpMults=[0.5,0.8,1.1,1.4,1.8,2.1];
+              const dt=1;
+              const steps=Math.max(1, Math.round(ttl_sec/300));
+              let best=null;
+              for(const sm of slMults){
+                for(const tm of tpMults){
+                  const sl_bps=Math.round(sm*atr_bps);
+                  const tp_bps=Math.round(tm*atr_bps);
+                  if(tp_bps <= cost_bps+2) continue;
+                  const { ev_lcb_bps } = gbmSimEV({entry,tp_bps,sl_bps,side,mu,sigma,dt,steps,N:128,cost_bps});
+                  const qual=ev_lcb_bps - Math.max(0, (spread_bps-6));
+                  if(!best || qual>(best.qual||-1e9)){
+                    best={ tp_bps, sl_bps, r:tp_bps/Math.max(1,sl_bps), ev_lcb_bps, qual };
+                  }
+                }
+              }
+              if(best){
+                const refine=[-0.15, -0.05, 0, +0.05, +0.15];
+                for(const ds of refine){
+                  for(const dtp of refine){
+                    const sm=clamp(best.sl_bps/atr_bps + ds, 0.30, 1.50);
+                    const tm=clamp(best.tp_bps/atr_bps + dtp, 0.40, 2.10);
+                    const sl_bps=Math.round(sm*atr_bps);
+                    const tp_bps=Math.round(tm*atr_bps);
+                    const { ev_lcb_bps } = gbmSimEV({entry,tp_bps,sl_bps,side: (tp_bps>=sl_bps? "long":"short"), mu,sigma,dt,steps,N:192,cost_bps});
+                    const qual=ev_lcb_bps;
+                    if(qual>(best.qual||-1e9)) best={ tp_bps, sl_bps, r:tp_bps/Math.max(1,sl_bps), ev_lcb_bps, qual };
+                  }
+                }
+              }
+              return best;
+            }
+
+            // ------------- Portfolio VaR / ES (MC) -------------
+            function mvnSample(meanVec, Sigma, M=1000){
+              const n=meanVec.length; const L=cholesky(Sigma); if(!L) return [];
+              const out=[];
+              for(let m=0;m<M;m++){
+                const z=Array(n).fill(0).map(()=>randn());
+                const y=Array(n).fill(0);
+                for(let i=0;i<n;i++){ let s=0; for(let k=0;k<=i;k++) s+=L[i][k]*z[k]; y[i]=s + (meanVec[i]||0); }
+                out.push(y);
+              }
+              return out;
+            }
+            function portfolioVaR_ES(picks){
+              if(picks.length===0) return { VaR95_bps:0, ES95_bps:0, scale:1 };
+              const n=picks.length;
+              const mu=Array(n).fill(0);
+              const sd=Array(n).fill(0);
+              for(let i=0;i<n;i++){
+                const r5=picks[i].ret5||[];
+                const rMean=mean(r5), rStd=std(r5);
+                const steps=Math.max(1, Math.round((picks[i].ttl_sec||600)/300));
+                const muH=rMean*steps;
+                const sdH=rStd*Math.sqrt(steps);
+                mu[i]=muH*10000;
+                sd[i]=sdH*10000;
+              }
+              const Sigma=Array.from({length:n},()=>Array(n).fill(0));
+              for(let i=0;i<n;i++){
+                for(let j=0;j<n;j++){
+                  const rho=corr(picks[i].ret5||[], picks[j].ret5||[]);
+                  Sigma[i][j]=rho * sd[i] * sd[j];
+                }
+                Sigma[i][i]=Math.max(Sigma[i][i], 1e-3 + sd[i]*sd[i]);
+              }
+              const weights=picks.map(p=> (p.size_bps||0)); const wSum=sum(weights)||1; for(let i=0;i<weights.length;i++) weights[i]/=wSum;
+
+              const draws=mvnSample(mu,Sigma,1200);
+              const port=[];
+              for(const d of draws){
+                let pr=0; for(let i=0;i<n;i++) pr += (weights[i]||0) * (d[i]||0);
+                port.push(pr);
+              }
+              port.sort((a,b)=>a-b);
+              const idx=Math.floor(0.05*port.length);
+              const VaR95=port[idx]||0;
+              const ES=mean(port.slice(0,idx+1));
+              return { VaR95_bps: Math.round(VaR95), ES95_bps: Math.round(ES), scale:1 };
+            }
+
+            // ---------- Config / ENV ----------
+            const UA="gh-actions-ideas-mexc-ultimate/4.0-stoch (+https://github.com/)";
+            async function fetchWithTimeout(url,opts={},ms=12000){ const ac=new AbortController(); const t=setTimeout(()=>ac.abort(),ms); try{ return await fetch(url,{...opts,signal:ac.signal,headers:{"User-Agent":UA,...(opts.headers||{})}});} finally{ clearTimeout(t);} }
+            async function getJSON(url,ms=12000,tries=2){ for(let a=0;a<tries;a++){ try{ const r=await fetchWithTimeout(url,{},ms); if(r?.ok){ return await r.json(); } }catch{} await sleep(jitter(220)); } return null; }
 
             const EXCHANGE=(process.env.EXCHANGE||"mexc").toLowerCase().replace("mexci","mexc");
             if(EXCHANGE!=="mexc"){ console.error("[gha] This build targets MEXC. Set EXCHANGE=mexc"); process.exit(1); }
-
             const MEXC_BASES=[process.env.MEXC_BASE,"https://api.mexc.com","https://www.mexc.com"].filter(Boolean);
 
-            // Defaults tightened for realistic top-10% retail on MEXC
-            let MIN_QV = Number(process.env.MIN_QV_USD||"0") || 30_000_000;
-            const TOP_N = Number(process.env.TOP_N||"10");              // core ideas target
-            const EXTRA_IDEAS_MAX = Number(process.env.EXTRA_IDEAS_MAX||"6"); // retained but superseded by strict/fallback caps
+            // Universe sizing
+            const MIN_QV_ENV = Number(process.env.MIN_QV_USD||"0") || 0;
+            const UNIV_TARGET_MIN=100, UNIV_TARGET_MAX=120;
+            const DYN_QV_MIN=10_000_000, DYN_QV_STEP=5_000_000;
+
+            // Core knobs
+            const TOP_N = Number(process.env.TOP_N||"3");
             const MAX_SPREAD_BPS = Number(process.env.MAX_SPREAD_BPS||"12");
             const EXP_LCB_MIN_BPS = Number(process.env.EXP_LCB_MIN_BPS||"5");
 
+            // TA + windows
             const EMA_FAST=21, EMA_SLOW=50, ADX_P=14, ATR_P=14;
             const K1M=240, K5M=120, K15M=96, K1H=96;
             const VWAP_5M_WIN=36;
 
+            // Costs & micro
             const COST_BPS = Number(process.env.FEES_BPS||"10");
-            const NOTIONAL = Number(process.env.NOTIONAL_USD||"200");
+            const NOTIONAL = Number(process.env.NOTIONAL_USD||"300");
             const DEPTH_LIMIT = Number(process.env.MEXC_DEPTH_LIMIT||"50");
             const OBI_TOPN = Number(process.env.OBI_TOPN||"12");
 
-            const COOLDOWN_MS = 3*60*60*1000;
-            const FLIP_GUARD_MS = 30*60*1000; // avoid rapid side flips
+            // Risk & timing
+            const COOLDOWN_MS=3*60*60*1000, FLIP_GUARD_MS=30*60*1000;
             const DD_24H_LIMIT_BPS=-150, DD_PEAK_LIMIT_BPS=-300;
-            const WILSON_Z=1.34;
+            const WILSON_Z=1.34, TARGET_PORT_RISK_BPS=52;
+            const TTL_MIN=540, TTL_MAX=1200;
 
-            const TP_ATR_MIN=0.40, TP_ATR_MAX=2.10;
-            const SL_ATR_MIN=0.28, SL_ATR_MAX=1.50;
-            const TP_TREND_BASE=1.12, SL_TREND_BASE=0.55;
-            const TP_MR_BASE=0.62,  SL_MR_BASE=0.54;
-            const TP_BO_BASE=1.30,  SL_BO_BASE=0.55;
+            // EV gate
+            const EV_MIN_BPS=3;
 
-            // Strict/Fallback framework
-            const SCORE_CUTOFF = 50;         // Step 2 cutoff
-            const REFINE_TOPK = 120;         // Step 3 deep analysis limit
-            const MAX_STRICT_PICKS = Math.min(3, TOP_N); // Step 4: up to 3 A+ ideas
-            const MAX_FALLBACK_PICKS = 3;    // Step 5: if strict empty, pick 1-3 B- ideas
-            const FALLBACK_SIZE_FACTOR = 0.55; // 40–60% smaller; we use 55%
-
+            // ToD gate
             const S_H = process.env.ACTIVE_UTC_START? Number(process.env.ACTIVE_UTC_START): null;
             const E_H = process.env.ACTIVE_UTC_END?   Number(process.env.ACTIVE_UTC_END):   null;
             const nowH = new Date().getUTCHours();
@@ -175,42 +365,25 @@ jobs:
             const STABLES=new Set(["USDT","USDC","USD","USDE","USDD","BUSD","FDUSD","TUSD","DAI","USDP","PAX","USTC"]);
 
             // ---------- Worker endpoints ----------
-            const PUSH_URL=process.env.WORKER_PUSH_URL||"";
+            const PUSH_URL=process.env.PUSH_URL || process.env.WORKER_PUSH_URL || "";
             const PUSH_TOKEN=process.env.PUSH_TOKEN||"";
             const HEALTH_URL=(()=>{ try{ const u=new URL(PUSH_URL); return `${u.origin}${u.pathname.replace(/\/signals\/push(\?.*)?$/,"/health")}`;}catch{return PUSH_URL.replace(/\/signals\/push(\?.*)?$/,"/health");}})();
 
-            // Guaranteed health GET (tail visibility even if 0 ideas)
+            // Health ping
             log("health GET", HEALTH_URL);
-            try{
-              const r=await fetchWithTimeout(HEALTH_URL,{ headers:{ "Authorization":`Bearer ${PUSH_TOKEN}`, "User-Agent":UA }},5000);
-              let t=""; try{ t=await r.text(); }catch{}
-              log("health status", r?.status||"ERR", (t||"").slice(0,160));
-            }catch(e){ log("health error", e?.message||e); }
+            try{ const r=await fetchWithTimeout(HEALTH_URL,{ headers:{ "Authorization":`Bearer ${PUSH_TOKEN}`, "User-Agent":UA }},5000); let t=""; try{ t=await r.text(); }catch{} log("health status", r?.status||"ERR", (t||"").slice(0,160)); }catch(e){ log("health error", e?.message||e); }
 
             // ---------- MEXC Adapter ----------
-            async function pickMexcBase(){
-              for(const b of MEXC_BASES){
-                try{
-                  const r=await fetchWithTimeout(`${b}/api/v3/time`,{},4000);
-                  if(r?.ok) return b;
-                }catch{}
-              }
-              throw new Error("No healthy MEXC base");
-            }
-            const BASE = await pickMexcBase();
+            async function pickMexcBase(){ for(const b of MEXC_BASES){ try{ const r=await fetchWithTimeout(`${b}/api/v3/time`,{},4000); if(r?.ok) return b; }catch{} } throw new Error("No healthy MEXC base"); }
+            const BASE=await pickMexcBase();
             const api=(path,params={})=>{ const u=new URL(path,BASE); for(const [k,v] of Object.entries(params)){ if(v!==undefined&&v!==null) u.searchParams.set(k,String(v)); } return u.toString(); };
-            async function fetchK(sym,interval,limit,startTime,endTime){
-              const u=api("/api/v3/klines",{symbol:sym,interval,limit,startTime,endTime});
-              const r=await getJSON(u,10000,2); return Array.isArray(r)?r:null;
-            }
+            async function fetchK(sym,interval,limit,startTime,endTime){ const u=api("/api/v3/klines",{symbol:sym,interval,limit,startTime,endTime}); const r=await getJSON(u,10000,2); return Array.isArray(r)?r:null; }
             async function fetchDepth(symbol){ return await getJSON(api("/api/v3/depth",{symbol,limit:DEPTH_LIMIT}), 10000, 2); }
-
-            // 24h fallback aggregator (robust universe even if all-24h fails)
             async function fetchAll24hr(){
               let all = await getJSON(api("/api/v3/ticker/24hr"), 10000, 2);
               if(Array.isArray(all) && all.length) return all;
               const exi=await getJSON(api("/api/v3/exchangeInfo"), 10000, 2);
-              const syms=(exi?.symbols||[]).filter(s=>s.status==="TRADING").map(s=>s.symbol).slice(0,180);
+              const syms=(exi?.symbols||[]).filter(s=>s.status==="TRADING").map(s=>s.symbol).slice(0,300);
               const out=[];
               for(let i=0;i<syms.length;i+=24){
                 const chunk=syms.slice(i,i+24);
@@ -224,13 +397,11 @@ jobs:
             // ---------- State (Gist) ----------
             async function loadState(){
               const token=process.env.GIST_TOKEN, id=process.env.GIST_ID;
-              const init={ v:"elite-ideas-mexc-2.1", cooldown:{}, cooldown_side:{}, pending:[], equity:[] };
+              const init={ v:"mexc-ultimate-4.0-stoch", cooldown:{}, cooldown_side:{}, pending:[], equity:[], gp_data:[] };
               if(!token||!id) return { state:init, persist:null };
               try{
-                const r=await fetchWithTimeout(`https://api.github.com/gists/${id}`,{ headers:{Authorization:`Bearer ${token}`,"Accept":"application/vnd.github+json","User-Agent":UA}});
-                if(!r.ok) return { state:init, persist:null };
-                const g=await r.json(); const c=g.files?.["state.json"]?.content;
-                return { state: c?JSON.parse(c):init, persist:{id,token} };
+                const r=await fetchWithTimeout(`https://api.github.com/gists/${id}`,{ headers:{Authorization:`Bearer ${token}`,"Accept":"application/vnd.github+json","User-Agent":UA}}); if(!r.ok) return { state:init, persist:null };
+                const g=await r.json(); const c=g.files?.["state.json"]?.content; return { state: c?JSON.parse(c):init, persist:{id,token} };
               }catch{ return { state:init, persist:null }; }
             }
             async function saveState(persist,state){
@@ -244,61 +415,53 @@ jobs:
               }catch{}
             }
 
-            // UPDATED: evalPending with fill-first for limit-at-SL entry
+            // Evaluate pending fills; add GP labels from realized outcomes
             async function evalPending(state){
+              const K1M=240;
               const now=Date.now(); const keep=[];
               for(const p of state.pending||[]){
                 if(now < p.ts_ms + p.hold_sec*1000 + 5000){ keep.push(p); continue; }
                 const k = await fetchK(p.symbolFull,"1m",K1M, p.ts_ms-60*1000, p.ts_ms+p.hold_sec*1000+60*1000);
                 if(!k){ keep.push(p); continue; }
-
                 const ts=k.map(x=>+x[0]), highs=k.map(x=>+x[2]), lows=k.map(x=>+x[3]), closes=k.map(x=>+x[4]);
-                const entry=p.entry_price, long=p.side==="long", tp=p.tp_bps/10000, sl=p.sl_bps/10000;
-
-                // Use fill-first logic if this was a limit-at-old-SL policy
+                const long=p.side==="long";
+                const entry = Number.isFinite(p.entry_limit) ? p.entry_limit : p.entry_price;
+                const tpB=(p.tp_bps||0)/10000, slB=(p.sl_bps||0)/10000;
                 const limitAtSL = p.entry_policy==="limit_at_old_sl";
 
+                let exitPx=closes.at(-1), filled=false;
                 if(limitAtSL){
                   const t0=p.ts_ms, tEnd=t0 + p.hold_sec*1000;
-                  // 1) Find fill (touch of entry)
                   let iFill=-1;
                   for(let i=0;i<k.length;i++){
                     const t=ts[i]; if(t < t0-1000) continue; if(t > tEnd) break;
                     if(long ? (lows[i] <= entry) : (highs[i] >= entry)){ iFill=i; break; }
                   }
-                  if(iFill===-1){
-                    // No fill within the hold window: treat as no-trade (drop without equity update)
-                    continue;
-                  }
-                  // 2) From fill forward, check TP/SL first-touch
-                  let exitPx=closes.at(-1);
-                  const tpPx = long ? entry*(1+tp) : entry*(1-tp);
-                  const slPx = long ? entry*(1-sl) : entry*(1+sl);
+                  if(iFill===-1){ keep.push(p); continue; }
+                  const tpPx = Number.isFinite(p.tp_abs) ? p.tp_abs : (long ? entry*(1+tpB) : entry*(1-tpB));
+                  const slPx = Number.isFinite(p.sl_abs) ? p.sl_abs : (long ? entry*(1-slB) : entry*(1+slB));
                   for(let i=iFill;i<k.length;i++){
                     const t=ts[i]; if(t > tEnd) break;
                     const hi=highs[i], lo=lows[i];
-                    if(long){
-                      if(hi>=tpPx){ exitPx=tpPx; break; }
-                      if(lo<=slPx){ exitPx=slPx; break; }
-                    }else{
-                      if(lo<=tpPx){ exitPx=tpPx; break; }
-                      if(hi>=slPx){ exitPx=slPx; break; }
-                    }
+                    if(long){ if(hi>=tpPx){ exitPx=tpPx; break; } if(lo<=slPx){ exitPx=slPx; break; } }
+                    else    { if(lo<=tpPx){ exitPx=tpPx; break; } if(hi>=slPx){ exitPx=slPx; break; } }
                   }
-                  const ret = long? (exitPx/entry - 1) : (entry/exitPx - 1);
-                  const pnl_bps = Math.round(ret*10000) - (p.cost_bps||0);
-                  state.equity.push({ ts_ms:p.ts_ms, pnl_bps });
+                  filled=true;
                 }else{
-                  // Original behavior (not used now, but kept for backward compatibility)
-                  let exitPx=closes.at(-1);
+                  filled=true;
                   for(let i=0;i<k.length;i++){
                     const hi=highs[i], lo=lows[i];
-                    if(long){ if(hi>=entry*(1+tp)){ exitPx=entry*(1+tp); break; } if(lo<=entry*(1-sl)){ exitPx=entry*(1-sl); break; } }
-                    else    { if(lo<=entry*(1-tp)){ exitPx=entry*(1-tp); break; } if(hi>=entry*(1+sl)){ exitPx=entry*(1+sl); break; } }
+                    if(long){ if(hi>=entry*(1+tpB)){ exitPx=entry*(1+tpB); break; } if(lo<=entry*(1-slB)){ exitPx=entry*(1-slB); break; } }
+                    else    { if(lo<=entry*(1-tpB)){ exitPx=entry*(1-tpB); break; } if(hi>=entry*(1+slB)){ exitPx=entry*(1+slB); break; } }
                   }
-                  const ret = long? (exitPx/entry - 1) : (entry/exitPx - 1);
-                  const pnl_bps = Math.round(ret*10000) - (p.cost_bps||0);
-                  state.equity.push({ ts_ms:p.ts_ms, pnl_bps });
+                }
+                if(!filled){ keep.push(p); continue; }
+                const ret = long? (exitPx/entry - 1) : (entry/exitPx - 1);
+                const pnl_bps = Math.round(ret*10000) - (p.cost_bps||0);
+                state.equity.push({ ts_ms:p.ts_ms, pnl_bps });
+                if(Array.isArray(p.gp_feat) && p.gp_feat.length){
+                  state.gp_data.push({ x:p.gp_feat, y: pnl_bps>0 ? 1:0 });
+                  if(state.gp_data.length>600) state.gp_data=state.gp_data.slice(-600);
                 }
               }
               state.pending = keep;
@@ -309,8 +472,8 @@ jobs:
               return { pnl24_bps:Math.round(pnl24), peak_dd_bps:Math.round(dd) };
             };
 
-            // ---------- Main (strict-first then fallback) ----------
-            let reason="ok", tier="none";
+            // ---------- Main ----------
+            let reason="ok", selectionTier="none";
             try{
               const ALL24 = await fetchAll24hr();
               const booksRaw=await getJSON(api("/api/v3/ticker/bookTicker"),10000,2) || [];
@@ -331,109 +494,116 @@ jobs:
                 all.push({ symbol:sym, base:sq.base, quote:sq.quote, qv });
               }
               all.sort((a,b)=>b.qv-a.qv);
-              const universe=all.filter(x=>x.qv>=MIN_QV).slice(0,1000);
+
+              // Dynamic min-QV to ~100–120
+              let dynMinQV=Math.max(MIN_QV_ENV||0, DYN_QV_MIN);
+              let filt=all.filter(x=>x.qv>=dynMinQV);
+              while(filt.length<UNIV_TARGET_MIN && dynMinQV>DYN_QV_MIN){
+                dynMinQV = Math.max(DYN_QV_MIN, dynMinQV - DYN_QV_STEP);
+                filt = all.filter(x=>x.qv>=dynMinQV);
+              }
+              const universe=filt.slice(0,UNIV_TARGET_MAX);
               if(!universe.length){ reason = (reason!=="ok"?reason:"no_universe"); }
 
               // Benchmarks
               const BTC="BTCUSDT", ETH="ETHUSDT", SOL="SOLUSDT";
+              const K15M=96, ADX_P=14, ATR_P=14, EMA_FAST=21, EMA_SLOW=50, VWAP_5M_WIN=36, K5M=120, K1H=96;
               const kBTC15=await fetchK(BTC,"15m",K15M);
               const kETH15=await fetchK(ETH,"15m",K15M);
               const kSOL15=await fetchK(SOL,"15m",K15M);
               const kBTC1H=await fetchK(BTC,"1h",K1H);
               const kETH1H=await fetchK(ETH,"1h",K1H);
 
-              const regime=(()=>{
-                const f=(k)=>{ if(!k||k.length<ADX_P+5) return null; const h=k.map(x=>+x[2]), l=k.map(x=>+x[3]), c=k.map(x=>+x[4]); const { adx }=computeADX_ATR(h,l,c,ADX_P)||{}; const roc=((c.at(-1)/c.at(-5)) - 1); return { adx:adx||0, roc }; };
-                const b=f(kBTC15)||{adx:0,roc:0}, e=f(kETH15)||{adx:0,roc:0};
-                const adxAvg=((b.adx||0)+(e.adx||0))/2, dir = Math.sign((b.roc||0)+(e.roc||0));
-                const isTrend=adxAvg>=22 && Math.abs(b.roc)>0.001 && Math.abs(e.roc)>0.001;
-                const uncertain=adxAvg>=18 && adxAvg<=22;
-                return { regime: isTrend?"trend":"meanrevert", adxAvg, dir, uncertain };
-              })();
-              log("regime", regime.regime, "adxAvg", regime.adxAvg?.toFixed?.(1)||"");
+              function regimeFeatures(k15){
+                if(!k15||k15.length<ADX_P+5) return [];
+                const h=k15.map(x=>+x[2]), l=k15.map(x=>+x[3]), c=k15.map(x=>+x[4]);
+                const { adx }=computeADX_ATR(h,l,c,ADX_P)||{adx:0};
+                const roc=((c.at(-1)/c.at(-5)) - 1);
+                const winS=20; const retW=[]; for(let i=c.length-winS;i<c.length;i++){ retW.push((c[i]/c[i-1])-1); }
+                const bbWidth = std(retW)*Math.sqrt(winS);
+                const atr=(computeADX_ATR(h,l,c,ADX_P)||{atr:1}).atr||1;
+                const kelWidth = (atr/c.at(-1));
+                const squeeze = kelWidth>0 ? (bbWidth/kelWidth) : 1;
+                return [roc, clamp((adx-10)/30,0,1), clamp((1.15 - squeeze)/0.45, 0, 1)];
+              }
+              const seqFeat=[];
+              function rollSeq(k){ if(!k) return; for(let i=5;i<Math.min(k.length,80);i++){ const seg=k.slice(i-5,i+1); const f=regimeFeatures(seg); if(f.length) seqFeat.push(f); } }
+              rollSeq(kBTC15); rollSeq(kETH15);
+              const hmm = seqFeat.length>=20 ? (function hmmTrainGaussian(obs,K=3,iters=6){
+                // Minimal EM (same as earlier helpers)
+                const T=obs.length, d=obs[0]?.length||0; if(T<d+5) return null;
+                let pi=Array(K).fill(1/K), A=Array.from({length:K},()=>Array(K).fill(1/K));
+                const mu=Array.from({length:K},(_,k)=> obs[Math.floor((k+1)*T/(K+1))].slice());
+                const Sig=Array.from({length:K},()=>{ const s=Array.from({length:d},(_,i)=>Array.from({length:d},(_,j)=> (i===j?0.1:0))); return s; });
+                const eps=1e-8;
+                for(let it=0; it<iters; it++){
+                  const B=Array.from({length:T},()=>Array(K).fill(0));
+                  for(let t=0;t<T;t++) for(let k=0;k<K;k++) B[t][k]=mvnPdf(obs[t],mu[k],Sig[k])+1e-18;
+                  const alpha=Array.from({length:T},()=>Array(K).fill(0)), c=Array(T).fill(0);
+                  for(let k=0;k<K;k++) alpha[0][k]=pi[k]*B[0][k]; c[0]=1/(sum(alpha[0])||1e-12); for(let k=0;k<K;k++) alpha[0][k]*=c[0];
+                  for(let t=1;t<T;t++){ for(let k=0;k<K;k++){ let s=0; for(let i=0;i<K;i++) s+=alpha[t-1][i]*A[i][k]; alpha[t][k]=s*B[t][k]; } c[t]=1/(sum(alpha[t])||1e-12); for(let k=0;k<K;k++) alpha[t][k]*=c[t]; }
+                  const beta=Array.from({length:T},()=>Array(K).fill(0)); for(let k=0;k<K;k++) beta[T-1][k]=c[T-1];
+                  for(let t=T-2;t>=0;t--){ for(let k=0;k<K;k++){ let s=0; for(let j=0;j<K;j++) s+=A[k][j]*B[t+1][j]*beta[t+1][j]; beta[t][k]=s*c[t]; } }
+                  const gamma=Array.from({length:T},()=>Array(K).fill(0));
+                  for(let t=0;t<T;t++){ const den=sum(alpha[t].map((a,kk)=>a*beta[t][kk]))||1e-12; for(let k=0;k<K;k++) gamma[t][k]=(alpha[t][k]*beta[t][k])/(den||1e-12); }
+                  const xi=Array.from({length:T-1},()=>Array.from({length:K},()=>Array(K).fill(0)));
+                  for(let t=0;t<T-1;t++){ let den=0; for(let i=0;i<K;i++) for(let j=0;j<K;j++) den+=alpha[t][i]*A[i][j]*B[t+1][j]*beta[t+1][j]; den=den||1e-12;
+                    for(let i=0;i<K;i++) for(let j=0;j<K;j++) xi[t][i][j]=(alpha[t][i]*A[i][j]*B[t+1][j]*beta[t+1][j])/den; }
+                  for(let k=0;k<K;k++){
+                    const gk=sum(gamma.map(g=>g[k]))||eps; pi[k]=gamma[0][k];
+                    for(let j=0;j<K;j++){ let s=0; for(let t=0;t<T-1;t++) s+=xi[t][k][j]; A[k][j]=s/(gk - gamma[T-1][k] + eps); A[k][j]=clamp(A[k][j],1e-6,1); }
+                    const mu_k=Array(mu[0].length).fill(0); for(let t=0;t<T;t++) for(let i=0;i<mu_k.length;i++) mu_k[i]+=gamma[t][k]*obs[t][i];
+                    for(let i=0;i<mu_k.length;i++) mu_k[i]/=(gk||1e-12); mu[k]=mu_k;
+                    const S=Array.from({length:mu_k.length},()=>Array(mu_k.length).fill(0));
+                    for(let t=0;t<T;t++){ const diff=obs[t].map((v,i)=>v-mu_k[i]); for(let i=0;i<mu_k.length;i++) for(let j=0;j<mu_k.length;j++) S[i][j]+=gamma[t][k]*diff[i]*diff[j]; }
+                    for(let i=0;i<mu_k.length;i++) for(let j=0;j<mu_k.length;j++) S[i][j]/=(gk||1e-12);
+                    for(let i=0;i<mu_k.length;i++) S[i][i]=Math.max(S[i][i], 1e-4); Sig[k]=S;
+                  }
+                  for(let i=0;i<K;i++){ const s=sum(A[i])||1e-12; for(let j=0;j<K;j++) A[i][j]/=s; }
+                }
+                return { pi, A, mu, Sig };
+              })(seqFeat,3,6) : null;
+              const post = (function hmmPosterior(obs, model){
+                if(!model){ return [0.4,0.4,0.2]; }
+                const {pi,A,mu,Sig}=model; const T=obs.length, K=pi.length; if(T===0) return Array(K).fill(1/K);
+                const B=obs.map(o=> mu.map((m,ki)=>mvnPdf(o,m,Sig[ki])+1e-18));
+                const alpha=Array.from({length:T},()=>Array(K).fill(0)), c=Array(T).fill(0);
+                for(let k=0;k<K;k++) alpha[0][k]=pi[k]*B[0][k]; c[0]=1/(sum(alpha[0])||1e-12); for(let k=0;k<K;k++) alpha[0][k]*=c[0];
+                for(let t=1;t<T;t++){ for(let k=0;k<K;k++){ let s=0; for(let i=0;i<K;i++) s+=alpha[t-1][i]*A[i][k]; alpha[t][k]=s*B[t][k]; } c[t]=1/(sum(alpha[t])||1e-12); for(let k=0;k<K;k++) alpha[t][k]*=c[t]; }
+                return alpha[T-1];
+              })(seqFeat.slice(-15),hmm);
+              const weights = { wTrend:post[0]||0.4, wMR:post[1]||0.4, wBO:post[2]||0.2 };
+
+              log("regime posterior", weights);
 
               // State & DD gate
               const { state, persist } = await loadState();
-              try{ await evalPending(state); }catch{}
+              try{ await evalPending(state); }catch(e){ log("evalPending warn", e?.message||e); }
               const { pnl24_bps, peak_dd_bps } = equityStats(state.equity);
               const throttle = (pnl24_bps<=DD_24H_LIMIT_BPS) || (peak_dd_bps<=DD_PEAK_LIMIT_BPS);
 
-              // Liquidity pct for later scoring
+              // GP model from realized outcomes
+              let gpModel=null;
+              try{
+                const X = state.gp_data?.map(d=>d.x)||[];
+                const Y = state.gp_data?.map(d=>d.y)||[];
+                if(X.length>=20) gpModel = buildGP(X.slice(-400), Y.slice(-400), 0.12);
+              }catch(e){ log("gp build warn", e?.message||e); }
+
+              // Liquidity pct rank
               const liqPct=new Map(); for(let i=0;i<universe.length;i++){ liqPct.set(universe[i].symbol,(universe.length===1)?1:1 - i/(universe.length-1)); }
 
-              // Microstructure helpers
-              function obiWeighted(depth,topN){
-                const w=(i)=>Math.exp(-i*0.18);
-                let bidNot=0, askNot=0;
-                for(let i=0;i<Math.min(topN, depth.bids.length); i++){ const p=+depth.bids[i][0], q=+depth.bids[i][1]; if(p>0&&q>0) bidNot += p*q*w(i); }
-                for(let i=0;i<Math.min(topN, depth.asks.length); i++){ const p=+depth.asks[i][0], q=+depth.asks[i][1]; if(p>0&&q>0) askNot += p*q*w(i); }
-                const obi = (bidNot+askNot>0) ? (bidNot-askNot)/(bidNot+askNot) : 0;
-                return { obi };
-              }
-              function vwapFill(levels,targetUSD){
-                let remain=targetUSD,val=0,qty=0;
-                for(const [ps,qs] of levels){ const p=+ps,q=+qs; if(!(p>0&&q>0)) continue; const can=p*q, take=Math.min(remain,can), tq=take/p;
-                  val+=p*tq; qty+=tq; remain-=take; if(remain<=1e-6) break; }
-                return { px: qty>0? val/qty : null, filledUSD: (targetUSD-remain) };
-              }
+              // Helpers
+              const toRet5=(k)=>{ if(!k) return []; const c=k.map(x=>+x[4]); const r=[]; for(let i=1;i<c.length;i++) r.push(Math.log(c[i]/c[i-1])); return r.slice(-60); };
+              const fBTC=toRet5(kBTC15), fETH=toRet5(kETH15), fSOL=toRet5(kSOL15);
 
-              const computeAutoRRR=({p,adx,atr_bps,cost_bps,spread_bps,trend_align,style,lvl_gap_bps=0,obi_adj=0})=>{
-                const adxF=clamp((adx-16)/14,0,1);
-                let baseR = style==="trend" ? (1.45+0.85*adxF) : style==="mr" ? (1.05+0.22*(1-adxF)) : (1.65+0.95*adxF);
-                baseR *= (1 + 0.42*clamp(p-0.55,-0.2,0.35));
-                const rLo = style==="mr" ? 0.96 : 1.12;
-                const rHi = style==="breakout" ? 2.8 : 2.55;
-                let prefR = clamp(baseR, rLo, rHi);
-                let slATR = style==="trend" ? SL_TREND_BASE : style==="mr" ? SL_MR_BASE : SL_BO_BASE;
-                slATR *= (1 + 0.24*(1-adxF));
-                if(spread_bps>12) slATR*=1.08;
-                // widen a touch if adverse OB pressure (obi_adj in 0..1)
-                slATR *= (1 + 0.08*clamp(obi_adj,0,1));
-                if(style==="trend" && trend_align && adxF>0.65 && p>0.64) slATR*=0.88;
-                slATR=clamp(slATR, SL_ATR_MIN, SL_ATR_MAX);
-
-                const tpMax=TP_ATR_MAX*atr_bps, tpMin=TP_ATR_MIN*atr_bps;
-                const slMin=SL_ATR_MIN*atr_bps, slMax=SL_ATR_MAX*atr_bps;
-                const levelMin = lvl_gap_bps>0 ? 0.60*lvl_gap_bps : 0; // respect recent swing levels
-                const hardMin = Math.max(slMin, levelMin);
-
-                let sl=clamp(Math.round(slATR*atr_bps), Math.round(hardMin), Math.round(slMax));
-                for(let i=0;i<5;i++){
-                  const rMin=((1-p)/p) + (cost_bps)/(Math.max(1e-6,p*sl));
-                  let r=Math.max(prefR,rMin);
-                  const rMax=tpMax/sl;
-                  if(r<=rMax){
-                    let tp=Math.round(clamp(r*sl, tpMin, tpMax));
-                    if(tp<cost_bps+2) tp=cost_bps+2;
-                    const exp=Math.round(p*tp - (1-p)*sl - cost_bps);
-                    if(exp<=0 && i<4){
-                      const denom=(p*r - (1-p));
-                      if(denom>0){
-                        const needSL=Math.ceil((cost_bps)/denom);
-                        const newSL=clamp(Math.max(sl,needSL), Math.round(hardMin), Math.round(slMax));
-                        if(newSL>sl){ sl=newSL; continue; }
-                      }
-                    }
-                    return { tp_bps:tp, sl_bps:sl, r_used:+(tp/sl).toFixed(2), tp_atr:+(tp/atr_bps).toFixed(2), sl_atr:+(sl/atr_bps).toFixed(2) };
-                  }
-                  const nextSL=Math.min(Math.round(sl*1.15), Math.round(slMax)); if(nextSL===sl) break; else sl=nextSL;
-                }
-                const tp=Math.round(tpMax), exp=Math.round(p*tp - (1-p)*sl - cost_bps);
-                if(exp<=0) return null;
-                return { tp_bps:tp, sl_bps:sl, r_used:+(tp/sl).toFixed(2), tp_atr:+(tp/atr_bps).toFixed(2), sl_atr:+(sl/atr_bps).toFixed(2) };
-              };
-
-              const to5m=(k)=>{ if(!k) return []; const c=k.map(x=>+x[4]); const r=[]; for(let i=1;i<c.length;i++) r.push(Math.log(c[i]/c[i-1])); return r.slice(-60); };
-              const fBTC=to5m(kBTC15), fETH=to5m(kETH15), fSOL=to5m(kSOL15);
-
-              // Prefilter (Step 1-2: cooldown + lightweight scoring)
+              // Prefilter
               const picksRaw=[];
-              const B=8;
+              const B=10;
               for(let i=0;i<(universe||[]).length;i+=B){
                 const batch=await Promise.all(universe.slice(i,i+B).map(async c=>{
                   try{
-                    // cooldown
-                    const now=Date.now(); const lastTs=(await (async()=>state.cooldown?.[c.base]))||0;
+                    const now=Date.now(); const lastTs=state.cooldown?.[c.base]||0;
                     if(lastTs && (now-lastTs) < COOLDOWN_MS) return null;
 
                     const book=bookMap.get(c.symbol); if(!book?.bid||!book?.ask) return null;
@@ -441,12 +611,14 @@ jobs:
                     const spreadBps=Math.round(((book.ask-book.bid)/mid)*10000);
                     if(spreadBps>MAX_SPREAD_BPS) return null;
 
-                    // K
-                    const k5 = await fetchK(c.symbol,"5m",K5M); if(!k5||k5.length<Math.max(EMA_SLOW+5,ATR_P+5)) return null;
-                    const k15= await fetchK(c.symbol,"15m",K15M);
-                    const k1h= await fetchK(c.symbol,"1h",K1H);
+                    const k5=await fetchK(c.symbol,"5m",K5M); if(!k5||k5.length<Math.max(EMA_SLOW+5,ATR_P+5)) return null;
+                    const k15=await fetchK(c.symbol,"15m",K15M);
+                    const k1h=await fetchK(c.symbol,"1h",K1H);
 
-                    const h5=k5.map(x=>+x[2]), l5=k5.map(x=>+x[3]), c5=k5.map(x=>+x[4]), v5=k5.map(x=>+x[5]);
+                    const c5_raw=k5.map(x=>+x[4]);
+                    const c5=kalman1D(c5_raw,{q=1e-4,r=5e-4,x0:c5_raw[0],p0:1e-2});
+                    const h5=k5.map(x=>+x[2]), l5=k5.map(x=>+x[3]), v5=k5.map(x=>+x[5]);
+
                     const em21=ema(c5,EMA_FAST), em50=ema(c5,EMA_SLOW);
                     const { adx:adx5, atr:atr5 } = computeADX_ATR(h5,l5,c5,ADX_P)||{};
                     if(!(adx5&&atr5)) return null;
@@ -459,33 +631,32 @@ jobs:
                     const vwap5=vwapAnchored(h5,l5,c5,v5,VWAP_5M_WIN);
                     const last=c5.at(-1), prev=c5.at(-2), prev3=c5.at(-4);
                     const roc5=(last/prev)-1, roc15=(last/prev3)-1;
-                    const adxF=clamp((adx5-16)/14,0,1);
+
                     const upF=last>=em21, upS=last>=em50;
                     const up15=(em15f&&em15s)? (last>=em15f && last>=em15s) : true;
                     const up1h=(em1hf&&em1hs)? (last>=em1hf && last>=em1hs) : true;
                     const z_vwap=(last-vwap5)/(atr5||1);
                     const rsi14=rsi(c5,14);
 
-                    // Donchian + squeeze
-                    let pHigh=null,pLow=null;
+                    let pHigh15=null,pLow15=null;
                     if(k15 && k15.length>40){
                       const highs=k15.map(x=>+x[2]), lows=k15.map(x=>+x[3]);
-                      const win=40; pHigh=Math.max(...highs.slice(-win)); pLow=Math.min(...lows.slice(-win));
+                      const win=40; pHigh15=Math.max(...highs.slice(-win)); pLow15=Math.min(...lows.slice(-win));
                     }
-                    const boUp = pHigh ? (last>pHigh) : false;
-                    const boDn = pLow  ? (last<pLow ) : false;
+                    const boUp = pHigh15 ? (last>pHigh15) : false;
+                    const boDn = pLow15  ? (last<pLow15 ) : false;
 
-                    // Squeeze: BB width vs Keltner-ish width (ATR)
                     const winS=20; const retW=[]; for(let i=c5.length-winS;i<c5.length;i++){ retW.push((c5[i]/c5[i-1])-1); }
-                    const bbWidth = std(retW)*Math.sqrt(winS); // approx
+                    const bbWidth = std(retW)*Math.sqrt(winS);
                     const kelWidth = (atr5/last);
                     const squeezeRatio = kelWidth>0 ? (bbWidth/kelWidth) : 1;
-                    const squeezeScore = clamp((1.15 - squeezeRatio)/0.45, 0, 1); // >0 when BB < ~1.15x Keltner
+                    const squeezeScore = clamp((1.15 - squeezeRatio)/0.45, 0, 1);
 
-                    // Experts
+                    const adxF=clamp((adx5-16)/14,0,1);
+                    const s1=tanh(roc5/0.0030), s2=tanh(roc15/0.0065);
+
                     const sideTrend= (0.6*roc5+0.4*roc15)>=0 ? "long":"short";
                     const trendAlign = (sideTrend==="long" && upF&&upS&&up15&&up1h) || (sideTrend==="short" && !upF&&!upS&&(!up15||!up1h));
-                    const s1=tanh(roc5/0.0030), s2=tanh(roc15/0.0065);
                     let pTrend = clamp(0.5 + 0.27*(0.6*s1+0.4*s2)*(trendAlign?1.0:0.7)*adxF, 0.32, 0.93);
 
                     const sideMR = z_vwap>0 ? "short" : "long";
@@ -498,71 +669,42 @@ jobs:
                     boBase *= (1 + 0.4*squeezeScore);
                     let pBO = clamp(0.5 + 0.29*(boBase*(sideBO==="long"?1:-1)), 0.35, 0.96);
 
-                    // Market bias + side preference
-                    const bias=(regime.dir>=0?+1:-1);
-                    const adj=(regime.adxAvg>=22 ? 0.03 : 0.015);
-                    const biasT = (sideTrend==="long"?+1:-1)*bias;
-                    const biasM = (sideMR==="long"?+1:-1)*bias;
-                    const biasB = (sideBO==="long"?+1:-1)*bias;
-
-                    pTrend=clamp(pTrend + adj*biasT, 0.30, 0.95);
-                    pMR   =clamp(pMR   + 0.5*adj*biasM, 0.30, 0.95);
-                    pBO   =clamp(pBO   + 0.7*adj*biasB, 0.30, 0.96);
-
-                    const wT = regime.regime==="trend" ? 0.53 : 0.30;
-                    const wM = regime.regime==="trend" ? 0.19 : 0.42;
-                    const wB = 1 - (wT+wM);
+                    const wT=weights.wTrend, wM=weights.wMR, wB=weights.wBO;
 
                     const pLong0  = clamp(wT*(sideTrend==="long"?pTrend:1-pTrend) + wM*(sideMR==="long"?pMR:1-pMR) + wB*(sideBO==="long"?pBO:1-pBO), 0.30, 0.97);
                     const pShort0 = clamp(wT*(sideTrend==="short"?pTrend:1-pTrend) + wM*(sideMR==="short"?pMR:1-pMR) + wB*(sideBO==="short"?pBO:1-pBO), 0.30, 0.97);
 
-                    // Level-aware gaps for SL anchoring
-                    const lvl_gap_long_bps = (pLow && last>0) ? Math.max(0, ((last - pLow)/last)*10000) : 0;
-                    const lvl_gap_short_bps= (pHigh&& last>0) ? Math.max(0, ((pHigh - last)/last)*10000) : 0;
+                    const lvl_gap_long_bps = (pLow15!=null && last>0) ? Math.max(0, ((last - pLow15)/last)*10000) : 0;
+                    const lvl_gap_short_bps= (pHigh15!=null && last>0)? Math.max(0, ((pHigh15 - last)/last)*10000) : 0;
 
-                    // Lightweight Signal Score 0..100
+                    const gp_feat=[ clamp((adx5-16)/14,0,1), clamp(z_vwap,-3,3), (rsi14||50)/100, 0 ];
+
                     const signalScore = clamp(Math.round(
-                      50
-                      + 30*((Math.max(pLong0,pShort0)-0.5)*2)
+                      50 + 30*((Math.max(pLong0,pShort0)-0.5)*2)
                       + 10*clamp((adx5-18)/14,0,1)
                       + 5*(trendAlign?1:0)
                       + 5*clamp(squeezeScore*1.2,0,1)
                       - Math.min(10, Math.max(0,(spreadBps-6)/2))
                     ), 0, 100);
 
-                    // Costs and proto RRR (no depth/obi here)
-                    const costLong0=COST_BPS + Math.round(spreadBps/2);
-                    const costShort0=COST_BPS + Math.round(spreadBps/2);
-                    const styleLong = trendAlign ? "trend" : (squeezeScore>0.25||boUp) ? "breakout" : "mr";
-                    const styleShort= !trendAlign ? "trend" : (squeezeScore>0.25||boDn) ? "breakout" : "mr";
-
-                    const rrrLong0 = computeAutoRRR({ p:pLong0,  adx:adx5, atr_bps:atr_bps, cost_bps:costLong0,  spread_bps:spreadBps, trend_align:(upF&&upS&&up15&&up1h), style:styleLong });
-                    const rrrShort0= computeAutoRRR({ p:pShort0, adx:adx5, atr_bps:atr_bps, cost_bps:costShort0, spread_bps:spreadBps, trend_align:(!upF&&!upS&&(!up15||!up1h)), style:styleShort });
-                    const expLong0 = rrrLong0 ? Math.round(pLong0*rrrLong0.tp_bps - (1-pLong0)*rrrLong0.sl_bps - costLong0) : -1e9;
-                    const expShort0= rrrShort0? Math.round(pShort0*rrrShort0.tp_bps - (1-pShort0)*rrrShort0.sl_bps - costShort0): -1e9;
-
-                    const best0=Math.max(expLong0,expShort0);
-                    if(best0<=0) return null;
-
                     return {
-                      c, k5, c5, adx5, atr_bps, spreadBps, pLong0, pShort0,
-                      rrrLong0, rrrShort0, expLong0, expShort0,
-                      styleLong, styleShort, upF, upS, up15, up1h, z_vwap, boUp, boDn, trendAlign, squeezeScore,
-                      lvl_gap_long_bps, lvl_gap_short_bps, signalScore
+                      c, k5, c5, adx5, atr_bps:Math.round((atr5/last)*10000), spreadBps, pLong0, pShort0,
+                      styleLong: trendAlign ? "trend" : (squeezeScore>0.25||boUp) ? "breakout" : "mr",
+                      styleShort: !trendAlign ? "trend" : (squeezeScore>0.25||boDn) ? "breakout" : "mr",
+                      upF, upS, up15, up1h, z_vwap, boUp, boDn, trendAlign, squeezeScore,
+                      lvl_gap_long_bps, lvl_gap_short_bps, signalScore, gp_feat_base:gp_feat
                     };
                   }catch{ return null; }
                 }));
-                for(const x of batch){
-                  if(x && x.signalScore > SCORE_CUTOFF) picksRaw.push(x);
-                }
+                for(const x of batch) if(x && x.signalScore > 50) picksRaw.push(x);
               }
               if(!picksRaw.length){ reason = (reason!=="ok"?reason:"no_candidates"); }
 
-              // Refine with depth + beta (Step 3: take top ~120 by signal score)
+              // Refine
               picksRaw.sort((a,b)=> b.signalScore - a.signalScore);
-              const REFINE_M = Math.min(REFINE_TOPK, picksRaw.length);
+              const REFINE_M = Math.min(UNIV_TARGET_MAX, picksRaw.length);
               const refined=[];
-              function retLog(arr){ const r=[]; for(let i=1;i<arr.length;i++) r.push(Math.log(arr[i]/arr[i-1])); return r; }
+              function retLog(arr){ const r=[]; for(let i=1;i<arr.length;i++) r.push(Math.log(arr[i]/arr[i-1])); return r.slice(-36); }
 
               for(let idx=0; idx<REFINE_M; idx++){
                 const p=picksRaw[idx];
@@ -573,8 +715,18 @@ jobs:
                 const depth=await fetchDepth(c.symbol);
                 let obi=0, slipL=p.spreadBps/2, slipS=p.spreadBps/2, fillL=0, fillS=0;
                 if(depth?.asks?.length && depth?.bids?.length){
-                  const ob=obiWeighted(depth,OBI_TOPN);
-                  obi=ob.obi;
+                  const w=(i)=>Math.exp(-i*0.18);
+                  let bidNot=0, askNot=0;
+                  for(let i=0;i<Math.min(OBI_TOPN, depth.bids.length); i++){ const p0=+depth.bids[i][0], q=+depth.bids[i][1]; if(p0>0&&q>0) bidNot += p0*q*w(i); }
+                  for(let i=0;i<Math.min(OBI_TOPN, depth.asks.length); i++){ const p0=+depth.asks[i][0], q=+depth.asks[i][1]; if(p0>0&&q>0) askNot += p0*q*w(i); }
+                  obi = (bidNot+askNot>0) ? (bidNot-askNot)/(bidNot+askNot) : 0;
+
+                  const vwapFill=(levels,targetUSD)=>{
+                    let remain=targetUSD,val=0,qty=0;
+                    for(const [ps,qs] of levels){ const p=+ps,q=+qs; if(!(p>0&&q>0)) continue; const can=p*q, take=Math.min(remain,can), tq=take/p;
+                      val+=p*tq; qty+=tq; remain-=take; if(remain<=1e-6) break; }
+                    return { px: qty>0? val/qty : null, filledUSD: (targetUSD-remain) };
+                  };
                   const buy=vwapFill(depth.asks, Math.max(50,NOTIONAL));
                   const sell=vwapFill(depth.bids, Math.max(50,NOTIONAL));
                   slipL = buy.px? Math.max(0, Math.round((buy.px - mid)/mid*10000)) : slipL;
@@ -582,16 +734,13 @@ jobs:
                   fillL = Math.min(1, buy.filledUSD/Math.max(1,NOTIONAL));
                   fillS = Math.min(1, sell.filledUSD/Math.max(1,NOTIONAL));
                 }
-                const obiAdjLong = Math.max(0, -obi); // widen SL a bit if opposite side heavier
-                const obiAdjShort= Math.max(0, +obi);
 
+                const rsiVal = rsi(p.c5,14);
+                const gp_feat_long  = [ clamp((p.adx5-16)/14,0,1), clamp(p.z_vwap,-3,3), (rsiVal||50)/100, Math.max(0,-obi) ];
+                const gp_feat_short = [ clamp((p.adx5-16)/14,0,1), clamp(-p.z_vwap,-3,3), (100-(rsiVal||50))/100, Math.max(0,+obi) ];
+
+                // Side priors + flip guard
                 let pLong=p.pLong0, pShort=p.pShort0;
-                // orderbook probability nudges
-                const obiAdj = clamp(obi*0.09, -0.07, +0.07);
-                pLong = clamp(pLong + (obi>0?+obiAdj:-obiAdj)*0.9, 0.30, 0.97);
-                pShort= clamp(pShort+ (obi<0?+(-obiAdj):+(obiAdj))*(-0.9), 0.30, 0.97);
-
-                // Flip guard: penalize if flipping sides too fast
                 const lastSide=state.cooldown_side?.[c.base];
                 if(lastSide && lastSide.side && lastSide.ts_ms && Date.now()-lastSide.ts_ms<FLIP_GUARD_MS){
                   if(lastSide.side==="long") pShort = Math.max(0.30, pShort-0.03);
@@ -601,186 +750,197 @@ jobs:
                 const costLong=COST_BPS + Math.max(Math.round(p.spreadBps/2), slipL);
                 const costShort=COST_BPS + Math.max(Math.round(p.spreadBps/2), slipS);
 
-                const rrrLong = computeAutoRRR({ p:pLong,  adx:p.adx5, atr_bps:p.atr_bps, cost_bps:costLong,  spread_bps:p.spreadBps, trend_align:(p.upF&&p.upS&&p.up15&&p.up1h), style:p.styleLong,  lvl_gap_bps:p.lvl_gap_long_bps, obi_adj:obiAdjLong });
-                const rrrShort= computeAutoRRR({ p:pShort, adx:p.adx5, atr_bps:p.atr_bps, cost_bps:costShort, spread_bps:p.spreadBps, trend_align:(!p.upF&&!p.upS&&(!p.up15||!p.up1h)), style:p.styleShort, lvl_gap_bps:p.lvl_gap_short_bps, obi_adj:obiAdjShort });
-                const expLong = rrrLong ? Math.round(pLong*rrrLong.tp_bps - (1-pLong)*rrrLong.sl_bps - costLong) : -1e9;
-                const expShort= rrrShort? Math.round(pShort*rrrShort.tp_bps - (1-pShort)*rrrShort.sl_bps - costShort): -1e9;
+                const y=[]; for(let i=1;i<p.c5.length;i++) y.push(Math.log(p.c5[i]/p.c5[i-1]));
+                const mu5=mean(y)||0, sig5=std(y)||1e-4;
 
-                // Multi-factor beta (BTC/ETH/SOL)
-                const y = retLog(p.c5.slice(-61));
-                const X1=fBTC.slice(-y.length), X2=fETH.slice(-y.length), X3=fSOL.slice(-y.length);
-                const {R2} = olsR2(y,[X1,X2,X3]);
+                const entryMid = mid;
+                const adxF=clamp((p.adx5-16)/14,0,1);
+                const hold_sec = clamp(Math.round((weights.wTrend>weights.wMR ? 720 : 560) + 240*adxF + 120*(p.squeezeScore||0)), TTL_MIN, TTL_MAX);
+
+                // Dynamic RRR via MC
+                const rrrDynLong  = optimizeRRR_MC({ atr_bps:p.atr_bps, cost_bps:costLong  , spread_bps:p.spreadBps, entry:entryMid, side:"long" , mu:mu5, sigma:sig5, ttl_sec:hold_sec });
+                const rrrDynShort = optimizeRRR_MC({ atr_bps:p.atr_bps, cost_bps:costShort , spread_bps:p.spreadBps, entry:entryMid, side:"short", mu:mu5, sigma:sig5, ttl_sec:hold_sec });
+
+                // GP adjust
+                const gpL = gpModel? gpPredict(gpModel, gp_feat_long)  : {mu:pLong, sigma:0.20};
+                const gpS = gpModel? gpPredict(gpModel, gp_feat_short) : {mu:pShort, sigma:0.20};
+                const dataN=(state.gp_data?.length||0);
+                const wGP = clamp(dataN/200, 0.15, 0.65);
+                const pLong_adj  = clamp((1-wGP)*pLong  + wGP*gpL.mu,  0.30, 0.97);
+                const pShort_adj = clamp((1-wGP)*pShort + wGP*gpS.mu,  0.30, 0.97);
+                const pLong_lcb  = clamp(pLong_adj  - WILSON_Z*(gpL.sigma||0.20), 0.10, 0.98);
+                const pShort_lcb = clamp(pShort_adj - WILSON_Z*(gpS.sigma||0.20), 0.10, 0.98);
+
+                // MC EV
+                const steps=Math.max(1,Math.round(hold_sec/300));
+                const evL = rrrDynLong  ? gbmSimEV({ entry:entryMid, tp_bps:rrrDynLong.tp_bps, sl_bps:rrrDynLong.sl_bps, side:"long",  mu:mu5, sigma:sig5, dt:1, steps, N:192, cost_bps:costLong  }) : { ev_lcb_bps:-1e9, p_lcb:0.0, ev_bps:-1e9 };
+                const evS = rrrDynShort ? gbmSimEV({ entry:entryMid, tp_bps:rrrDynShort.tp_bps, sl_bps:rrrDynShort.sl_bps, side:"short", mu:mu5, sigma:sig5, dt:1, steps, N:192, cost_bps:costShort }) : { ev_lcb_bps:-1e9, p_lcb:0.0, ev_bps:-1e9 };
+
+                const evLongLCB  = rrrDynLong  ? Math.round(pLong_lcb  * rrrDynLong.tp_bps  - (1-pLong_lcb )*rrrDynLong.sl_bps - costLong)  : -1e9;
+                const evShortLCB = rrrDynShort ? Math.round(pShort_lcb * rrrDynShort.tp_bps - (1-pShort_lcb)*rrrDynShort.sl_bps - costShort) : -1e9;
+                const chooseLong = (evLongLCB>=evShortLCB) && rrrDynLong;
+
+                const chosen = chooseLong ? {side:"long",  tp_bps:rrrDynLong.tp_bps,  sl_bps:rrrDynLong.sl_bps,  p_lcb:pLong_lcb,  cost_bps:costLong , exp_lcb_bps:evLongLCB , exp_bps:evL.ev_bps }
+                                          : {side:"short", tp_bps:rrrDynShort.tp_bps, sl_bps:rrrDynShort.sl_bps, p_lcb:pShort_lcb, cost_bps:costShort, exp_lcb_bps:evShortLCB, exp_bps:evS.ev_bps };
+
+                // Factor regression
+                const yR = y.slice(-61), X1=fBTC.slice(-yR.length), X2=fETH.slice(-yR.length), X3=fSOL.slice(-yR.length);
+                const {R2} = (function ols(y,f1,f2,f3){
+                  const n=Math.min(y.length,f1.length,f2.length,f3.length); if(n<20) return {R2:0};
+                  const Y=y.slice(-n), X1=f1.slice(-n), X2=f2.slice(-n), X3=f3.slice(-n);
+                  const ym=mean(Y); let sYY=0,sRes=0;
+                  const k=4; const XtX=Array.from({length:k},()=>Array(k).fill(0)), XtY=Array(k).fill(0);
+                  for(let i=0;i<n;i++){ const row=[1, X1[i]||0, X2[i]||0, X3[i]||0], yi=Y[i]; for(let a=0;a<k;a++){ XtY[a]+=row[a]*yi; for(let b=0;b<k;b++) XtX[a][b]+=row[a]*row[b]; } }
+                  for(let i=0;i<k;i++) XtX[i][i]+=1e-6;
+                  const M=XtX.map((row,i)=>row.concat([XtY[i]]));
+                  for(let i=0;i<k;i++){ let p=i; for(let r=i+1;r<k;r++) if(Math.abs(M[r][i])>Math.abs(M[p][i])) p=r;
+                    if(Math.abs(M[p][i])<1e-12) return {R2:0}; if(p!==i) [M[i],M[p]]=[M[p],M[i]];
+                    const piv=M[i][i]; for(let j=i;j<=k;j++) M[i][j]/=piv;
+                    for(let r=0;r<k;r++){ if(r===i) continue; const f=M[r][i]; for(let j=i;j<=k;j++) M[r][j]-=f*M[i][j]; } }
+                  const beta=M.map(row=>row[k]);
+                  for(let i=0;i<n;i++){ const row=[1, X1[i]||0, X2[i]||0, X3[i]||0]; let yhat=0; for(let j=0;j<k;j++) yhat+=row[j]*beta[j]; const e=Y[i]-yhat; sRes+=e*e; sYY+=(Y[i]-ym)**2; }
+                  return {R2: clamp(sYY>0? (1-sRes/sYY):0,0,1)};
+                })(yR,X1,X2,X3);
+
                 const liq = liqPct.get(c.symbol)||0.5;
 
-                // Confluence score
-                let confl=0;
-                confl += p.trendAlign ? 0.25 : 0;
-                confl += (Math.abs(p.z_vwap)<=0.5) ? 0.15 : 0;
-                confl += (p.boUp && expLong>expShort) || (p.boDn && expShort>expLong) ? 0.20 : 0;
-                confl += (expLong>=expShort && obi>0) || (expShort>expLong && obi<0) ? 0.20 : 0;
-                confl += p.squeezeScore*0.20;
-                confl = clamp(confl, 0, 1);
-
-                const adxF=clamp((p.adx5-16)/14,0,1);
-                let nConf = 46 + 26*adxF + 22*liq + 22*confl - 34*clamp(R2,0,1);
-                nConf = Math.round(clamp(nConf, 34, 132));
-
-                // Side + EVs
-                let side = expLong>=expShort ? "long":"short";
-                let p_final = side==="long"? pLong : pShort;
-                let rrr = side==="long"? rrrLong : rrrShort;
-                let costSide = side==="long"? costLong : costShort;
-                const fillSide = side==="long"? fillL : fillS;
-                if(!rrr) continue;
-
-                const p_lcb=wilsonLCB(p_final, nConf, WILSON_Z);
-                const exp_bps = side==="long"? expLong : expShort;
-                const exp_lcb_bps=Math.round(p_lcb*rrr.tp_bps - (1-p_lcb)*rrr.sl_bps - costSide);
-
-                const dynFloor = Math.max(
-                  EXP_LCB_MIN_BPS,
-                  Math.round(EXP_LCB_MIN_BPS + (1-liq)*2 + Math.max(0,12-p.spreadBps)/12 + (fillSide<0.70? (8*(0.70-fillSide)) : 0))
-                );
-
-                const hold_base = (regime.regime==="trend"?760:560) + 240*adxF + 120*p.squeezeScore;
-                const hold_sec = Math.round(clamp(hold_base, 480, 2000));
-
-                const score = clamp(Math.round(
-                  60 + 30*(p_final-0.5)*2 + 12*adxF + 7*((liq-0.5)*2) + 9*(confl-0.5)
-                  - Math.min(12, Math.max(0,(p.spreadBps-5)/2))
-                  - Math.round(9*clamp(R2,0,1))
-                ), 1, 99);
+                const score = clamp(Math.round(60 + 30*(chosen.p_lcb-0.5)*2 + 12*clamp((p.adx5-16)/14,0,1) + 7*((liq-0.5)*2)
+                                   - Math.min(12, Math.max(0,(p.spreadBps-5)/2)) - Math.round(9*clamp(R2,0,1))), 1, 99);
 
                 refined.push({
                   symbol:c.symbol, base:c.base, quote:c.quote, qv:c.qv,
-                  side, p_win:+p_final.toFixed(3), p_lcb:+p_lcb.toFixed(3),
-                  exp_bps, exp_lcb_bps,
-                  tp_bps: rrr.tp_bps, sl_bps: rrr.sl_bps, rrr: rrr.r_used,
-                  tp_atr_mult: rrr.tp_atr, sl_atr_mult: rrr.sl_atr,
-                  spread_bps: p.spreadBps, cost_bps: costSide,
+                  side:chosen.side, p_lcb:+chosen.p_lcb.toFixed(3),
+                  p_win: +(Math.max(p.pLong0,p.pShort0)).toFixed(3),
+                  exp_bps: chosen.exp_bps, exp_lcb_bps: chosen.exp_lcb_bps,
+                  tp_bps: chosen.tp_bps, sl_bps: chosen.sl_bps, rrr: +(chosen.tp_bps/Math.max(1,chosen.sl_bps)).toFixed(2),
+                  spread_bps: p.spreadBps, cost_bps: chosen.cost_bps,
                   adx:+(p.adx5||0).toFixed(1), atr_bps:p.atr_bps,
-                  regime: regime.regime, style: side==="long"?p.styleLong:p.styleShort,
-                  score, beta_r2:+R2.toFixed(2), n_conf:nConf, obi:+obi.toFixed(3), confl:+confl.toFixed(2),
-                  hold_sec, liq_pct:+liq.toFixed(3),
-                  ret5:(()=>{ const r=[]; for(let i=1;i<p.c5.length;i++) r.push(Math.log(p.c5[i]/p.c5[i-1])); return r.slice(-36); })(),
-                  fill_prob: +fillSide.toFixed(2),
-                  dyn_floor: dynFloor,
-                  signal_score: p.signalScore
+                  regime: (weights.wTrend>weights.wMR? "trend":"meanrevert"), style: (chosen.side==="long"? p.styleLong: p.styleShort),
+                  score, beta_r2:+R2.toFixed(2), n_conf:Math.round(60+40*clamp((p.adx5-16)/14,0,1)),
+                  obi:+obi.toFixed(3), hold_sec, liq_pct:+liq.toFixed(3),
+                  ret5:retLog(p.c5), fill_prob:+((chosen.side==="long"?fillL:fillS)||0).toFixed(2),
+                  dyn_floor: Math.max(EXP_LCB_MIN_BPS, 6 + Math.max(0,12-p.spreadBps)/2),
+                  lvl_gap_long_bps:p.lvl_gap_long_bps, lvl_gap_short_bps:p.lvl_gap_short_bps,
+                  trend_align_long:(p.upF&&p.upS&&p.up15&&p.up1h),
+                  trend_align_short:(!p.upF&&!p.upS&&(!p.up15||!p.up1h)),
+                  rsi14: rsiVal
                 });
               }
 
-              // Rank refined candidates
+              // Rank refined
               refined.sort((a,b)=> b.exp_lcb_bps!==a.exp_lcb_bps ? b.exp_lcb_bps-a.exp_lcb_bps
-                              : b.exp_bps!==a.exp_bps ? b.exp_bps-a.exp_bps
-                              : b.confl!==a.confl ? b.confl-a.confl
-                              : b.score!==a.score ? b.score-a.score
-                              : b.signal_score!==a.signal_score ? b.signal_score-a.signal_score
-                              : b.qv-a.qv);
+                                : b.exp_bps!==a.exp_bps ? b.exp_bps-a.exp_bps
+                                : b.score!==a.score ? b.score-a.score
+                                : b.qv-a.qv);
 
-              // Selection framework: Strict first (A+), then Fallback (B-) if none
-              const CORE_CORR_MAX=0.84, OF_CORR_MAX=0.90; // correlation caps
+              // Strict picks (MC-LCB EV)
+              const CORE_CORR_MAX=0.84;
               const rho=(a,b)=>corr(a.ret5||[],b.ret5||[]);
+              const strictOk=(cand)=> cand.p_lcb>=0.60 && cand.exp_lcb_bps>=Math.max(cand.dyn_floor+3, EXP_LCB_MIN_BPS+3)
+                && (cand.fill_prob||0)>=0.70 && cand.cost_bps<=Math.max(COST_BPS+8, 18)
+                && cand.spread_bps<=MAX_SPREAD_BPS && cand.beta_r2<=0.75;
 
-              const strictOk=(cand)=>{
-                return cand.p_lcb>=0.60
-                  && cand.exp_lcb_bps>=Math.max(cand.dyn_floor+3, EXP_LCB_MIN_BPS+3)
-                  && cand.fill_prob>=0.70
-                  && cand.cost_bps<=Math.max(COST_BPS+8, 18)
-                  && cand.spread_bps<=MAX_SPREAD_BPS
-                  && cand.beta_r2<=0.75;
-              };
-              const fallbackOk=(cand)=>{
-                return cand.p_lcb>=0.52
-                  && cand.exp_lcb_bps>=Math.max(EXP_LCB_MIN_BPS-2, 2)
-                  && cand.fill_prob>=0.55
-                  && cand.cost_bps<=Math.max(COST_BPS+12, 22)
-                  && cand.spread_bps<=Math.min(MAX_SPREAD_BPS+4, 24)
-                  && cand.beta_r2<=0.88;
-              };
-
-              // Strict picks (up to 1–3)
-              const picksStrict=[];
+              const strictPicks=[];
               for(const cand of refined){
-                if(picksStrict.length>=MAX_STRICT_PICKS) break;
+                if(strictPicks.length>=Math.min(3, TOP_N)) break;
                 if(!strictOk(cand)) continue;
-                let ok=true;
-                for(const s of picksStrict){ if(rho(cand,s)>CORE_CORR_MAX){ ok=false; break; } }
-                if(ok) picksStrict.push(cand);
+                let ok=true; for(const s of strictPicks){ if(rho(cand,s)>CORE_CORR_MAX){ ok=false; break; } }
+                if(ok) strictPicks.push(cand);
               }
 
-              let selected=[], selectionTier="none";
-              if(picksStrict.length>0){
-                selected=picksStrict;
+              let selected=[];
+              if(strictPicks.length>0){
+                selected=strictPicks;
                 selectionTier="strict";
-                reason = (reason!=="ok"?reason:"strict");
+                reason=(reason!=="ok"?reason:"strict");
               }else{
-                // Fallback (1–3 best) if strict found nothing
-                const picksFallback=[];
-                for(const cand of refined){
-                  if(picksFallback.length>=MAX_FALLBACK_PICKS) break;
-                  if(!fallbackOk(cand)) continue;
-                  let ok=true;
-                  for(const s of picksFallback){ if(rho(cand,s)>OF_CORR_MAX){ ok=false; break; } }
-                  if(ok) picksFallback.push(cand);
+                // strict=0 → "viable-first" force: >=3 viable → take 3; 1–2 viable → take those; 0 viable → take top 3 by rank (micro-size)
+                const TARGET_K = Math.min(3, TOP_N || 3);
+                const viable = refined.filter(c => (c.exp_lcb_bps ?? -1e9) > 0);
+
+                if (viable.length >= TARGET_K){
+                  selected = viable.slice(0, TARGET_K);                // exactly 3 viable
+                  selectionTier="mp_force3_viable3";
+                } else if (viable.length > 0){
+                  selected = viable.slice(0, viable.length);           // push as many viable (1–2)
+                  selectionTier="mp_force3_viable12";
+                } else {
+                  selected = refined.slice(0, TARGET_K).map(c=>({ ...c, mp_fill:true })); // none viable → top 3 ranked, micro-sized
+                  selectionTier="mp_force3_rank";
                 }
-                if(picksFallback.length>0){
-                  selected=picksFallback;
-                  selectionTier="fallback";
-                  reason = (reason!=="ok"?reason:"fallback");
-                }else{
-                  reason = (reason!=="ok"?reason:"filtered_by_caps");
-                }
+                reason=(reason!=="ok"?reason:"strict0_force3_spec");
               }
 
-              // Sizing (constant risk; fallback downsized)
-              const softmax=(arr,t=20)=>{ const ex=arr.map(x=>Math.exp(x/t)); const s=ex.reduce((a,b)=>a+b,0)||1; return ex.map(x=>x/s); };
-              const wExp=softmax(selected.map(x=>x.exp_lcb_bps),20);
+              // Build picks (limit_at_old_sl) + micro-size forced negatives
               const TARGET_PORT_RISK_BPS=52;
+              const wEv=softmax(selected.map(x=> (x.exp_lcb_bps)), 20);
+              let picks = selected.map((x,i)=>{
+                const sideUsed = x.side, tpUsed = x.tp_bps, slUsed = x.sl_bps;
+                const bk = bookMap.get(x.symbol);
+                const mid = (bk?.bid && bk?.ask) ? ((+bk.bid + +bk.ask)/2) : null;
 
-              const sizeFactor = selectionTier==="fallback" ? FALLBACK_SIZE_FACTOR : 1.0;
+                const slF = slUsed/10000, tpF = tpUsed/10000;
+                const entry_limit = mid==null ? null : (sideUsed==="long" ? mid*(1 - slF) : mid*(1 + slF));
+                const tp_abs = entry_limit==null ? null : (sideUsed==="long" ? entry_limit*(1 + tpF) : entry_limit*(1 - tpF));
+                const sl_abs = entry_limit==null ? null : (sideUsed==="long" ? entry_limit*(1 - slF) : entry_limit*(1 + slF));
 
-              const picks = selected.map((x,i)=>({
-                symbol: x.base,
-                symbol_full: x.symbol,
-                quote: x.quote,
-                side: x.side, score: x.score, rank:i+1,
-                ttl_sec: clamp(Math.round(x.hold_sec + i*12), 480, 2000),
-                p_win:x.p_win, p_lcb:x.p_lcb,
-                exp_bps:x.exp_bps, exp_lcb_bps:x.exp_lcb_bps,
-                tp_bps:x.tp_bps, sl_bps:x.sl_bps, rrr:x.rrr,
-                tp_atr_mult:x.tp_atr_mult, sl_atr_mult:x.sl_atr_mult,
-                spread_bps:x.spread_bps, cost_bps:x.cost_bps,
-                adx:x.adx, atr_bps:x.atr_bps, beta_r2:x.beta_r2, n_conf:x.n_conf, obi:x.obi, confl:x.confl,
-                regime:x.regime, style:x.style,
-                liq_pct:x.liq_pct, fill_prob:x.fill_prob,
-                tier: selectionTier,
-                size_bps: x.sl_bps>0 ? Math.min(220, Math.round(sizeFactor * (wExp[i]*TARGET_PORT_RISK_BPS/x.sl_bps*100))) : 0
-              }));
+                const ttl = clamp(Math.round((x.hold_sec||720) + i*12), 540, 1200);
+
+                let size_bps = 0;
+                if(Number(process.env.FORCE_SIZE_BPS||"0")>0){ 
+                  size_bps = Math.round(Number(process.env.FORCE_SIZE_BPS));
+                } else { 
+                  size_bps = slUsed>0 ? Math.min(220, Math.round((wEv[i]*TARGET_PORT_RISK_BPS/slUsed)*100)) : 0;
+                }
+                if (x.mp_fill) size_bps = Math.max(8, Math.round(size_bps * 0.4));
+
+                return {
+                  symbol: x.base, symbol_full: x.symbol, quote: x.quote,
+                  side: sideUsed, rank:i+1, ttl_sec: ttl,
+                  p_win:x.p_win, p_lcb: x.p_lcb,
+                  tp_bps: tpUsed, sl_bps: slUsed, rrr: +(tpUsed/Math.max(1,slUsed)).toFixed(2),
+                  exp_lcb_bps: x.exp_lcb_bps,
+                  ev_bps: x.exp_bps,
+                  spread_bps:x.spread_bps, cost_bps:x.cost_bps,
+                  adx:x.adx, atr_bps:x.atr_bps, n_conf:x.n_conf, obi:x.obi,
+                  regime:x.regime, style:x.style,
+                  liq_pct:x.liq_pct, fill_prob:x.fill_prob,
+                  entry_policy:"limit_at_old_sl", entry_type:"limit", activation:"on_fill",
+                  entry_mid: mid, entry_limit, tp_abs, sl_abs,
+                  size_bps, tier: selectionTier,
+                  mp_fill: !!x.mp_fill,
+                  gp_feat: [ clamp((x.adx-16)/14,0,1), 0, ((x.rsi14 ?? 50)/100), Math.max(0, sideUsed==="long"? -x.obi : +x.obi) ],
+                  ret5: x.ret5
+                };
+              });
+
+              // Portfolio VaR/ES gate: scale sizes if tail risk too high
+              try{
+                const varStats = portfolioVaR_ES(picks);
+                const ES_LIMIT = -220;
+                if(varStats.ES95_bps < ES_LIMIT){
+                  const scale = clamp(ES_LIMIT/Math.min(-1e-6, varStats.ES95_bps), 0.35, 1);
+                  picks = picks.map(p=> ({ ...p, size_bps: Math.round(p.size_bps*scale) }));
+                  log("VaR/ES throttle", varStats, "scale", scale);
+                }else{ log("VaR/ES ok", varStats); }
+              }catch(e){ log("VaR/ES warn", e?.message||e); }
 
               // Save cooldown + pending
               try{
                 const nowMs=Date.now(); const ideasTs=new Date(nowMs).toISOString();
                 for(const p of picks){
                   const bk=bookMap.get(p.symbol_full); const mid=bk? (bk.bid+bk.ask)/2 : 0;
-
-                  // UPDATED: entry at old SL price (limit), TP/SL recalculated around new entry during eval
-                  let entry_mid = mid;
-                  let entry_new = mid;
-                  if(p.side==="long"){
-                    entry_new = entry_mid * (1 - p.sl_bps/10000);
-                  }else{
-                    entry_new = entry_mid * (1 + p.sl_bps/10000);
-                  }
-
+                  const entry_mid = p.entry_mid ?? mid;
+                  const entry_new = p.entry_limit ?? (p.side==="long" ? entry_mid*(1 - p.sl_bps/10000) : entry_mid*(1 + p.sl_bps/10000));
+                  const tp_abs = p.tp_abs ?? (p.side==="long" ? entry_new*(1 + p.tp_bps/10000) : entry_new*(1 - p.tp_bps/10000));
+                  const sl_abs = p.sl_abs ?? (p.side==="long" ? entry_new*(1 - p.sl_bps/10000) : entry_new*(1 + p.sl_bps/10000));
                   state.cooldown[p.symbol]=nowMs;
                   state.cooldown_side[p.symbol]={ side:p.side, ts_ms:nowMs };
                   state.pending.push({
                     ts:ideasTs, ts_ms:nowMs, symbolFull:p.symbol_full, base:p.symbol, quote:p.quote, side:p.side,
-                    // entry hinting
-                    entry_policy:"limit_at_old_sl",
-                    entry_mid: entry_mid,
-                    entry_price: entry_new,
-                    hold_sec:p.ttl_sec, tp_bps:p.tp_bps, sl_bps:p.sl_bps, regime:p.regime, cost_bps:p.cost_bps
+                    entry_policy:"limit_at_old_sl", entry_mid, entry_price:entry_new, entry_limit:entry_new,
+                    tp_abs, sl_abs, hold_sec:p.ttl_sec, tp_bps:p.tp_bps, sl_bps:p.sl_bps, regime:p.regime, cost_bps:p.cost_bps,
+                    gp_feat: p.gp_feat
                   });
                 }
                 if(state.pending.length>550) state.pending=state.pending.slice(-550);
@@ -788,27 +948,30 @@ jobs:
                 await saveState(persist,state);
               }catch(e){ log("state save warn", e?.message||e); }
 
-              // POST (always)
-              const metaExtra = {
-                exchange:"mexc", exchange_base: BASE,
+              // POST
+              const meta={
+                exchange:"mexc", exchange_base:BASE,
+                counts:{ universe:universe.length, pre:picksRaw.length, refined:refined.length, selected:picks.length },
                 filters:{
-                  min_qv:MIN_QV, top_n:TOP_N, strict_max:MAX_STRICT_PICKS, fallback_max:MAX_FALLBACK_PICKS,
-                  score_cutoff:SCORE_CUTOFF, refine_topk:REFINE_TOPK, fallback_size_factor:FALLBACK_SIZE_FACTOR,
-                  max_spread_bps:MAX_SPREAD_BPS, ema_fast:EMA_FAST, ema_slow:EMA_SLOW, adx_p:ADX_P, atr_p:ATR_P,
-                  vwap_5m_win:VWAP_5M_WIN, corr_core:0.84, corr_overflow:0.90,
-                  depth_limit: DEPTH_LIMIT, obi_topn: OBI_TOPN,
+                  dyn_min_qv:dynMinQV, univ_target_min:UNIV_TARGET_MIN, univ_target_max:UNIV_TARGET_MAX,
+                  score_cutoff:50, refine_topk:UNIV_TARGET_MAX,
+                  max_spread_bps:MAX_SPREAD_BPS, ema_fast:EMA_FAST, ema_slow:EMA_SLOW, adx_p:ADX_P, atr_p:ATR_P, vwap_5m_win:VWAP_5M_WIN,
+                  depth_limit:DEPTH_LIMIT, obi_topn:OBI_TOPN,
                   cooldown_min: COOLDOWN_MS/60000, flip_guard_min: FLIP_GUARD_MS/60000,
-                  cost_bps:COST_BPS, notional_usd:NOTIONAL,
-                  exp_lcb_min_bps:EXP_LCB_MIN_BPS, wilson_z:WILSON_Z
+                  fees_bps:COST_BPS, notional_usd:NOTIONAL,
+                  exp_lcb_min_bps:EXP_LCB_MIN_BPS, wilson_z:WILSON_Z,
+                  entry_policy: "limit_at_old_sl",
+                  stochastic: { hmm:true, gp:true, sde_mc:true, var_es:true, kalman:true },
+                  strict0_force3_spec: true
                 },
-                dd_gate:{ pnl24_bps, peak_dd_bps, throttle },
+                dd_gate: (function(){ const s=state.equity||[]; const day=Date.now()-24*3600*1000; let pnl24=0,cum=0,peak=0,dd=0; for(const e of s){ if(e.ts_ms>=day) pnl24+=e.pnl_bps; cum+=e.pnl_bps; if(cum>peak) peak=cum; dd=Math.min(dd,cum-peak); } return { pnl24_bps:Math.round(pnl24), peak_dd_bps:Math.round(dd), throttle }; })(),
                 tod: { active: S_H!=null && E_H!=null, start:S_H, end:E_H },
                 tier: selectionTier,
-                entry_policy: "limit_at_old_sl"
+                regime_post: weights
               };
-              const payload={ ts:new Date().toISOString(), mode:"normal", source:"external_pusher", meta:{ origin:"github_actions", reason, ...(metaExtra||{}) }, top_n:selected.length||0, ideas:picks||[] };
+              const payload={ ts:new Date().toISOString(), mode:"normal", source:"external_pusher", meta:{ origin:"github_actions", reason, ...meta }, top_n:picks.length||0, ideas:picks||[] };
 
-              console.log(`[gha] pushing ${selected.length} ideas (${selectionTier}) to ${PUSH_URL}`);
+              console.log(`[gha] pushing ${picks.length} ideas (${selectionTier}) to ${PUSH_URL}`);
               try{
                 const r=await fetchWithTimeout(PUSH_URL,{ method:"POST", headers:{ "Content-Type":"application/json","Authorization":`Bearer ${PUSH_TOKEN}` }, body: JSON.stringify(payload) },15000);
                 let txt=""; try{ txt=await r.text(); }catch{}
@@ -818,7 +981,6 @@ jobs:
               }
 
             }catch(e){
-              // Graceful fallback: always push minimal payload so tail shows a [push] line
               reason = reason!=="ok"?reason:"data_error";
               const payload={ ts:new Date().toISOString(), mode:"normal", source:"external_pusher", meta:{ origin:"github_actions", reason, error:(e?.message||String(e)).slice(0,220) }, top_n:0, ideas:[] };
               console.log(`[gha] pushing 0 ideas to ${PUSH_URL}`);
@@ -838,24 +1000,21 @@ jobs:
           set -e
           if [[ $EXIT_CODE -ne 0 ]]; then
             echo "[gha] pusher exited with code $EXIT_CODE — sending minimal payload so tail shows a [push] line"
-
-            # 1) Fallback health GET (guaranteed Worker hit)
-            health_url="${WORKER_PUSH_URL/\/signals\/push/\/health}"
-            echo "[gha] fallback health GET ${health_url}"
-            http_code_h=$(curl -sS -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${PUSH_TOKEN}" --max-time 8 "${health_url}" || true)
-            echo "[gha] fallback health status ${http_code_h}"
-
-            # 2) Minimal POST with 0 ideas
-            now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-            payload='{"ts":"'"$now"'","mode":"normal","source":"external_pusher","meta":{"origin":"github_actions","reason":"fallback_node_error"},"top_n":0,"ideas":[]}'
-            echo "[gha] pushing 0 ideas to ${WORKER_PUSH_URL}"
-            http_code=$(curl -sS -o /tmp/push_resp.txt -w "%{http_code}" -X POST \
-              -H "Content-Type: application/json" \
-              -H "Authorization: Bearer ${PUSH_TOKEN}" \
-              --data "${payload}" \
-              --max-time 12 \
-              "${WORKER_PUSH_URL}" || true)
-            body="$(head -c 400 /tmp/push_resp.txt || true)"
-            echo "[gha] push status ${http_code} ${body}"
+            if [[ -n "${WORKER_PUSH_URL:-}" ]]; then
+              health_url="${WORKER_PUSH_URL/\/signals\/push/\/health}"
+              echo "[gha] fallback health GET ${health_url}"
+              curl -sS -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${PUSH_TOKEN}" --max-time 8 "${health_url}" || true
+              now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+              payload='{"ts":"'"$now"'","mode":"normal","source":"external_pusher","meta":{"origin":"github_actions","reason":"fallback_node_error"},"top_n":0,"ideas":[]}'
+              echo "[gha] pushing 0 ideas to ${WORKER_PUSH_URL}"
+              curl -sS -o /tmp/push_resp.txt -w "%{http_code}" -X POST \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer ${PUSH_TOKEN}" \
+                --data "${payload}" \
+                --max-time 12 \
+                "${WORKER_PUSH_URL}" || true
+            else
+              echo "[gha] WORKER_PUSH_URL is empty; skip fallback curl"
+            fi
             exit 0
           fi
