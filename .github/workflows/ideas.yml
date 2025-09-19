@@ -1,3 +1,4 @@
+
 name: Ideas Pusher (MEXC ULTIMATE EV@Pusher, Strict → MP Top-20 Fallback)
 
 on:
@@ -17,18 +18,33 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 12
     env:
-      # Required
+      # Required secrets
       WORKER_PUSH_URL: ${{ secrets.WORKER_PUSH_URL }}
       PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
+
+      text
 
       # Optional (state)
       GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
       GIST_ID: ${{ secrets.GIST_ID }}
 
-      # Optional (infra/times)
-      MEXC_BASE: ${{ vars.MEXC_BASE }}          # optional custom base (e.g., proxy)
+      # Exchange + tuning knobs (via Repo/Org Variables)
+      EXCHANGE: mexc
+      MIN_QV_USD: ${{ vars.MIN_QV_USD }}
+      TOP_N: ${{ vars.TOP_N }}
+      MAX_SPREAD_BPS: ${{ vars.MAX_SPREAD_BPS }}
+      EXP_LCB_MIN_BPS: ${{ vars.EXP_LCB_MIN_BPS }}
+      FEES_BPS: ${{ vars.FEES_BPS }}
+      NOTIONAL_USD: ${{ vars.NOTIONAL_USD }}
+      MEXC_DEPTH_LIMIT: ${{ vars.MEXC_DEPTH_LIMIT }}
+      OBI_TOPN: ${{ vars.OBI_TOPN }}
       ACTIVE_UTC_START: ${{ vars.ACTIVE_UTC_START }}
       ACTIVE_UTC_END: ${{ vars.ACTIVE_UTC_END }}
+      MEXC_BASE: ${{ vars.MEXC_BASE }}
+
+      # New knobs
+      FORCE_SIZE_BPS: ${{ vars.FORCE_SIZE_BPS }}  # e.g., 1000 = 10% fixed; 0 = risk-based
+      MP_TOP_POOL: ${{ vars.MP_TOP_POOL }}        # e.g., 20
 
     steps:
       - name: Setup Node 20
@@ -36,7 +52,7 @@ jobs:
         with:
           node-version: 20
 
-      - name: Run Ultimate Pusher (EV in pusher, strict-first; MP top-20 fallback)
+      - name: Run pusher (EV@pusher, strict-first; MP top-20 fallback; absolute limit)
         shell: bash
         run: |
           set -euo pipefail
@@ -70,63 +86,34 @@ jobs:
             const corr=(a,b)=>{ const n=Math.min(a.length,b.length); if(n<5) return 0; const as=a.slice(-n), bs=b.slice(-n);
               const ma=as.reduce((x,y)=>x+y,0)/n, mb=bs.reduce((x,y)=>x+y,0)/n; let num=0,da=0,db=0;
               for(let i=0;i<n;i++){ const xa=as[i]-ma, xb=bs[i]-mb; num+=xa*xb; da+=xa*xa; db+=xb*xb; }
-              const den=Math.sqrt(da*db); return den===0?0:num/den;
+              const den=Math.sqrt(da*db)||1; return num/den;
             };
             const wilsonLCB=(p,n,z=1.34)=>{ if(n<=0) return p; const z2=z*z; const a=p + z2/(2*n); const b=z*Math.sqrt((p*(1-p)+z2/(4*n))/n); const c=1+z2/n; return clamp((a-b)/c, 0, 1); };
-            const sum=(a)=>a.reduce((x,y)=>x+y,0);
-            const matMulT=(X,y)=>{ const k=X[0].length; const XtY=new Array(k).fill(0); for(let i=0;i<X.length;i++){ const row=X[i]; const yi=y[i]; for(let j=0;j<k;j++) XtY[j]+=row[j]*yi; } return XtY; };
-            const matTXmat=(X)=>{ const k=X[0].length; const XtX=Array.from({length:k},()=>new Array(k).fill(0)); for(let i=0;i<X.length;i++){ const row=X[i]; for(let a=0;a<k;a++) for(let b=0;b<k;b++) XtX[a][b]+=row[a]*row[b]; } return XtX; };
-            const solveRidge=(A,b,lam=1e-6)=>{ const k=A.length; const M=Array.from({length:k},(_,i)=>A[i].slice()); for(let i=0;i<k;i++) M[i][i]+=lam;
-              const aug=M.map((row,i)=>row.concat([b[i]]));
-              for(let i=0;i<k;i++){
-                let p=i; for(let r=i+1;r<k;r++) if(Math.abs(aug[r][i])>Math.abs(aug[p][i])) p=r;
-                if(Math.abs(aug[p][i])<1e-12) return null;
-                if(p!==i){ const t=aug[i]; aug[i]=aug[p]; aug[p]=t; }
-                const piv=aug[i][i]; for(let j=i;j<=k;j++) aug[i][j]/=piv;
-                for(let r=0;r<k;r++){ if(r===i) continue; const f=aug[r][i]; for(let j=i;j<=k;j++) aug[r][j]-=f*aug[i][j]; }
-              }
-              return aug.map(row=>row[k]);
-            };
-            const olsR2=(y,factors)=>{ const n=y.length; if(n<10) return {R2:0,beta:null}; const X=[]; for(let i=0;i<n;i++){ const row=[1]; for(const f of factors) row.push(f[i]||0); X.push(row); }
-              const XtX=matTXmat(X), XtY=matMulT(X,y); const beta=solveRidge(XtX,XtY,1e-6);
-              if(!beta) return {R2:0,beta:null};
-              let ssTot=0, ssRes=0; const ym=sum(y)/n;
-              for(let i=0;i<n;i++){
-                let yhat=0; for(let j=0;j<beta.length;j++) yhat+=X[i][j]*beta[j];
-                ssRes+=(y[i]-yhat)**2; ssTot+=(y[i]-ym)**2;
-              }
-              return {R2: clamp(ssTot>0? (1-ssRes/ssTot):0,0,1), beta};
-            };
             const sleep=(ms)=>new Promise(r=>setTimeout(r,ms));
             const jitter=(ms)=>ms + Math.floor(Math.random()*ms*0.25);
+            const sum=(a)=>a.reduce((x,y)=>x+y,0);
             const log=(...a)=>console.log("[gha]",...a);
+            const softmax=(arr,t=20)=>{ const m=Math.max(...arr,0); const ex=arr.map(x=>Math.exp((x-m)/t)); const s=ex.reduce((a,b)=>a+b,0)||1; return ex.map(x=>x/s); };
 
-            // ---------- Config ----------
-            const UA="gh-actions-mexc-ultimate/3.0 (+https://github.com/)";
-            async function fetchWithTimeout(url,opts={},ms=12000){
-              const ac=new AbortController(); const t=setTimeout(()=>ac.abort(),ms);
-              try{ return await fetch(url,{...opts,signal:ac.signal,headers:{"User-Agent":UA,...(opts.headers||{})}}); }
-              finally{ clearTimeout(t); }
-            }
-            async function getJSON(url,ms=12000,tries=2){
-              for(let a=0;a<tries;a++){
-                try{ const r=await fetchWithTimeout(url,{},ms); if(r?.ok){ return await r.json(); } }catch{}
-                await sleep(jitter(220));
-              }
-              return null;
-            }
+            // ---------- Config / ENV ----------
+            const UA="gh-actions-ideas-mexc-ultimate/3.0 (+https://github.com/)";
+            async function fetchWithTimeout(url,opts={},ms=12000){ const ac=new AbortController(); const t=setTimeout(()=>ac.abort(),ms); try{ return await fetch(url,{...opts,signal:ac.signal,headers:{"User-Agent":UA,...(opts.headers||{})}});} finally{ clearTimeout(t);} }
+            async function getJSON(url,ms=12000,tries=2){ for(let a=0;a<tries;a++){ try{ const r=await fetchWithTimeout(url,{},ms); if(r?.ok){ return await r.json(); } }catch{} await sleep(jitter(220)); } return null; }
 
-            // Exchange fixed to MEXC
-            const EXCHANGE="mexc";
+            const EXCHANGE=(process.env.EXCHANGE||"mexc").toLowerCase().replace("mexci","mexc");
+            if(EXCHANGE!=="mexc"){ console.error("[gha] This build targets MEXC. Set EXCHANGE=mexc"); process.exit(1); }
+
             const MEXC_BASES=[process.env.MEXC_BASE,"https://api.mexc.com","https://www.mexc.com"].filter(Boolean);
 
-            // Liquidity & universe (dynamic to hit 100–120)
+            // Universe sizing
             const MIN_QV_ENV = Number(process.env.MIN_QV_USD||"0") || 0;
             const UNIV_TARGET_MIN=100, UNIV_TARGET_MAX=120;
             const DYN_QV_MIN=10_000_000, DYN_QV_STEP=5_000_000;
 
-            // Spread caps
-            const MAX_SPREAD_BPS=12;
+            // Core knobs
+            const TOP_N = Number(process.env.TOP_N||"3");
+            const MAX_SPREAD_BPS = Number(process.env.MAX_SPREAD_BPS||"12");
+            const EXP_LCB_MIN_BPS = Number(process.env.EXP_LCB_MIN_BPS||"5");
 
             // TA + windows
             const EMA_FAST=21, EMA_SLOW=50, ADX_P=14, ATR_P=14;
@@ -134,25 +121,25 @@ jobs:
             const VWAP_5M_WIN=36;
 
             // Costs & micro
-            const FEES_BPS=10;
-            const NOTIONAL=300;
-            const DEPTH_LIMIT=50;
-            const OBI_TOPN=12;
-            const SIGNAL_NOTIONAL=300;
+            const COST_BPS = Number(process.env.FEES_BPS||"10");
+            const NOTIONAL = Number(process.env.NOTIONAL_USD||"300");
+            const DEPTH_LIMIT = Number(process.env.MEXC_DEPTH_LIMIT||"50");
+            const OBI_TOPN = Number(process.env.OBI_TOPN||"12");
 
             // Risk & timing
-            const TOP_N=3;
-            const COOLDOWN_MS=3*60*60*1000;
-            const FLIP_GUARD_MS=30*60*1000;
+            const COOLDOWN_MS=3*60*60*1000, FLIP_GUARD_MS=30*60*1000;
             const DD_24H_LIMIT_BPS=-150, DD_PEAK_LIMIT_BPS=-300;
-            const WILSON_Z=1.34;
-            const TARGET_PORT_RISK_BPS=52;
+            const WILSON_Z=1.34, TARGET_PORT_RISK_BPS=52;
             const TTL_MIN=540, TTL_MAX=1200;
 
-            // EV gating (pusher-only)
-            const EV_MIN_BPS=3; // hard lower bound; dynamic floor will be >= this
+            // New knobs
+            const FORCE_SIZE_BPS = Number(process.env.FORCE_SIZE_BPS||"0");
+            const MP_TOP_POOL = Number(process.env.MP_TOP_POOL||"20");
 
-            // Regime timing gate (optional via env)
+            // EV gating (pusher-only)
+            const EV_MIN_BPS=3;
+
+            // ToD gate
             const S_H = process.env.ACTIVE_UTC_START? Number(process.env.ACTIVE_UTC_START): null;
             const E_H = process.env.ACTIVE_UTC_END?   Number(process.env.ACTIVE_UTC_END):   null;
             const nowH = new Date().getUTCHours();
@@ -165,35 +152,21 @@ jobs:
             const PUSH_TOKEN=process.env.PUSH_TOKEN||"";
             const HEALTH_URL=(()=>{ try{ const u=new URL(PUSH_URL); return `${u.origin}${u.pathname.replace(/\/signals\/push(\?.*)?$/,"/health")}`;}catch{return PUSH_URL.replace(/\/signals\/push(\?.*)?$/,"/health");}})();
 
+            // Health ping
             log("health GET", HEALTH_URL);
-            try{
-              const r=await fetchWithTimeout(HEALTH_URL,{ headers:{ "Authorization":`Bearer ${PUSH_TOKEN}`, "User-Agent":UA }},5000);
-              let t=""; try{ t=await r.text(); }catch{}
-              log("health status", r?.status||"ERR", (t||"").slice(0,160));
-            }catch(e){ log("health error", e?.message||e); }
+            try{ const r=await fetchWithTimeout(HEALTH_URL,{ headers:{ "Authorization":`Bearer ${PUSH_TOKEN}`, "User-Agent":UA }},5000); let t=""; try{ t=await r.text(); }catch{} log("health status", r?.status||"ERR", (t||"").slice(0,160)); }catch(e){ log("health error", e?.message||e); }
 
-            // ---------- MEXC adapter ----------
-            async function pickMexcBase(){
-              for(const b of MEXC_BASES){
-                try{
-                  const r=await fetchWithTimeout(`${b}/api/v3/time`,{},4000);
-                  if(r?.ok) return b;
-                }catch{}
-              }
-              throw new Error("No healthy MEXC base");
-            }
+            // ---------- MEXC Adapter ----------
+            async function pickMexcBase(){ for(const b of MEXC_BASES){ try{ const r=await fetchWithTimeout(`${b}/api/v3/time`,{},4000); if(r?.ok) return b; }catch{} } throw new Error("No healthy MEXC base"); }
             const BASE=await pickMexcBase();
             const api=(path,params={})=>{ const u=new URL(path,BASE); for(const [k,v] of Object.entries(params)){ if(v!==undefined&&v!==null) u.searchParams.set(k,String(v)); } return u.toString(); };
-            async function fetchK(sym,interval,limit,startTime,endTime){
-              const u=api("/api/v3/klines",{symbol:sym,interval,limit,startTime,endTime});
-              const r=await getJSON(u,10000,2); return Array.isArray(r)?r:null;
-            }
+            async function fetchK(sym,interval,limit,startTime,endTime){ const u=api("/api/v3/klines",{symbol:sym,interval,limit,startTime,endTime}); const r=await getJSON(u,10000,2); return Array.isArray(r)?r:null; }
             async function fetchDepth(symbol){ return await getJSON(api("/api/v3/depth",{symbol,limit:DEPTH_LIMIT}), 10000, 2); }
 
             async function fetchAll24hr(){
-              let all=await getJSON(api("/api/v3/ticker/24hr"),10000,2);
+              let all = await getJSON(api("/api/v3/ticker/24hr"), 10000, 2);
               if(Array.isArray(all) && all.length) return all;
-              const exi=await getJSON(api("/api/v3/exchangeInfo"),10000,2);
+              const exi=await getJSON(api("/api/v3/exchangeInfo"), 10000, 2);
               const syms=(exi?.symbols||[]).filter(s=>s.status==="TRADING").map(s=>s.symbol).slice(0,300);
               const out=[];
               for(let i=0;i<syms.length;i+=24){
@@ -206,56 +179,71 @@ jobs:
             }
 
             // ---------- State (Gist) ----------
-            async function loadState(){
-              const token=process.env.GIST_TOKEN, id=process.env.GIST_ID;
-              const init={ v:"mexc-ultimate-3.0", cooldown:{}, cooldown_side:{}, pending:[], equity:[] };
+            async function loadState(){ const token=process.env.GIST_TOKEN, id=process.env.GIST_ID; const init={ v:"mexc-ultimate-3.0", cooldown:{}, cooldown_side:{}, pending:[], equity:[] };
               if(!token||!id) return { state:init, persist:null };
-              try{
-                const r=await fetchWithTimeout(`https://api.github.com/gists/${id}`,{ headers:{Authorization:`Bearer ${token}`,"Accept":"application/vnd.github+json","User-Agent":UA}});
-                if(!r.ok) return { state:init, persist:null };
-                const g=await r.json(); const c=g.files?.["state.json"]?.content;
-                return { state: c?JSON.parse(c):init, persist:{id,token} };
-              }catch{ return { state:init, persist:null }; }
-            }
-            async function saveState(persist,state){
-              if(!persist) return;
-              try{
-                await fetchWithTimeout(`https://api.github.com/gists/${persist.id}`,{
-                  method:"PATCH",
-                  headers:{Authorization:`Bearer ${persist.token}`,"Accept":"application/vnd.github+json","Content-Type":"application/json","User-Agent":UA},
-                  body: JSON.stringify({ files:{ "state.json":{ content: JSON.stringify(state) } } })
-                });
-              }catch{}
-            }
+              try{ const r=await fetchWithTimeout(`https://api.github.com/gists/${id}`,{ headers:{Authorization:`Bearer ${token}`,"Accept":"application/vnd.github+json","User-Agent":UA}}); if(!r.ok) return { state:init, persist:null };
+                const g=await r.json(); const c=g.files?.["state.json"]?.content; return { state: c?JSON.parse(c):init, persist:{id,token} }; }catch{ return { state:init, persist:null }; } }
+            async function saveState(persist,state){ if(!persist) return; try{ await fetchWithTimeout(`https://api.github.com/gists/${persist.id}`,{ method:"PATCH", headers:{Authorization:`Bearer ${persist.token}`,"Accept":"application/vnd.github+json","Content-Type":"application/json","User-Agent":UA}, body: JSON.stringify({ files:{ "state.json":{ content: JSON.stringify(state) } } }) }); }catch{} }
+
+            // Fill-first eval for limit_at_old_sl
             async function evalPending(state){
               const now=Date.now(); const keep=[];
               for(const p of state.pending||[]){
                 if(now < p.ts_ms + p.hold_sec*1000 + 5000){ keep.push(p); continue; }
-                const k=await fetchK(p.symbolFull,"1m",K1M, p.ts_ms-60*1000, p.ts_ms+p.hold_sec*1000+60*1000);
+                const k = await fetchK(p.symbolFull,"1m",K1M, p.ts_ms-60*1000, p.ts_ms+p.hold_sec*1000+60*1000);
                 if(!k){ keep.push(p); continue; }
-                const highs=k.map(x=>+x[2]), lows=k.map(x=>+x[3]), closes=k.map(x=>+x[4]);
-                const entry=p.entry_price, long=p.side==="long", tp=p.tp_bps/10000, sl=p.sl_bps/10000;
-                let exitPx=closes.at(-1);
-                for(let i=0;i<k.length;i++){
-                  const hi=highs[i], lo=lows[i];
-                  if(long){ if(hi>=entry*(1+tp)){ exitPx=entry*(1+tp); break; } if(lo<=entry*(1-sl)){ exitPx=entry*(1-sl); break; } }
-                  else    { if(lo<=entry*(1-tp)){ exitPx=entry*(1-tp); break; } if(hi>=entry*(1+sl)){ exitPx=entry*(1+sl); break; } }
+
+                const ts=k.map(x=>+x[0]), highs=k.map(x=>+x[2]), lows=k.map(x=>+x[3]), closes=k.map(x=>+x[4]);
+                const long = p.side==="long";
+                const entry = Number.isFinite(p.entry_limit) ? p.entry_limit : p.entry_price;
+                const tpB=(p.tp_bps||0)/10000, slB=(p.sl_bps||0)/10000;
+                const limitAtSL = p.entry_policy==="limit_at_old_sl";
+
+                if(limitAtSL){
+                  const t0=p.ts_ms, tEnd=t0 + p.hold_sec*1000;
+                  let iFill=-1;
+                  for(let i=0;i<k.length;i++){
+                    const t=ts[i]; if(t < t0-1000) continue; if(t > tEnd) break;
+                    if(long ? (lows[i] <= entry) : (highs[i] >= entry)){ iFill=i; break; }
+                  }
+                  if(iFill===-1) continue; // no trade if not filled
+
+                  const tpPx = Number.isFinite(p.tp_abs) ? p.tp_abs : (long ? entry*(1+tpB) : entry*(1-tpB));
+                  const slPx = Number.isFinite(p.sl_abs) ? p.sl_abs : (long ? entry*(1-slB) : entry*(1+slB));
+
+                  let exitPx=closes.at(-1);
+                  for(let i=iFill;i<k.length;i++){
+                    const t=ts[i]; if(t > tEnd) break;
+                    const hi=highs[i], lo=lows[i];
+                    if(long){ if(hi>=tpPx){ exitPx=tpPx; break; } if(lo<=slPx){ exitPx=slPx; break; } }
+                    else    { if(lo<=tpPx){ exitPx=tpPx; break; } if(hi>=slPx){ exitPx=slPx; break; } }
+                  }
+                  const ret = long? (exitPx/entry - 1) : (entry/exitPx - 1);
+                  const pnl_bps = Math.round(ret*10000) - (p.cost_bps||0);
+                  state.equity.push({ ts_ms:p.ts_ms, pnl_bps });
+                }else{
+                  let exitPx=closes.at(-1);
+                  for(let i=0;i<k.length;i++){
+                    const hi=highs[i], lo=lows[i];
+                    if(long){ if(hi>=entry*(1+tpB)){ exitPx=entry*(1+tpB); break; } if(lo<=entry*(1-slB)){ exitPx=entry*(1-slB); break; } }
+                    else    { if(lo<=entry*(1-tpB)){ exitPx=entry*(1-tpB); break; } if(hi>=entry*(1+slB)){ exitPx=entry*(1+slB); break; } }
+                  }
+                  const ret = long? (exitPx/entry - 1) : (entry/exitPx - 1);
+                  const pnl_bps = Math.round(ret*10000) - (p.cost_bps||0);
+                  state.equity.push({ ts_ms:p.ts_ms, pnl_bps });
                 }
-                const ret = long? (exitPx/entry - 1) : (entry/exitPx - 1);
-                const pnl_bps = Math.round(ret*10000) - (p.cost_bps||0);
-                state.equity.push({ ts_ms:p.ts_ms, pnl_bps });
               }
-              state.pending=keep;
-              if(state.equity.length>6000) state.equity=state.equity.slice(-6000);
+              state.pending = keep;
+              if(state.equity.length>6000) state.equity = state.equity.slice(-6000);
             }
             const equityStats=(eq)=>{ const day=Date.now()-24*3600*1000; let pnl24=0,cum=0,peak=0,dd=0;
               for(const e of eq){ if(e.ts_ms>=day) pnl24+=e.pnl_bps; cum+=e.pnl_bps; if(cum>peak) peak=cum; dd=Math.min(dd,cum-peak); }
               return { pnl24_bps:Math.round(pnl24), peak_dd_bps:Math.round(dd) };
             };
 
-            // ---------- Auto-RRR (2.1/ELITE style) ----------
+            // ---------- Auto-RRR (Ultimate v2 bounds) ----------
             function computeAutoRRR({p,adx,atr_bps,cost_bps,spread_bps,trend_align,style,lvl_gap_bps=0,obi_adj=0}){
-              const SL_ATR_MIN=0.35, SL_ATR_MAX=1.70;
+              const SL_ATR_MIN=0.28, SL_ATR_MAX=1.50;  // v2
               const TP_ATR_MIN=0.40, TP_ATR_MAX=2.10;
               const BASE_SL = { trend:0.62, mr:0.60, breakout:0.60 };
               const BASE_TP = { trend:1.12, mr:0.62, breakout:1.30 };
@@ -322,7 +310,7 @@ jobs:
             }
 
             // ---------- Main ----------
-            let reason="ok";
+            let reason="ok", selectionTier="none";
             try{
               const ALL24 = await fetchAll24hr();
               const booksRaw=await getJSON(api("/api/v3/ticker/bookTicker"),10000,2) || [];
@@ -370,6 +358,7 @@ jobs:
                 const uncertain=adxAvg>=18 && adxAvg<=22;
                 return { regime: isTrend?"trend":"meanrevert", adxAvg, dir, uncertain };
               })();
+              log("regime", regime.regime, "adxAvg", regime.adxAvg?.toFixed?.(1)||"");
 
               // State & DD gate
               const { state, persist } = await loadState();
@@ -380,11 +369,11 @@ jobs:
               // Liquidity pct map
               const liqPct=new Map(); for(let i=0;i<universe.length;i++){ liqPct.set(universe[i].symbol,(universe.length===1)?1:1 - i/(universe.length-1)); }
 
-              // Helpers for returns
+              // Helpers
               const to5m=(k)=>{ if(!k) return []; const c=k.map(x=>+x[4]); const r=[]; for(let i=1;i<c.length;i++) r.push(Math.log(c[i]/c[i-1])); return r.slice(-60); };
               const fBTC=to5m(kBTC15), fETH=to5m(kETH15), fSOL=to5m(kSOL15);
 
-              // Prefilter (cooldown + lightweight experts)
+              // Prefilter
               const picksRaw=[];
               const B=10;
               for(let i=0;i<(universe||[]).length;i+=B){
@@ -457,34 +446,56 @@ jobs:
                     boBase *= (1 + 0.4*squeezeScore);
                     let pBO = clamp(0.5 + 0.29*(boBase*(sideBO==="long"?1:-1)), 0.35, 0.96);
 
-                    // Regime weights (soft bias via softmax-like)
-                    const w_trend = regime.regime==="trend" ? [1.0,0.6,0.8] : [0.6,1.0,0.8];
-                    const soft=(arr,t=0.5)=>{ const m=Math.max(...arr); const ex=arr.map(x=>Math.exp((x-m)/t)); const s=ex.reduce((a,b)=>a+b,0); return ex.map(x=>x/s); };
-                    const ws=soft(w_trend,0.5); const wT=ws[0], wM=ws[1], wB=ws[2];
+                    // Regime weights
+                    const wT = regime.regime==="trend" ? 0.53 : 0.30;
+                    const wM = regime.regime==="trend" ? 0.19 : 0.42;
+                    const wB = 1 - (wT+wM);
 
-                    const pUpTrend = sideTrend==="long"? pTrend : 1-pTrend;
-                    const pUpMR    = sideMR==="long"  ? pMR    : 1-pMR;
-                    const pUpBO    = sideBO==="long"  ? pBO    : 1-pBO;
+                    const pLong0  = clamp(wT*(sideTrend==="long"?pTrend:1-pTrend) + wM*(sideMR==="long"?pMR:1-pMR) + wB*(sideBO==="long"?pBO:1-pBO), 0.30, 0.97);
+                    const pShort0 = clamp(wT*(sideTrend==="short"?pTrend:1-pTrend) + wM*(sideMR==="short"?pMR:1-pMR) + wB*(sideBO==="short"?pBO:1-pBO), 0.30, 0.97);
 
-                    const pLong0  = clamp(wT*pUpTrend + wM*pUpMR + wB*pUpBO, 0.05, 0.95);
-                    const pShort0 = clamp(wT*(1-pUpTrend) + wM*(1-pUpMR) + wB*(1-pUpBO), 0.05, 0.95);
+                    // Level-aware gaps (for SL anchoring) + proto RRR
+                    const lvl_gap_long_bps = (pLow && last>0) ? Math.max(0, ((last - pLow)/last)*10000) : 0;
+                    const lvl_gap_short_bps= (pHigh&& last>0) ? Math.max(0, ((pHigh - last)/last)*10000) : 0;
 
-                    // Pre-score (reuse spreadBps computed above)
+                    const styleLong = trendAlign ? "trend" : (squeezeScore>0.25||boUp) ? "breakout" : "mr";
+                    const styleShort= !trendAlign ? "trend" : (squeezeScore>0.25||boDn) ? "breakout" : "mr";
+                    const costLong0=COST_BPS + Math.round(spreadBps/2);
+                    const costShort0=COST_BPS + Math.round(spreadBps/2);
+
+                    const rrrLong0 = computeAutoRRR({ p:pLong0,  adx:adx5, atr_bps:Math.round((atr5/last)*10000), cost_bps:costLong0,  spread_bps:spreadBps, trend_align:(upF&&upS&&up15&&up1h), style:styleLong,  lvl_gap_bps:lvl_gap_long_bps });
+                    const rrrShort0= computeAutoRRR({ p:pShort0, adx:adx5, atr_bps:Math.round((atr5/last)*10000), cost_bps:costShort0, spread_bps:spreadBps, trend_align:(!upF&&!upS&&(!up15||!up1h)), style:styleShort, lvl_gap_bps:lvl_gap_short_bps });
+
+                    const expLong0 = rrrLong0 ? Math.round(pLong0*rrrLong0.tp_bps - (1-pLong0)*rrrLong0.sl_bps - costLong0) : -1e9;
+                    const expShort0= rrrShort0? Math.round(pShort0*rrrShort0.tp_bps - (1-pShort0)*rrrShort0.sl_bps - costShort0): -1e9;
+                    const best0=Math.max(expLong0,expShort0);
+                    if(best0<=0) return null;
+
+                    // Lightweight Signal Score 0..100 (reuse spreadBps)
                     const signalScore = clamp(Math.round(
-                      50 + 30*((Math.max(pLong0,pShort0)-0.5)*2) + 10*adxF + 5*(trendAlign?1:0) + 5*clamp(squeezeScore*1.2,0,1)
+                      50
+                      + 30*((Math.max(pLong0,pShort0)-0.5)*2)
+                      + 10*clamp((adx5-18)/14,0,1)
+                      + 5*(trendAlign?1:0)
+                      + 5*clamp(squeezeScore*1.2,0,1)
                       - Math.min(10, Math.max(0,(spreadBps-6)/2))
                     ), 0, 100);
 
-                    return { c, k5, k15, c5, adx5, atr_bps:Math.round((atr5/last)*10000), spreadBps,
-                             pLong0, pShort0, trendAlign, squeezeScore,
-                             upF, upS, up15, up1h, z_vwap, boUp, boDn, signalScore };
+                    return {
+                      c, k5, c5, adx5, atr_bps:Math.round((atr5/last)*10000), spreadBps, pLong0, pShort0,
+                      rrrLong0, rrrShort0, expLong0, expShort0,
+                      styleLong, styleShort, upF, upS, up15, up1h, z_vwap, boUp, boDn, trendAlign, squeezeScore,
+                      lvl_gap_long_bps, lvl_gap_short_bps, signalScore
+                    };
                   }catch{ return null; }
                 }));
-                for(const x of batch){ if(x) picksRaw.push(x); }
+                for(const x of batch){
+                  if(x && x.signalScore > 50) picksRaw.push(x);
+                }
               }
               if(!picksRaw.length){ reason = (reason!=="ok"?reason:"no_candidates"); }
 
-              // Refine with depth + OBI + EV@pusher
+              // Refine
               picksRaw.sort((a,b)=> b.signalScore - a.signalScore);
               const REFINE_M = Math.min(UNIV_TARGET_MAX, picksRaw.length);
               const refined=[];
@@ -499,224 +510,204 @@ jobs:
                 const depth=await fetchDepth(c.symbol);
                 let obi=0, slipL=p.spreadBps/2, slipS=p.spreadBps/2, fillL=0, fillS=0;
                 if(depth?.asks?.length && depth?.bids?.length){
-                  const ob=obiWeighted(depth,OBI_TOPN);
-                  obi=ob.obi;
-                  const buy=vwapFill(depth.asks, Math.max(50,SIGNAL_NOTIONAL));
-                  const sell=vwapFill(depth.bids, Math.max(50,SIGNAL_NOTIONAL));
+                  const ob=obiWeighted(depth,OBI_TOPN); obi=ob.obi;
+                  const buy=vwapFill(depth.asks, Math.max(50,NOTIONAL));
+                  const sell=vwapFill(depth.bids, Math.max(50,NOTIONAL));
                   slipL = buy.px? Math.max(0, Math.round((buy.px - mid)/mid*10000)) : slipL;
                   slipS = sell.px? Math.max(0, Math.round((mid - sell.px)/mid*10000)) : slipS;
-                  fillL = Math.min(1, buy.filledUSD/Math.max(1,SIGNAL_NOTIONAL));
-                  fillS = Math.min(1, sell.filledUSD/Math.max(1,SIGNAL_NOTIONAL));
+                  fillL = Math.min(1, buy.filledUSD/Math.max(1,NOTIONAL));
+                  fillS = Math.min(1, sell.filledUSD/Math.max(1,NOTIONAL));
                 }
+                const obiAdjLong = Math.max(0, -obi);
+                const obiAdjShort= Math.max(0, +obi);
 
-                // OBI-adjusted probabilities + flip guard
-                const obiAdj=clamp(obi*0.10, -0.06, +0.06);
-                let pLong=clamp(p.pLong0 + (obi>0?+obiAdj:-obiAdj)*0.8, 0.05, 0.95);
-                let pShort=clamp(p.pShort0+ (obi<0?+(-obiAdj):+(obiAdj))*(-0.8), 0.05, 0.95);
+                let pLong=p.pLong0, pShort=p.pShort0;
+                const obiAdj = clamp(obi*0.09, -0.07, +0.07);
+                pLong = clamp(pLong + (obi>0?+obiAdj:-obiAdj)*0.9, 0.30, 0.97);
+                pShort= clamp(pShort+ (obi<0?+(-obiAdj):+(obiAdj))*(-0.9), 0.30, 0.97);
 
                 const lastSide=state.cooldown_side?.[c.base];
                 if(lastSide && lastSide.side && lastSide.ts_ms && Date.now()-lastSide.ts_ms<FLIP_GUARD_MS){
-                  if(lastSide.side==="long") pShort = Math.max(0.05, pShort-0.03);
-                  if(lastSide.side==="short") pLong  = Math.max(0.05, pLong -0.03);
+                  if(lastSide.side==="long") pShort = Math.max(0.30, pShort-0.03);
+                  if(lastSide.side==="short") pLong  = Math.max(0.30, pLong -0.03);
                 }
 
-                const costLong=FEES_BPS + Math.max(Math.round(p.spreadBps/2), slipL);
-                const costShort=FEES_BPS + Math.max(Math.round(p.spreadBps/2), slipS);
+                const costLong=COST_BPS + Math.max(Math.round(p.spreadBps/2), slipL);
+                const costShort=COST_BPS + Math.max(Math.round(p.spreadBps/2), slipS);
 
-                // Styles
-                const styleLong = p.trendAlign ? "trend" : (p.squeezeScore>0.25||p.boUp) ? "breakout" : "mr";
-                const styleShort= !p.trendAlign ? "trend" : (p.squeezeScore>0.25||p.boDn) ? "breakout" : "mr";
+                const rrrLong = computeAutoRRR({ p:pLong,  adx:p.adx5, atr_bps:p.atr_bps, cost_bps:costLong,  spread_bps:p.spreadBps, trend_align:(p.upF&&p.upS&&p.up15&&p.up1h), style:p.styleLong,  lvl_gap_bps:p.lvl_gap_long_bps, obi_adj:obiAdjLong });
+                const rrrShort= computeAutoRRR({ p:pShort, adx:p.adx5, atr_bps:p.atr_bps, cost_bps:costShort, spread_bps:p.spreadBps, trend_align:(!p.upF&&!p.upS&&(!p.up15||!p.up1h)), style:p.styleShort, lvl_gap_bps:p.lvl_gap_short_bps, obi_adj:obiAdjShort });
+                const expLong = rrrLong ? Math.round(pLong*rrrLong.tp_bps - (1-pLong)*rrrLong.sl_bps - costLong) : -1e9;
+                const expShort= rrrShort? Math.round(pShort*rrrShort.tp_bps - (1-pShort)*rrrShort.sl_bps - costShort): -1e9;
 
-                const exLong=computeAutoRRR({ p:pLong, adx:p.adx5, atr_bps:p.atr_bps, cost_bps:costLong, spread_bps:p.spreadBps, trend_align:(p.upF&&p.upS&&p.up15&&p.up1h), style:styleLong, lvl_gap_bps:0, obi_adj:Math.max(0,-obi) });
-                const exShort=computeAutoRRR({ p:pShort, adx:p.adx5, atr_bps:p.atr_bps, cost_bps:costShort, spread_bps:p.spreadBps, trend_align:(!p.upF&&!p.upS&&(!p.up15||!p.up1h)), style:styleShort, lvl_gap_bps:0, obi_adj:Math.max(0,+obi) });
-                if(!exLong && !exShort) continue;
+                const y = (()=>{
+                  const arr=[]; for(let i=1;i<p.c5.length;i++) arr.push(Math.log(p.c5[i]/p.c5[i-1])); return arr.slice(-61);
+                })();
+                const X1=fBTC.slice(-y.length), X2=fETH.slice(-y.length), X3=fSOL.slice(-y.length);
+                const {R2} = (function ols(y,f1,f2,f3){
+                  const n=Math.min(y.length,f1.length,f2.length,f3.length); if(n<20) return {R2:0};
+                  const Y=y.slice(-n), X1=f1.slice(-n), X2=f2.slice(-n), X3=f3.slice(-n);
+                  const ym=sum(Y)/n; let sYY=0,sRes=0;
+                  const k=4; const XtX=Array.from({length:k},()=>Array(k).fill(0)); const XtY=Array(k).fill(0);
+                  for(let i=0;i<n;i++){ const row=[1, X1[i]||0, X2[i]||0, X3[i]||0], yi=Y[i]; for(let a=0;a<k;a++){ XtY[a]+=row[a]*yi; for(let b=0;b<k;b++) XtX[a][b]+=row[a]*row[b]; } }
+                  const lam=1e-6; for(let i=0;i<k;i++) XtX[i][i]+=lam;
+                  const M=XtX.map((row,i)=>row.concat([XtY[i]]));
+                  for(let i=0;i<k;i++){ let p=i; for(let r=i+1;r<k;r++) if(Math.abs(M[r][i])>Math.abs(M[p][i])) p=r;
+                    if(Math.abs(M[p][i])<1e-12) return {R2:0}; if(p!==i) [M[i],M[p]]=[M[p],M[i]];
+                    const piv=M[i][i]; for(let j=i;j<=k;j++) M[i][j]/=piv;
+                    for(let r=0;r<k;r++){ if(r===i) continue; const f=M[r][i]; for(let j=i;j<=k;j++) M[r][j]-=f*M[i][j]; } }
+                  const beta=M.map(row=>row[k]);
+                  for(let i=0;i<n;i++){ const row=[1, X1[i]||0, X2[i]||0, X3[i]||0]; let yhat=0; for(let j=0;j<k;j++) yhat+=row[j]*beta[j]; sRes+=(Y[i]-yhat)**2; sYY+=(Y[i]-ym)**2; }
+                  return {R2: clamp(sYY>0? (1-sRes/sYY):0,0,1)};
+                })(y,X1,X2,X3);
 
-                // Confidence via beta (BTC/ETH/SOL)
-                const y = retLog(p.c5);
-                const X1=to5m(kBTC15).slice(-y.length), X2=to5m(kETH15).slice(-y.length), X3=to5m(kSOL15).slice(-y.length);
-                const {R2} = olsR2(y,[X1,X2,X3]);
                 const liq = liqPct.get(c.symbol)||0.5;
-
-                // Wilson LCB
                 const adxF=clamp((p.adx5-16)/14,0,1);
-                let nConf = Math.round(clamp(46 + 26*adxF + 22*liq + 10*Math.abs(obi) - 8*Math.abs(pLong-pShort), 32, 132));
-                const p_lcbL = wilsonLCB(pLong, nConf, WILSON_Z);
-                const p_lcbS = wilsonLCB(pShort,nConf, WILSON_Z);
+                const p_final = expLong>=expShort ? pLong : pShort;
+                const r_used = expLong>=expShort ? rrrLong : rrrShort;
+                const costSide = expLong>=expShort ? costLong : costShort;
+                const fillSide = expLong>=expShort ? fillL : fillS;
+                if(!r_used) continue;
 
-                // EV at pusher (LCB-based)
-                const ev_long  = exLong  ? Math.round(p_lcbL*exLong.tp_bps  - (1-p_lcbL)*exLong.sl_bps  - costLong) : -1e9;
-                const ev_short = exShort ? Math.round(p_lcbS*exShort.tp_bps - (1-p_lcbS)*exShort.sl_bps - costShort): -1e9;
+                const p_lcb=wilsonLCB(p_final, Math.round(clamp(46 + 26*adxF + 22*liq - 34*clamp(R2,0,1), 34, 132)), WILSON_Z);
+                const exp_bps = Math.max(expLong, expShort);
+                const exp_lcb_bps=Math.round(p_lcb*r_used.tp_bps - (1-p_lcb)*r_used.sl_bps - costSide);
 
-                const side = (ev_long>=ev_short) ? "long" : "short";
-                const p_final = side==="long"? pLong : pShort;
-                const p_lcb   = side==="long"? p_lcbL: p_lcbS;
-                const exSide  = side==="long"? exLong : exShort;
-                const costSide= side==="long"? costLong: costShort;
-                const fillSide= side==="long"? fillL  : fillS;
-                const ev_bps  = Math.max(ev_long,ev_short);
+                const dynFloor = Math.max(EXP_LCB_MIN_BPS, Math.round(EXP_LCB_MIN_BPS + (1-liq)*2 + Math.max(0,12-p.spreadBps)/12 + (fillSide<0.70? (8*(0.70-fillSide)) : 0)));
 
-                // Dyn EV floor
-                const micro_adj = Math.round( 2*(1-(liq)) + Math.max(0,12-p.spreadBps)/12 + 8*Math.max(0, 0.70 - (fillSide||0)) );
-                const floor_eff = Math.max(EV_MIN_BPS, micro_adj);
-
-                // Confluence
-                let confl=0;
-                confl += (p.trendAlign ? 0.25 : 0);
-                confl += (Math.abs(p.z_vwap)<=0.5) ? 0.15 : 0;
-                confl += ((side==="long" && p.boUp) || (side==="short" && p.boDn)) ? 0.20 : 0;
-                confl += ((side==="long" && obi>0) || (side==="short" && obi<0)) ? 0.20 : 0;
-                confl += p.squeezeScore*0.20;
-                confl = clamp(confl,0,1);
-
-                const hold_base = (regime.regime==="trend"?720:560) + 240*adxF + 120*p.squeezeScore;
+                const hold_base = (regime.regime==="trend"?720:560) + 240*adxF + 120*(p.squeezeScore||0);
                 const hold_sec = Math.round(clamp(hold_base, TTL_MIN, TTL_MAX));
 
-                const score = Math.round(
-                  1000*ev_bps + 100*((p_lcb-0.5)*100) + 5*(liq) - 2*(p.spreadBps)
-                );
+                const score = clamp(Math.round(60 + 30*(p_final-0.5)*2 + 12*adxF + 7*((liq-0.5)*2) - Math.min(12, Math.max(0,(p.spreadBps-5)/2)) - Math.round(9*clamp(R2,0,1))), 1, 99);
 
                 refined.push({
                   symbol:c.symbol, base:c.base, quote:c.quote, qv:c.qv,
-                  side, p_win:+p_final.toFixed(3), p_lcb:+p_lcb.toFixed(3),
-                  tp_bps: exSide.tp_bps, sl_bps: exSide.sl_bps, rrr: exSide.r_used,
-                  tp_atr_mult: exSide.tp_atr, sl_atr_mult: exSide.sl_atr,
+                  side: (expLong>=expShort? "long":"short"),
+                  p_win:+p_final.toFixed(3), p_lcb:+p_lcb.toFixed(3),
+                  exp_bps, exp_lcb_bps,
+                  tp_bps: r_used.tp_bps, sl_bps: r_used.sl_bps, rrr: r_used.r_used,
+                  tp_atr_mult: r_used.tp_atr, sl_atr_mult: r_used.sl_atr,
                   spread_bps: p.spreadBps, cost_bps: costSide,
                   adx:+(p.adx5||0).toFixed(1), atr_bps:p.atr_bps,
-                  regime: regime.regime, style: (side==="long"?styleLong:styleShort),
-                  n_conf:nConf, obi:+obi.toFixed(3), squeeze:+p.squeezeScore.toFixed(2),
-                  liq_pct:+liq.toFixed(3), fill_prob:+(fillSide||0).toFixed(2),
-                  beta_r2:+(R2||0).toFixed(2),
-                  ev_bps, floor_eff, passEV:(ev_bps>=floor_eff), passFill:((fillSide||0) >= ((liq>=0.8 && p.spreadBps<=6)?0.60:0.65)),
-                  score,
-                  hold_sec,                                     // persist adaptive hold
-                  trend_align_long: (p.upF&&p.upS&&p.up15&&p.up1h),
-                  trend_align_short: (!p.upF&&!p.upS&&(!p.up1h||!p.up15)),
-                  ret5: retLog(p.c5),
+                  regime: regime.regime, style: (expLong>=expShort? p.styleLong: p.styleShort),
+                  score, beta_r2:+R2.toFixed(2), n_conf: Math.round(clamp(46 + 26*adxF + 22*liq - 34*clamp(R2,0,1), 34, 132)),
+                  obi:+obi.toFixed(3), hold_sec, liq_pct:+liq.toFixed(3),
+                  ret5:retLog(p.c5), fill_prob:+(fillSide||0).toFixed(2), dyn_floor: dynFloor,
                   p_long_adj:pLong, p_short_adj:pShort,
                   cost_long:costLong, cost_short:costShort,
-                  style_long:styleLong, style_short:styleShort
+                  style_long:p.styleLong, style_short:p.styleShort,
+                  lvl_gap_long_bps:p.lvl_gap_long_bps, lvl_gap_short_bps:p.lvl_gap_short_bps,
+                  trend_align_long:(p.upF&&p.upS&&p.up15&&p.up1h),
+                  trend_align_short:(!p.upF&&!p.upS&&(!p.up15||!p.up1h))
                 });
               }
 
               // Rank refined
-              refined.sort((a,b)=>
-                   (b.passEV - a.passEV)
-                || (b.passFill - a.passFill)
-                || (b.score - a.score)
-                || (b.p_lcb - a.p_lcb)
-                || (b.ev_bps - a.ev_bps)
-                || (b.qv - a.qv)
-              );
+              refined.sort((a,b)=> b.exp_lcb_bps!==a.exp_lcb_bps ? b.exp_lcb_bps-a.exp_lcb_bps
+                              : b.exp_bps!==a.exp_bps ? b.exp_bps-a.exp_bps
+                              : b.score!==a.score ? b.score-a.score
+                              : b.qv-a.qv);
 
               // Strict picks
-              const CORE_CORR_MAX=0.84;
+              const CORE_CORR_MAX=0.84, OF_CORR_MAX=0.90;
               const rho=(a,b)=>corr(a.ret5||[],b.ret5||[]);
+              const strictOk=(cand)=> cand.p_lcb>=0.60 && cand.exp_lcb_bps>=Math.max(cand.dyn_floor+3, EXP_LCB_MIN_BPS+3)
+                && cand.fill_prob>=0.70 && cand.cost_bps<=Math.max(COST_BPS+8, 18)
+                && cand.spread_bps<=MAX_SPREAD_BPS && cand.beta_r2<=0.75;
+
               const strictPicks=[];
               for(const cand of refined){
-                if(strictPicks.length>=TOP_N) break;
-                if(cand.spread_bps>MAX_SPREAD_BPS) continue;
-                if(!cand.passFill) continue;
-                if(!cand.passEV) continue;
-                if(cand.p_lcb<0.58) continue;
-                if(cand.beta_r2>0.80) continue;
+                if(strictPicks.length>=Math.min(3, TOP_N)) break;
+                if(!strictOk(cand)) continue;
                 let ok=true; for(const s of strictPicks){ if(rho(cand,s)>CORE_CORR_MAX){ ok=false; break; } }
                 if(ok) strictPicks.push(cand);
               }
 
-              let selected=[], selectionTier="strict", forced=false;
-
-              if(strictPicks.length===0){
-                // Fallback: best method (EV@pusher + 2.1 RRR), take top-20 by score and push 3
-                selectionTier="mp_top20";
-                forced=true;
-                const pool = Array.from(refined).sort((a,b)=> b.score-a.score).slice(0,20);
-
-                function enhanceMP(c){
+              let selected=[];
+              if(strictPicks.length>0){
+                selected=strictPicks;
+                selectionTier="strict";
+                reason=(reason!=="ok"?reason:"strict");
+              }else{
+                // MP fallback: take top-20 by score, recompute conservatively, push 3
+                const pool = Array.from(refined).sort((a,b)=> b.score-a.score).slice(0, Math.max(3, MP_TOP_POOL||20));
+                function mpEnhance(c){
                   const pL_long  = wilsonLCB(c.p_long_adj||0.5, c.n_conf||60, WILSON_Z);
                   const pL_short = wilsonLCB(c.p_short_adj||0.5, c.n_conf||60, WILSON_Z);
-
-                  const rrrL=computeAutoRRR({
-                    p:pL_long, adx:+c.adx||0, atr_bps:c.atr_bps, cost_bps:c.cost_long||c.cost_bps, spread_bps:c.spread_bps,
-                    trend_align:!!c.trend_align_long, style:c.style_long||"trend", lvl_gap_bps:0, obi_adj:Math.max(0, -(c.obi||0))
-                  });
-                  const rrrS=computeAutoRRR({
-                    p:pL_short, adx:+c.adx||0, atr_bps:c.atr_bps, cost_bps:c.cost_short||c.cost_bps, spread_bps:c.spread_bps,
-                    trend_align:!!c.trend_align_short, style:c.style_short||"trend", lvl_gap_bps:0, obi_adj:Math.max(0, +(c.obi||0))
-                  });
-
+                  const rrrL = computeAutoRRR({ p:pL_long,  adx:+c.adx||0, atr_bps:c.atr_bps, cost_bps:c.cost_long||c.cost_bps, spread_bps:c.spread_bps, trend_align:!!c.trend_align_long, style:c.style_long||"trend", lvl_gap_bps:c.lvl_gap_long_bps||0, obi_adj:Math.max(0, -(c.obi||0)) });
+                  const rrrS = computeAutoRRR({ p:pL_short, adx:+c.adx||0, atr_bps:c.atr_bps, cost_bps:c.cost_short||c.cost_bps, spread_bps:c.spread_bps, trend_align:!!c.trend_align_short, style:c.style_short||"trend", lvl_gap_bps:c.lvl_gap_short_bps||0, obi_adj:Math.max(0, +(c.obi||0)) });
                   const evL = rrrL ? Math.round(pL_long*rrrL.tp_bps - (1-pL_long)*rrrL.sl_bps - (c.cost_long||c.cost_bps)) : -1e9;
                   const evS = rrrS ? Math.round(pL_short*rrrS.tp_bps - (1-pL_short)*rrrS.sl_bps - (c.cost_short||c.cost_bps)) : -1e9;
-
-                  let side="long", tp_bps=0, sl_bps=0, r_used=0, ev_lcb=-1e9, ev=0;
-                  if(evL>=evS && rrrL){
-                    side="long"; tp_bps=rrrL.tp_bps; sl_bps=rrrL.sl_bps; r_used=rrrL.r_used; ev_lcb=evL;
-                    ev = Math.round((c.p_long_adj||pL_long)*rrrL.tp_bps - (1-(c.p_long_adj||pL_long))*rrrL.sl_bps - (c.cost_long||c.cost_bps));
-                  }else if(rrrS){
-                    side="short"; tp_bps=rrrS.tp_bps; sl_bps=rrrS.sl_bps; r_used=rrrS.r_used; ev_lcb=evS;
-                    ev = Math.round((c.p_short_adj||pL_short)*rrrS.tp_bps - (1-(c.p_short_adj||pL_short))*rrrS.sl_bps - (c.cost_short||c.cost_bps));
-                  }
-                  return { ...c, mp_side:side, mp_tp_bps:tp_bps, mp_sl_bps:sl_bps, mp_rrr:r_used, mp_ev_lcb:ev_lcb, mp_ev:ev };
+                  let mp_side="long", mp_tp_bps=0, mp_sl_bps=0, mp_rrr=0, mp_exp_lcb_bps=-1e9, mp_exp_bps=-1e9;
+                  if(evL>=evS && rrrL){ mp_side="long"; mp_tp_bps=rrrL.tp_bps; mp_sl_bps=rrrL.sl_bps; mp_rrr=rrrL.r_used; mp_exp_lcb_bps=evL; mp_exp_bps=Math.round((c.p_long_adj||pL_long)*rrrL.tp_bps - (1-(c.p_long_adj||pL_long))*rrrL.sl_bps - (c.cost_long||c.cost_bps)); }
+                  else if(rrrS){ mp_side="short"; mp_tp_bps=rrrS.tp_bps; mp_sl_bps=rrrS.sl_bps; mp_rrr=rrrS.r_used; mp_exp_lcb_bps=evS; mp_exp_bps=Math.round((c.p_short_adj||pL_short)*rrrS.tp_bps - (1-(c.p_short_adj||pL_short))*rrrS.sl_bps - (c.cost_short||c.cost_bps)); }
+                  return { ...c, mp_side, mp_tp_bps, mp_sl_bps, mp_rrr, mp_exp_lcb_bps, mp_exp_bps };
                 }
-
-                const poolMP = pool.map(enhanceMP).sort((a,b)=> (b.mp_ev_lcb - a.mp_ev_lcb) || (b.mp_ev - a.mp_ev) || (b.score - a.score));
-
-                const OF_CORR_MAX=0.90;
-                const take=[];
-                for(const cand of poolMP){
-                  if(take.length>=3) break;
-                  let ok=true; for(const s of take){ if(rho(cand,s)>OF_CORR_MAX){ ok=false; break; } }
-                  if(ok) take.push(cand);
-                }
-                if(take.length<3){
-                  for(const cand of poolMP){
-                    if(take.length>=3) break;
-                    if(!take.includes(cand)) take.push(cand);
-                  }
-                }
-                selected = take;
-              }else{
-                selected = strictPicks.slice(0,Math.min(TOP_N, strictPicks.length));
+                const poolMP = pool.map(mpEnhance).sort((a,b)=> (b.mp_exp_lcb_bps - a.mp_exp_lcb_bps) || (b.mp_exp_bps - a.mp_exp_bps) || (b.score - a.score));
+                const take=[]; for(const cand of poolMP){ if(take.length>=3) break; let ok=true; for(const s of take){ if(rho(cand,s)>OF_CORR_MAX){ ok=false; break; } } if(ok) take.push(cand); }
+                if(take.length<3){ for(const cand of poolMP){ if(take.length>=3) break; if(!take.includes(cand)) take.push(cand); } }
+                selected=take; selectionTier="mp_top20"; reason=(reason!=="ok"?reason:"maxpower_top20");
               }
 
-              // Size + TTL
-              const softmax=(arr,t=20)=>{ const ex=arr.map(x=>Math.exp(x/t)); const s=ex.reduce((a,b)=>a+b,0)||1; return ex.map(x=>x/s); };
-              const wEv=softmax(selected.map(x=> (x.mp_ev_lcb??x.ev_bps) ),20);
-
+              // Build picks with absolute limit_at_old_sl
+              const wEv=softmax(selected.map(x=> (x.mp_exp_lcb_bps ?? x.exp_lcb_bps)), 20);
               const picks = selected.map((x,i)=>{
-                const side = (selectionTier==="mp_top20" && x.mp_side) ? x.mp_side : x.side;
-                const tp_bps = (selectionTier==="mp_top20" && x.mp_tp_bps) ? x.mp_tp_bps : x.tp_bps;
-                const sl_bps = (selectionTier==="mp_top20" && x.mp_sl_bps) ? x.mp_sl_bps : x.sl_bps;
+                const sideUsed = (selectionTier==="mp_top20" && x.mp_side) ? x.mp_side : x.side;
+                const tpUsed = (selectionTier==="mp_top20" && x.mp_tp_bps) ? x.mp_tp_bps : x.tp_bps;
+                const slUsed = (selectionTier==="mp_top20" && x.mp_sl_bps) ? x.mp_sl_bps : x.sl_bps;
+
+                const bk = bookMap.get(x.symbol);
+                const mid = (bk?.bid && bk?.ask) ? ((+bk.bid + +bk.ask)/2) : null;
+
+                const slF = slUsed/10000, tpF = tpUsed/10000;
+                const entry_limit = mid==null ? null : (sideUsed==="long" ? mid*(1 - slF) : mid*(1 + slF));
+                const tp_abs = entry_limit==null ? null : (sideUsed==="long" ? entry_limit*(1 + tpF) : entry_limit*(1 - tpF));
+                const sl_abs = entry_limit==null ? null : (sideUsed==="long" ? entry_limit*(1 - slF) : entry_limit*(1 + slF));
+
                 const ttl = clamp(Math.round((x.hold_sec||720) + i*12), TTL_MIN, TTL_MAX);
 
-                const baseSz = sl_bps>0 ? Math.min(220, Math.round(wEv[i]*TARGET_PORT_RISK_BPS/sl_bps*100)) : 0;
+                let size_bps = 0;
+                if(FORCE_SIZE_BPS>0){ size_bps = Math.round(FORCE_SIZE_BPS); }
+                else { size_bps = slUsed>0 ? Math.min(220, Math.round((wEv[i]*TARGET_PORT_RISK_BPS/slUsed)*100)) : 0; }
+
+                // Use LCB matching sideUsed if MP
+                const p_used = (selectionTier==="mp_top20")
+                  ? ((sideUsed==="long") ? wilsonLCB(x.p_long_adj ?? 0.5, x.n_conf ?? 60, WILSON_Z)
+                                         : wilsonLCB(x.p_short_adj ?? 0.5, x.n_conf ?? 60, WILSON_Z))
+                  : x.p_lcb;
 
                 return {
                   symbol: x.base, symbol_full: x.symbol, quote: x.quote,
-                  side, rank:i+1, ttl_sec: ttl,
-                  p_win:x.p_win, p_lcb:x.p_lcb,
-                  tp_bps, sl_bps, rrr: (selectionTier==="mp_top20" && x.mp_rrr) ? x.mp_rrr : x.rrr,
-                  exp_lcb_bps: Math.round(x.p_lcb*tp_bps - (1-x.p_lcb)*sl_bps - x.cost_bps),
-                  ev_bps: (x.mp_ev_lcb ?? x.ev_bps),
+                  side: sideUsed, rank:i+1, ttl_sec: ttl,
+                  p_win:x.p_win, p_lcb: p_used,
+                  tp_bps: tpUsed, sl_bps: slUsed, rrr: (selectionTier==="mp_top20" && x.mp_rrr) ? x.mp_rrr : x.rrr,
+                  exp_lcb_bps: Math.round(p_used*tpUsed - (1-p_used)*slUsed - x.cost_bps),
+                  ev_bps: (x.mp_exp_lcb_bps ?? x.exp_lcb_bps),
                   spread_bps:x.spread_bps, cost_bps:x.cost_bps,
                   adx:x.adx, atr_bps:x.atr_bps, n_conf:x.n_conf, obi:x.obi,
-                  regime:x.regime, style: (selectionTier==="mp_top20" ? (x["style_"+side] || x.style) : x.style),
+                  regime:x.regime, style: (selectionTier==="mp_top20" ? (x["style_"+sideUsed] || x.style) : x.style),
                   liq_pct:x.liq_pct, fill_prob:x.fill_prob,
-                  quality_tag: selectionTier,
-                  ev_mode: "pusher",
-                  size_bps: baseSz
+                  entry_policy:"limit_at_old_sl", entry_type:"limit", activation:"on_fill",
+                  entry_mid: mid, entry_limit, tp_abs, sl_abs,
+                  size_bps, tier: selectionTier
                 };
               });
 
-              // Save cooldown + pending
+              // Save cooldown + pending (persist absolutes)
               try{
                 const nowMs=Date.now(); const ideasTs=new Date(nowMs).toISOString();
                 for(const p of picks){
                   const bk=bookMap.get(p.symbol_full); const mid=bk? (bk.bid+bk.ask)/2 : 0;
+                  const entry_mid = p.entry_mid ?? mid;
+                  const entry_new = p.entry_limit ?? (p.side==="long" ? entry_mid*(1 - p.sl_bps/10000) : entry_mid*(1 + p.sl_bps/10000));
+                  const tp_abs = p.tp_abs ?? (p.side==="long" ? entry_new*(1 + p.tp_bps/10000) : entry_new*(1 - p.tp_bps/10000));
+                  const sl_abs = p.sl_abs ?? (p.side==="long" ? entry_new*(1 - p.sl_bps/10000) : entry_new*(1 + p.sl_bps/10000));
                   state.cooldown[p.symbol]=nowMs;
                   state.cooldown_side[p.symbol]={ side:p.side, ts_ms:nowMs };
                   state.pending.push({
                     ts:ideasTs, ts_ms:nowMs, symbolFull:p.symbol_full, base:p.symbol, quote:p.quote, side:p.side,
-                    entry_price:mid, hold_sec:p.ttl_sec, tp_bps:p.tp_bps, sl_bps:p.sl_bps, regime:p.regime, cost_bps:p.cost_bps
+                    entry_policy:"limit_at_old_sl", entry_mid, entry_price:entry_new, entry_limit:entry_new,
+                    tp_abs, sl_abs, hold_sec:p.ttl_sec, tp_bps:p.tp_bps, sl_bps:p.sl_bps, regime:p.regime, cost_bps:p.cost_bps
                   });
                 }
                 if(state.pending.length>550) state.pending=state.pending.slice(-550);
@@ -725,22 +716,25 @@ jobs:
               }catch(e){ log("state save warn", e?.message||e); }
 
               // POST
-              const metaExtra={
-                exchange:"mexc", exchange_base: BASE,
+              const meta={
+                exchange:"mexc", exchange_base:BASE,
                 counts:{ universe:universe.length, pre:picksRaw.length, refined:refined.length, selected:picks.length },
                 filters:{
-                  dyn_min_qv: dynMinQV, univ_target_min:UNIV_TARGET_MIN, univ_target_max:UNIV_TARGET_MAX,
+                  dyn_min_qv:dynMinQV, univ_target_min:UNIV_TARGET_MIN, univ_target_max:UNIV_TARGET_MAX,
+                  score_cutoff:50, refine_topk:UNIV_TARGET_MAX,
                   max_spread_bps:MAX_SPREAD_BPS, ema_fast:EMA_FAST, ema_slow:EMA_SLOW, adx_p:ADX_P, atr_p:ATR_P, vwap_5m_win:VWAP_5M_WIN,
-                  depth_limit: DEPTH_LIMIT, obi_topn: OBI_TOPN,
+                  depth_limit:DEPTH_LIMIT, obi_topn:OBI_TOPN,
                   cooldown_min: COOLDOWN_MS/60000, flip_guard_min: FLIP_GUARD_MS/60000,
-                  fees_bps:FEES_BPS, notional_usd:NOTIONAL,
-                  ev_mode:"pusher", ev_min_bps:EV_MIN_BPS
+                  fees_bps:COST_BPS, notional_usd:NOTIONAL,
+                  exp_lcb_min_bps:EXP_LCB_MIN_BPS, wilson_z:WILSON_Z,
+                  mp_top_pool: MP_TOP_POOL,
+                  entry_policy: "limit_at_old_sl"
                 },
-                dd_gate:{ pnl24_bps, peak_dd_bps, throttle },
+                dd_gate: (function(){ const s=state.equity||[]; const day=Date.now()-24*3600*1000; let pnl24=0,cum=0,peak=0,dd=0; for(const e of s){ if(e.ts_ms>=day) pnl24+=e.pnl_bps; cum+=e.pnl_bps; if(cum>peak) peak=cum; dd=Math.min(dd,cum-peak); } return { pnl24_bps:Math.round(pnl24), peak_dd_bps:Math.round(dd), throttle }; })(),
                 tod: { active: S_H!=null && E_H!=null, start:S_H, end:E_H },
                 tier: selectionTier
               };
-              const payload={ ts:new Date().toISOString(), mode:"normal", source:"external_pusher", meta:{ origin:"github_actions", reason, ...(metaExtra||{}) }, top_n:picks.length||0, ideas:picks||[] };
+              const payload={ ts:new Date().toISOString(), mode:"normal", source:"external_pusher", meta:{ origin:"github_actions", reason, ...meta }, top_n:picks.length||0, ideas:picks||[] };
 
               console.log(`[gha] pushing ${picks.length} ideas (${selectionTier}) to ${PUSH_URL}`);
               try{
@@ -767,16 +761,26 @@ jobs:
           NODE
           EXIT_CODE=$?
 
-          # Shell fallback if node crashed before posting
+          # Shell-level fallback (in case node crashed before posting)
           set -e
           if [[ $EXIT_CODE -ne 0 ]]; then
-            echo "[gha] node exited ${EXIT_CODE}; sending minimal payload"
-            health_url="${WORKER_PUSH_URL/\/signals\/push/\/health}"
-            curl -sS -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${PUSH_TOKEN}" --max-time 8 "${health_url}" || true
-            now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-            payload='{"ts":"'"$now"'","mode":"normal","source":"external_pusher","meta":{"origin":"github_actions","reason":"fallback_node_error"},"top_n":0,"ideas":[]}'
-            curl -sS -o /tmp/push_resp.txt -w "%{http_code}" -X POST \
-              -H "Content-Type: application/json" -H "Authorization: Bearer ${PUSH_TOKEN}" \
-              --data "${payload}" --max-time 12 "${WORKER_PUSH_URL}" || true
+            echo "[gha] pusher exited with code $EXIT_CODE — sending minimal payload so tail shows a [push] line"
+            if [[ -n "${WORKER_PUSH_URL:-}" ]]; then
+              health_url="${WORKER_PUSH_URL/\/signals\/push/\/health}"
+              echo "[gha] fallback health GET ${health_url}"
+              curl -sS -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${PUSH_TOKEN}" --max-time 8 "${health_url}" || true
+              now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+              payload='{"ts":"'"$now"'","mode":"normal","source":"external_pusher","meta":{"origin":"github_actions","reason":"fallback_node_error"},"top_n":0,"ideas":[]}'
+              echo "[gha] pushing 0 ideas to ${WORKER_PUSH_URL}"
+              curl -sS -o /tmp/push_resp.txt -w "%{http_code}" -X POST \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer ${PUSH_TOKEN}" \
+                --data "${payload}" \
+                --max-time 12 \
+                "${WORKER_PUSH_URL}" || true
+            else
+              echo "[gha] WORKER_PUSH_URL is empty; skip fallback curl"
+            fi
             exit 0
           fi
+```
