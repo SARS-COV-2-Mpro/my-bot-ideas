@@ -782,4 +782,4 @@ steps:
           --data "${payload}" --max-time 12 "${WORKER_PUSH_URL}" || true
         exit 0
       fi
-NODE
+
