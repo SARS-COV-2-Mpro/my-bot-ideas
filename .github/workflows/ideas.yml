@@ -3,7 +3,7 @@ name: Ideas Pusher (MEXC ULTIMATE EV@Pusher+, Stochastic Pro, GP PRC+)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/45 * * * *"
+    - cron: "*/20 * * * *"
 
 permissions:
   contents: read
