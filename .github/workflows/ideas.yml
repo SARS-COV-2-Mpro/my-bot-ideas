@@ -398,7 +398,7 @@ jobs:
             // ---------- State (Gist) ----------
             async function loadState(){
               const token=process.env.GIST_TOKEN, id=process.env.GIST_ID;
-              const init={ v:"mexc-ultimate-4.0-stoch", cooldown:{}, cooldown_side:{}, pending:[], equity:[], gp_data:[] };
+              const init={ v:"mexc-ultimate-4.0-stoch", cooldown:{}, cooldown_side:{}, pending:[], equity:[], gp_data:[], closed:[] };
               if(!token||!id) return { state:init, persist:null };
               try{
                 const r=await fetchWithTimeout(`https://api.github.com/gists/${id}`,{ headers:{Authorization:`Bearer ${token}`,"Accept":"application/vnd.github+json","User-Agent":UA}}); if(!r.ok) return { state:init, persist:null };
@@ -458,14 +458,38 @@ jobs:
                 if(!filled){ keep.push(p); continue; }
                 const ret = long? (exitPx/entry - 1) : (entry/exitPx - 1);
                 const pnl_bps = Math.round(ret*10000) - (p.cost_bps||0);
-                state.equity.push({ ts_ms:p.ts_ms, pnl_bps });
+
+                // Labeled equity (tier/mp_fill for later analysis)
+                state.equity.push({ ts_ms:p.ts_ms, pnl_bps, tier:p.tier, mp_fill: !!p.mp_fill });
+                if(state.equity.length>6000) state.equity = state.equity.slice(-6000);
+
+                // Optional labeled closed trade record
+                try{
+                  state.closed = Array.isArray(state.closed) ? state.closed : [];
+                  state.closed.push({
+                    ts_ms: p.ts_ms,
+                    symbolFull: p.symbolFull,
+                    base: p.base,
+                    quote: p.quote,
+                    side: p.side,
+                    tier: p.tier,
+                    mp_fill: !!p.mp_fill,
+                    pnl_bps,
+                    tp_bps: p.tp_bps,
+                    sl_bps: p.sl_bps,
+                    cost_bps: p.cost_bps,
+                    regime: p.regime
+                  });
+                  if(state.closed.length>5000) state.closed = state.closed.slice(-5000);
+                }catch{}
+
+                // GP training data
                 if(Array.isArray(p.gp_feat) && p.gp_feat.length){
-                  state.gp_data.push({ x:p.gp_feat, y: pnl_bps>0 ? 1:0 });
+                  state.gp_data.push({ x:p.gp_feat, y: pnl_bps>0 ? 1:0, tier: p.tier, mp_fill: !!p.mp_fill });
                   if(state.gp_data.length>600) state.gp_data=state.gp_data.slice(-600);
                 }
               }
               state.pending = keep;
-              if(state.equity.length>6000) state.equity = state.equity.slice(-6000);
             }
             const equityStats=(eq)=>{ const day=Date.now()-24*3600*1000; let pnl24=0,cum=0,peak=0,dd=0;
               for(const e of eq){ if(e.ts_ms>=day) pnl24+=e.pnl_bps; cum+=e.pnl_bps; if(cum>peak) peak=cum; dd=Math.min(dd,cum-peak); }
@@ -578,6 +602,8 @@ jobs:
 
               // State & DD gate
               const { state, persist } = await loadState();
+              // Ensure new arrays exist on older state
+              if(!Array.isArray(state.closed)) state.closed=[];
               try{ await evalPending(state); }catch(e){ log("evalPending warn", e?.message||e); }
               const { pnl24_bps, peak_dd_bps } = equityStats(state.equity);
               const throttle = (pnl24_bps<=DD_24H_LIMIT_BPS) || (peak_dd_bps<=DD_PEAK_LIMIT_BPS);
@@ -1003,7 +1029,9 @@ jobs:
                     ts:ideasTs, ts_ms:nowMs, symbolFull:p.symbol_full, base:p.symbol, quote:p.quote, side:p.side,
                     entry_policy:"limit_at_old_sl", entry_mid, entry_price:entry_new, entry_limit:entry_new,
                     tp_abs, sl_abs, hold_sec:p.ttl_sec, tp_bps:p.tp_bps, sl_bps:p.sl_bps, regime:p.regime, cost_bps:p.cost_bps,
-                    gp_feat: p.gp_feat
+                    gp_feat: p.gp_feat,
+                    tier: p.tier, mp_fill: !!p.mp_fill,
+                    p_lcb: p.p_lcb, exp_lcb_bps: p.exp_lcb_bps
                   });
                 }
                 if(state.pending.length>550) state.pending=state.pending.slice(-550);
@@ -1061,6 +1089,33 @@ jobs:
               }
             }
           })();
+
+          // ---- Helpers for HMM Gaussian ----
+          function mvnPdf(x, mu, Sig){
+            const d=mu.length;
+            const A=Sig;
+            const L=(function cholesky(A){
+              const n=A.length; const L=Array.from({length:n},()=>Array(n).fill(0));
+              for(let i=0;i<n;i++){
+                for(let j=0;j<=i;j++){
+                  let s=0; for(let k=0;k<j;k++) s+=L[i][k]*L[j][k];
+                  const v=A[i][j]-s;
+                  if(i===j){ if(v<=1e-12) return null; L[i][j]=Math.sqrt(v); }
+                  else { L[i][j]=v/(L[j][j]||1e-12); }
+                }
+              }
+              return L;
+            })(A);
+            if(!L) return 1e-18;
+            // Solve (L L^T) y = (x-mu)
+            const y=Array(d).fill(0); const z=Array(d).fill(0);
+            for(let i=0;i<d;i++){ let s=0; for(let k=0;k<i;k++) s+=L[i][k]*y[k]; y[i]=((x[i]-mu[i]) - s)/(L[i][i]||1e-12); }
+            for(let i=d-1;i>=0;i--){ let s=0; for(let k=i+1;k<d;k++) s+=L[k][i]*z[k]; z[i]=(y[i]-s)/(L[i][i]||1e-12); }
+            let quad=0; for(let i=0;i<d;i++) quad+=z[i]*z[i];
+            const det = L.reduce((acc, row, i)=> acc * (row[i]||1e-12), 1);
+            const norm = Math.pow(2*Math.PI, -d/2) * Math.pow(det, -1);
+            return Math.max(1e-18, norm * Math.exp(-0.5 * quad));
+          }
           NODE
           EXIT_CODE=$?
 
