@@ -52,11 +52,6 @@ jobs:
       MAX_COST_BPS_HARD: ${{ vars.MAX_COST_BPS_HARD }}
       EDGE_COST_MULT_MIN: ${{ vars.EDGE_COST_MULT_MIN }}
 
-      # Symmetric long-side guards (optional overrides; defaults are enabled)
-      NO_LONG_DOWN_ENABLE: ${{ vars.NO_LONG_DOWN_ENABLE }}        # default "true"
-      LONG_DOWN_RSI_CUTOFF: ${{ vars.LONG_DOWN_RSI_CUTOFF }}      # default "40"
-      LONG_MR_DIVERGENCE_REQ: ${{ vars.LONG_MR_DIVERGENCE_REQ }}  # default "true"
-
     steps:
       - name: Setup Node 20
         uses: actions/setup-node@v4
@@ -398,11 +393,6 @@ jobs:
             const MR_TP_ATR_MIN = Number(process.env.MR_TP_ATR_MIN||"0.8");
             const MR_TP_ATR_MAX = Number(process.env.MR_TP_ATR_MAX||"1.2");
 
-            // Symmetric long-side guards (defaults ON; configurable via env)
-            const NO_LONG_DOWN_ENABLE   = (process.env.NO_LONG_DOWN_ENABLE || "true").toLowerCase() === "true";
-            const LONG_DOWN_RSI_CUTOFF  = Number(process.env.LONG_DOWN_RSI_CUTOFF || "40");
-            const LONG_MR_DIVERGENCE_REQ= (process.env.LONG_MR_DIVERGENCE_REQ || "true").toLowerCase() === "true";
-
             // Always-3 fallback (defaults inside code; can override via env but not required)
             const ALWAYS3_ENABLE = (process.env.ALWAYS3_ENABLE||"true").toLowerCase()==="true";
             const ALWAYS3_SIZE_FACTOR = Number(process.env.ALWAYS3_SIZE_FACTOR||"0.4");
@@ -412,6 +402,21 @@ jobs:
             const ALWAYS3_SL_ATR = Number(process.env.ALWAYS3_SL_ATR||"0.5");
             const ALWAYS3_TP_ATR = Number(process.env.ALWAYS3_TP_ATR||"1.0");
             const ALWAYS3_SKIP_COOLDOWN = (process.env.ALWAYS3_SKIP_COOLDOWN||"false").toLowerCase()==="true";
+
+            // ---------- Long policy (stricter for "Up" bets) ----------
+            const LONG_MAX_COST_BPS = Number(process.env.LONG_MAX_COST_BPS || "12");          // strict cap on total long cost
+            const LONG_EDGE_MULT_MIN = Number(process.env.LONG_EDGE_MULT_MIN || "4");        // TP >= 4x total cost
+            const LONG_BOUNCE_SL_ATR = Number(process.env.LONG_BOUNCE_SL_ATR || "0.50");    // tighter SL
+            const LONG_BOUNCE_TP_ATR = Number(process.env.LONG_BOUNCE_TP_ATR || "0.90");    // tighter TP
+            const LONG_BOUNCE_HOLD_MIN_SEC = Number(process.env.LONG_BOUNCE_HOLD_MIN_SEC || "900");
+            const LONG_BOUNCE_HOLD_MAX_SEC = Number(process.env.LONG_BOUNCE_HOLD_MAX_SEC || "2400");
+            const LONG_ENTRY_BOUNCE_OFFSET = Number(process.env.LONG_ENTRY_BOUNCE_OFFSET || "0.0015"); // +0.15% above recent swing low
+            const LONG_SIMILARITY_RHO = Number(process.env.LONG_SIMILARITY_RHO || "0.84");   // one long per cluster threshold
+            const LONG_KILL_MIN_TRADES = Number(process.env.LONG_KILL_MIN_TRADES || "20");
+            const LONG_KILL_WINRATE = Number(process.env.LONG_KILL_WINRATE || "0.20");
+            const LONG_KILL_SIZE_MULT = Number(process.env.LONG_KILL_SIZE_MULT || "0.5");
+            const LONG_NAUGHTY_BASES = new Set(String(process.env.LONG_NAUGHTY_BASES || "EDU,THE,HEMI,COOKIE,MNT,ASTER")
+              .split(",").map(s=>s.trim().toUpperCase()).filter(Boolean));
 
             // ---------- Worker endpoints ----------
             const PUSH_URL=process.env.WORKER_PUSH_URL||"";
@@ -479,7 +484,7 @@ jobs:
                 const long=p.side==="long";
                 const entry = Number.isFinite(p.entry_limit) ? p.entry_limit : p.entry_price;
                 const tpB=(p.tp_bps||0)/10000, slB=(p.sl_bps||0)/10000;
-                const limitAtSL = p.entry_policy==="limit_at_old_sl";
+                const limitAtSL = p.entry_policy==="limit_at_old_sl" || p.entry_policy==="smart_swing_limit";
 
                 let exitPx=closes.at(-1), filled=false;
                 if(limitAtSL){
@@ -620,6 +625,24 @@ jobs:
               const kBTC1H=await fetchK(BTC,"1h",K1H);
               const kETH1H=await fetchK(ETH,"1h",K1H);
 
+              // BTC uptrend + small recent rise green light
+              function uptrendTF(k, fast=EMA_FAST, slow=EMA_SLOW){
+                if(!k?.length) return { up:false, last:null };
+                const c=k.map(x=>+x[4]);
+                const emF=ema(c, fast), emS=ema(c, slow);
+                const last=c.at(-1);
+                return { up: (last>=emF && last>=emS), last };
+              }
+              const btc15 = uptrendTF(kBTC15, EMA_FAST, EMA_SLOW);
+              const btc1h = uptrendTF(kBTC1H, EMA_FAST, EMA_SLOW);
+              let btcRoc15 = 0; try{
+                const c = kBTC15?.map(x=>+x[4])||[];
+                const prev3 = c.at(-4)||c.at(-2)||c.at(-1)||0;
+                const last  = c.at(-1)||0;
+                btcRoc15 = prev3 ? (last/prev3 - 1) : 0;
+              }catch{}
+              const btcGreen = (btc15.up && btc1h.up && btcRoc15 > 0.001);
+
               // Regime HMM
               function regimeFeatures(k15){
                 if(!k15||k15.length<ADX_P+5) return [];
@@ -693,6 +716,19 @@ jobs:
                 const Y = state.gp_data?.map(d=>d.y)||[];
                 if(X.length>=20) gpModel = buildGP(X.slice(-400), Y.slice(-400), 0.12);
               }catch(e){ log("gp build warn", e?.message||e); }
+
+              // Long kill-switch (pause poor long performance)
+              let longKill=false, longKillStats={ total:0, wins:0, winrate:0, pnl_sum:0 };
+              try{
+                const closed = Array.isArray(state.closed) ? state.closed.slice(-200) : [];
+                const longs = closed.filter(x=>x.side==="long");
+                const total = longs.length;
+                const wins  = longs.filter(x=> (x.pnl_bps||0) > 0).length;
+                const pnlSum = sum(longs.map(x=>x.pnl_bps||0));
+                const wr = total>0 ? wins/total : 0;
+                longKill = (total >= LONG_KILL_MIN_TRADES) && ((wr < LONG_KILL_WINRATE) || (pnlSum < 0));
+                longKillStats = { total, wins, winrate:+wr.toFixed(3), pnl_sum:Math.round(pnlSum) };
+              }catch(e){ log("longKill compute warn", e?.message||e); }
 
               // Liquidity pct rank
               const liqPct=new Map(); for(let i=0;i<universe.length;i++){ liqPct.set(universe[i].symbol,(universe.length===1)?1:1 - i/(universe.length-1)); }
@@ -775,13 +811,6 @@ jobs:
                                     || ((rsi14||0) > 60)
                                     || (function hhhl(){ if(h5.length<3||l5.length<3) return false; const H=h5.slice(-3), L=l5.slice(-3); return (H[2]>H[1] && H[1]>H[0] && L[2]>L[1] && L[1]>L[0]); })();
 
-                    // NEW: No-long in downtrend (symmetric)
-                    const noLongDown = NO_LONG_DOWN_ENABLE && (
-                      ((em20!=null && em50!=null) ? (em20<em50 && last<em20) : false)
-                      || ((rsi14||0) < LONG_DOWN_RSI_CUTOFF)
-                      || (function llll(){ if(h5.length<3||l5.length<3) return false; const H=h5.slice(-3), L=l5.slice(-3); return (H[2]<H[1] && H[1]<H[0] && L[2]<L[1] && L[1]<L[0]); })()
-                    );
-
                     // Simple divergence gate for shorts (optional, only when trying to fade)
                     const bb = bollinger(c5,20,2);
                     const rsiPrev3 = rsi(c5.slice(0,-2),14);
@@ -789,12 +818,6 @@ jobs:
                     const rsiLowerHigh = (rsiPrev5!=null && rsiPrev3!=null && rsi14!=null) ? (rsiPrev3>rsiPrev5 && rsi14<rsiPrev3) : false;
                     const obvNeg = obvDelta(c5,v5) < 0;
                     const fadeShortDivergenceOK = ((bb.up!=null && last>bb.up) && rsiLowerHigh) || ((bb.z||0) > 2 && obvNeg);
-
-                    // NEW: Symmetric bullish divergence gate for MR longs
-                    const rsiHigherLow = (rsiPrev5!=null && rsiPrev3!=null && rsi14!=null) ? (rsiPrev3<rsiPrev5 && rsi14>rsiPrev3) : false;
-                    const obvPos = obvDelta(c5,v5) > 0;
-                    const fadeLongDivergenceOK_raw = ((bb.dn!=null && last<bb.dn) && rsiHigherLow) || ((bb.z||0) < -2 && obvPos);
-                    const fadeLongDivergenceOK = LONG_MR_DIVERGENCE_REQ ? fadeLongDivergenceOK_raw : true;
 
                     const s1=tanh(roc5/0.0030), s2=tanh(roc15/0.0065);
                     const adxF=clamp((adx5-16)/14,0,1);
@@ -842,8 +865,6 @@ jobs:
                       lvl_gap_long_bps, lvl_gap_short_bps, signalScore,
                       em20, em50, em200, slope_atr50, dcHi, dcLo, breakout, mrLocked,
                       rsi14, bb, obvNeg, fadeShortDivergenceOK, noShortUp,
-                      // NEW symmetric long-side fields
-                      obvPos, fadeLongDivergenceOK, noLongDown,
                       vol1h_est_usd
                     };
                   }catch{ return null; }
@@ -889,7 +910,7 @@ jobs:
 
                     const vwapFill=(levels,targetUSD)=>{
                       let remain=targetUSD,val=0,qty=0;
-                      for(const [ps,qs] of levels){ const p=+ps,q=+qs; if(!(p>0&&q>0)) continue; const can=p*q, take=Math.min(remain,can), tq=take/p;
+                      for(const [ps,qs] of levels){ const p=+ps,q=+qs; if(!(p>0&&q>0)) continue; const can=p*q,wgt=Math.exp(-0.0); const take=Math.min(remain,can), tq=take/p;
                         val+=p*tq; qty+=tq; remain-=take; if(remain<=1e-6) break; }
                       return { px: qty>0? val/qty : null, filledUSD: (targetUSD-remain) };
                     };
@@ -908,23 +929,24 @@ jobs:
                     depth1pUSD = depth1p;
                   }
 
-                  // Side allowance: env + trend bias + no-short/long guards
+                  // Side allowance: env + trend bias + long-only new rules (multi-TF + BTC green + naughty + kill-switch)
                   const bias = (p.em50!=null && p.em200!=null) ? (p.em50>p.em200 ? "long_only" : p.em50<p.em200 ? "short_only" : "both") : "both";
                   const envAllowed = (dir)=>ALLOWED.has(dir);
                   const biasAllows = (dir)=> bias==="both" ? true : (bias==="long_only"? dir==="long" : dir==="short");
                   const shortAllowedByTrend = (!p.noShortUp);
-                  const longAllowedByTrend  = (!p.noLongDown); // NEW symmetric guard
-                  const allowedLong = envAllowed("long")  && biasAllows("long")  && longAllowedByTrend; // NEW
-                  const allowedShort= envAllowed("short") && biasAllows("short") && shortAllowedByTrend;
-                  if(!allowedLong && !allowedShort){ gatingDropCounts.direction++; continue; }
+                  const coinUpMultiTF = (p.up15 && p.up1h);
+                  const baseUp = (c.base||"").toUpperCase();
+                  const coinNotNaughty = !LONG_NAUGHTY_BASES.has(baseUp);
 
                   // Costs per side
                   const costLong=COST_BPS + Math.max(Math.round(p.spreadBps/2), slipL);
                   const costShort=COST_BPS + Math.max(Math.round(p.spreadBps/2), slipS);
                   const costMaxOK = Math.max(costLong,costShort) <= MAX_COST_BPS_HARD;
-
-                  // Liquidity/cost gates
                   if(!costMaxOK){ gatingDropCounts.liqCost++; continue; }
+
+                  const allowedShort = envAllowed("short") && biasAllows("short") && shortAllowedByTrend;
+                  let allowedLong = envAllowed("long")  && biasAllows("long") && coinUpMultiTF && btcGreen && coinNotNaughty && !longKill && (costLong <= LONG_MAX_COST_BPS);
+
                   if(p.vol1h_est_usd < MIN_VOL_1H_USD){ gatingDropCounts.vol1h++; continue; }
                   if(depth1pUSD < DEPTH_1P_MIN_USD){ gatingDropCounts.depth++; continue; }
 
@@ -977,28 +999,32 @@ jobs:
                   let candLong=null, candShort=null;
                   const stepsBase=Math.max(1,Math.round(hold_base/300));
 
-                  // Long side
+                  // Long side (bounce-style exits + strict costs/edge)
                   if(allowedLong){
-                    const mrOkL = allowMR("long") && p.fadeLongDivergenceOK; // NEW symmetric divergence requirement
-                    let styleL = mrOkL ? "mr" : (strongTrend ? "momentum" : "trend");
-                    let holdL = styleL==="mr" ? clamp(Math.round(Math.max(1800, hold_base)), 1200, 3600) : hold_base;
+                    let styleL = allowMR("long") ? "mr" : (strongTrend ? "momentum" : "trend");
+                    let holdL = clamp(Math.round(Math.max(LONG_BOUNCE_HOLD_MIN_SEC, Math.min(hold_base, LONG_BOUNCE_HOLD_MAX_SEC))), LONG_BOUNCE_HOLD_MIN_SEC, LONG_BOUNCE_HOLD_MAX_SEC);
                     let tpL=0, slL=0;
 
                     if(styleL==="mr"){
-                      const m=mrTP_SL(p.atr_bps);
-                      slL=m.sl_bps; tpL=m.tp_bps;
-                      if(tpL < EDGE_COST_MULT_MIN*(COST_BPS + Math.max(Math.round(p.spreadBps/2), 0))){ gatingDropCounts.edgeCost++; styleL = strongTrend? "momentum":"trend"; }
-                    }
-                    if(styleL!=="mr"){
-                      const rrrDynLong  = optimizeRRR_MC({ atr_bps:p.atr_bps, cost_bps:COST_BPS + Math.max(Math.round(p.spreadBps/2), 0), spread_bps:p.spreadBps, entry:entryMid, side:"long",  mu:mu5, sigma:sig5, ttl_sec:holdL });
+                      slL = Math.round(LONG_BOUNCE_SL_ATR * p.atr_bps);
+                      tpL = Math.round(LONG_BOUNCE_TP_ATR * p.atr_bps);
+                    }else{
+                      const rrrDynLong  = optimizeRRR_MC({ atr_bps:p.atr_bps, cost_bps:costLong, spread_bps:p.spreadBps, entry:entryMid, side:"long",  mu:mu5, sigma:sig5, ttl_sec:holdL });
                       if(rrrDynLong){ tpL=rrrDynLong.tp_bps; slL=rrrDynLong.sl_bps; }
+                      slL = Math.round(clamp(slL, Math.round(0.35*p.atr_bps), Math.round(0.60*p.atr_bps)));
+                      tpL = Math.round(clamp(tpL, Math.round(0.60*p.atr_bps), Math.round(1.00*p.atr_bps)));
                     }
 
                     if(tpL && slL){
-                      const evL = gbmSimEV({ entry:entryMid, tp_bps:tpL, sl_bps:slL, side:"long",  mu:mu5, sigma:sig5, dt:1, steps:stepsBase, N:192, cost_bps:COST_BPS + Math.max(Math.round(p.spreadBps/2), 0) });
-                      const pLCB = pLong_lcb;
-                      const evLongLCB = Math.round(pLCB*tpL - (1-pLCB)*slL - (COST_BPS + Math.max(Math.round(p.spreadBps/2), 0)));
-                      candLong = { side:"long", p_lcb:pLCB, cost_bps:(COST_BPS + Math.max(Math.round(p.spreadBps/2), 0)), tp_bps:tpL, sl_bps:slL, exp_lcb_bps:evLongLCB, exp_bps:evL.ev_bps, hold_sec:holdL, style:styleL };
+                      // Strict 4x edge and cost cap
+                      if(tpL >= LONG_EDGE_MULT_MIN * costLong){
+                        const evL = gbmSimEV({ entry:entryMid, tp_bps:tpL, sl_bps:slL, side:"long",  mu:mu5, sigma:sig5, dt:1, steps:stepsBase, N:192, cost_bps:costLong });
+                        const pLCB = pLong_lcb;
+                        const evLongLCB = Math.round(pLCB*tpL - (1-pLCB)*slL - costLong);
+                        candLong = { side:"long", p_lcb:pLCB, cost_bps:costLong, tp_bps:tpL, sl_bps:slL, exp_lcb_bps:evLongLCB, exp_bps:evL.ev_bps, hold_sec:holdL, style:styleL };
+                      } else {
+                        gatingDropCounts.edgeCost++;
+                      }
                     }
                   }
 
@@ -1015,21 +1041,21 @@ jobs:
                       if(tpS < EDGE_COST_MULT_MIN*(COST_BPS + Math.max(Math.round(p.spreadBps/2), 0))){ gatingDropCounts.edgeCost++; styleS = strongTrend? "momentum":"trend"; }
                     }
                     if(styleS!=="mr"){
-                      const rrrDynShort = optimizeRRR_MC({ atr_bps:p.atr_bps, cost_bps:COST_BPS + Math.max(Math.round(p.spreadBps/2), 0), spread_bps:p.spreadBps, entry:entryMid, side:"short", mu:mu5, sigma:sig5, ttl_sec:holdS });
+                      const rrrDynShort = optimizeRRR_MC({ atr_bps:p.atr_bps, cost_bps:costShort, spread_bps:p.spreadBps, entry:entryMid, side:"short", mu:mu5, sigma:sig5, ttl_sec:holdS });
                       if(rrrDynShort){ tpS=rrrDynShort.tp_bps; slS=rrrDynShort.sl_bps; }
                     }
 
                     if(tpS && slS){
-                      const evS = gbmSimEV({ entry:entryMid, tp_bps:tpS, sl_bps:slS, side:"short", mu:mu5, sigma:sig5, dt:1, steps:stepsBase, N:192, cost_bps:COST_BPS + Math.max(Math.round(p.spreadBps/2), 0) });
+                      const evS = gbmSimEV({ entry:entryMid, tp_bps:tpS, sl_bps:slS, side:"short", mu:mu5, sigma:sig5, dt:1, steps:stepsBase, N:192, cost_bps:costShort });
                       const pLCB = pShort_lcb;
-                      const evShortLCB = Math.round(pLCB*tpS - (1-pLCB)*slS - (COST_BPS + Math.max(Math.round(p.spreadBps/2), 0)));
-                      candShort = { side:"short", p_lcb:pLCB, cost_bps:(COST_BPS + Math.max(Math.round(p.spreadBps/2), 0)), tp_bps:tpS, sl_bps:slS, exp_lcb_bps:evShortLCB, exp_bps:evS.ev_bps, hold_sec:holdS, style:styleS };
+                      const evShortLCB = Math.round(pLCB*tpS - (1-pLCB)*slS - costShort);
+                      candShort = { side:"short", p_lcb:pLCB, cost_bps:costShort, tp_bps:tpS, sl_bps:slS, exp_lcb_bps:evShortLCB, exp_bps:evS.ev_bps, hold_sec:holdS, style:styleS };
                     }
                   }
 
                   // Edge vs cost (final check for all)
                   function edgeOk(cand){ return cand && (cand.tp_bps >= EDGE_COST_MULT_MIN * cand.cost_bps); }
-                  if(candLong && !edgeOk(candLong)){ gatingDropCounts.edgeCost++; candLong=null; }
+                  if(candLong && !edgeOk(candLong)){ gatingDropCounts.edgeCost++; candLong=null; } // should pass 4x anyway
                   if(candShort && !edgeOk(candShort)){ gatingDropCounts.edgeCost++; candShort=null; }
 
                   // Choose side by EV LCB among allowed candidates
@@ -1091,7 +1117,8 @@ jobs:
                     depth1p_usd: depth1pUSD,
                     direction_env: DIRECTION,
                     side_bias: bias,
-                    mr_lockout_until: state.mr_lockout?.[c.symbol]||0
+                    mr_lockout_until: state.mr_lockout?.[c.symbol]||0,
+                    swing_lo_px: pLow15
                   });
                 }catch(err){
                   log("refine warn", (REFINE_SRC[idx]?.c?.symbol)||"unknown", err?.message||err);
@@ -1109,9 +1136,21 @@ jobs:
               // Strict picks
               const CORE_CORR_MAX=0.84;
               const rho=(a,b)=>corr(a.ret5||[],b.ret5||[]);
-              const strictOk=(cand)=> cand.p_lcb>=0.60 && cand.exp_lcb_bps>=Math.max(cand.dyn_floor+3, EXP_LCB_MIN_BPS+3)
-                && (cand.fill_prob||0)>=0.70 && (cand.cost_bps||999)<=Math.max(COST_BPS+8, 18)
-                && cand.spread_bps<=MAX_SPREAD_BPS && cand.beta_r2<=0.75;
+              const strictOk=(cand)=> {
+                const common = cand.p_lcb>=0.60
+                  && cand.exp_lcb_bps>=Math.max(cand.dyn_floor+3, EXP_LCB_MIN_BPS+3)
+                  && (cand.fill_prob||0)>=0.70
+                  && cand.spread_bps<=MAX_SPREAD_BPS
+                  && cand.beta_r2<=0.75;
+                if(!common) return false;
+                if(cand.side==="long"){
+                  if(cand.cost_bps > LONG_MAX_COST_BPS) return false;
+                  if(cand.tp_bps < LONG_EDGE_MULT_MIN * cand.cost_bps) return false;
+                }else{
+                  if(cand.cost_bps > Math.max(COST_BPS+8, 18)) return false;
+                }
+                return true;
+              };
 
               const TARGET_K = Math.min(3, TOP_N || 3);
 
@@ -1119,7 +1158,12 @@ jobs:
               for(const cand of refined){
                 if(strictPicks.length>=TARGET_K) break;
                 if(!strictOk(cand)) continue;
-                let ok=true; for(const s of strictPicks){ if(rho(cand,s)>CORE_CORR_MAX){ ok=false; break; } }
+                let ok=true; 
+                for(const s of strictPicks){ 
+                  const r=rho(cand,s); 
+                  if(cand.side==="long" && s.side==="long" && r>LONG_SIMILARITY_RHO){ ok=false; break; }
+                  if(r>CORE_CORR_MAX){ ok=false; break; }
+                }
                 if(ok) strictPicks.push(cand);
               }
 
@@ -1165,7 +1209,7 @@ jobs:
                 }
               }
 
-              // New Tier 4: Always-3 fallback from picksAny
+              // New Tier 4: Always-3 fallback from picksAny (respect long rules)
               const selectedBeforeAlways3 = selected.length;
               if (ALWAYS3_ENABLE && selected.length < TARGET_K && picksAny.length>0){
                 const pool = picksAny.slice().sort((a,b)=>{
@@ -1184,25 +1228,24 @@ jobs:
                   if (have.has(p.c.symbol)) continue;
                   if ((p.signalScore||0) < ALWAYS3_MIN_SCORE) continue;
 
-                  // Side allowance: env + trend bias + no-short/long guards
+                  // Side allowance with new long rules
                   const bias = (p.em50!=null && p.em200!=null) ? (p.em50>p.em200 ? "long_only" : p.em50<p.em200 ? "short_only" : "both") : "both";
                   const envAllowed = (dir)=>ALLOWED.has(dir);
                   const biasAllows = (dir)=> bias==="both" ? true : (bias==="long_only"? dir==="long" : dir==="short");
-                  const allowedLong = envAllowed("long")  && biasAllows("long")  && !p.noLongDown; // NEW symmetric guard here too
-                  const allowedShort= envAllowed("short") && biasAllows("short") && !p.noShortUp;
-                  if(!allowedLong && !allowedShort) continue;
+                  const allowedLongFB  = envAllowed("long")  && biasAllows("long") && (p.up15 && p.up1h) && btcGreen && !LONG_NAUGHTY_BASES.has(p.c.base.toUpperCase()) && !longKill;
+                  const allowedShortFB = envAllowed("short") && biasAllows("short") && !p.noShortUp;
+                  if(!allowedLongFB && !allowedShortFB) continue;
 
                   const bk=bookMap.get(p.c.symbol); if(!bk?.bid||!bk?.ask) continue;
                   const mid=(bk.bid+bk.ask)/2;
-                  const sideWanted = (!allowedShort && allowedLong) ? "long"
-                                    : (!allowedLong && allowedShort) ? "short"
+                  const baseCost = COST_BPS + Math.round((p.spreadBps||0)/2);
+
+                  const sideWanted = (!allowedShortFB && allowedLongFB) ? "long"
+                                    : (!allowedLongFB && allowedShortFB) ? "short"
                                     : (p.pLong0 >= p.pShort0 ? "long" : "short");
 
-                  const sl_bps = Math.max(4, Math.round(ALWAYS3_SL_ATR * (p.atr_bps||40)));
-                  const tp_bps = Math.max(sl_bps+1, Math.round(ALWAYS3_TP_ATR * (p.atr_bps||40)));
-                  const cost_bps = COST_BPS + Math.round((p.spreadBps||0)/2);
+                  if(sideWanted==="long" && baseCost>LONG_MAX_COST_BPS) continue;
 
-                  // GP-adjust LCB (fallback-friendly)
                   const rsiVal = p.rsi14;
                   const gp_feat_long  = [ clamp((p.adx5-16)/14,0,1), clamp(p.z_vwap,-3,3), (rsiVal||50)/100, 0 ];
                   const gp_feat_short = [ clamp((p.adx5-16)/14,0,1), clamp(-p.z_vwap,-3,3), (100-(rsiVal||50))/100, 0 ];
@@ -1216,14 +1259,27 @@ jobs:
                   const pShort_lcb = clamp(pShort_adj - WILSON_Z*((gpS.sigma)||0.20), 0.10, 0.98);
                   const pLCB = sideWanted==="long" ? pLong_lcb : pShort_lcb;
 
-                  // Simple EV calc with GBM for fallback
                   const y=[]; for(let i=1;i<p.c5.length;i++) y.push(Math.log(p.c5[i]/p.c5[i-1]));
                   const mu5=mean(y)||0, sig5=std(y)||1e-4;
-                  const steps=Math.max(1,Math.round((clamp(ALWAYS3_HOLD_SEC, TTL_MIN, TTL_MAX))/300));
+
+                  let sl_bps, tp_bps, hold_fb = clamp(ALWAYS3_HOLD_SEC, TTL_MIN, TTL_MAX);
+                  if(sideWanted==="long"){
+                    sl_bps = Math.max(4, Math.round(LONG_BOUNCE_SL_ATR * (p.atr_bps||40)));
+                    tp_bps = Math.max(sl_bps+1, Math.round(LONG_BOUNCE_TP_ATR * (p.atr_bps||40)));
+                    hold_fb = clamp(Math.round(Math.max(LONG_BOUNCE_HOLD_MIN_SEC, Math.min(ALWAYS3_HOLD_SEC, LONG_BOUNCE_HOLD_MAX_SEC))), LONG_BOUNCE_HOLD_MIN_SEC, LONG_BOUNCE_HOLD_MAX_SEC);
+                    if(tp_bps < LONG_EDGE_MULT_MIN * baseCost) continue;
+                  }else{
+                    sl_bps = Math.max(4, Math.round(ALWAYS3_SL_ATR * (p.atr_bps||40)));
+                    tp_bps = Math.max(sl_bps+1, Math.round(ALWAYS3_TP_ATR * (p.atr_bps||40)));
+                  }
+
+                  const cost_bps = baseCost;
+                  const steps=Math.max(1,Math.round((hold_fb)/300));
                   const evSim = gbmSimEV({ entry:mid, tp_bps, sl_bps, side:sideWanted, mu:mu5, sigma:sig5, dt:1, steps, N:96, cost_bps });
                   const ev_lcb_bps = Math.round(pLCB*tp_bps - (1-pLCB)*sl_bps - cost_bps);
 
-                  // Build refined-like record for selection
+                  const refLowFB = (p.l5 && p.l5.length>=20) ? Math.min(...p.l5.slice(-40)) : null;
+
                   const fb = {
                     symbol:p.c.symbol, base:p.c.base, quote:p.c.quote, qv:p.c.qv,
                     side:sideWanted, p_lcb:+pLCB.toFixed(3),
@@ -1235,7 +1291,7 @@ jobs:
                     regime: (weights.wTrend>weights.wMR? "trend":"meanrevert"),
                     style: "fallback",
                     score: p.signalScore, beta_r2: 0.0, n_conf: 50,
-                    obi: 0.0, hold_sec: clamp(ALWAYS3_HOLD_SEC, TTL_MIN, TTL_MAX), liq_pct:+(liqPct.get(p.c.symbol)||0.5).toFixed(3),
+                    obi: 0.0, hold_sec: hold_fb, liq_pct:+(liqPct.get(p.c.symbol)||0.5).toFixed(3),
                     ret5:(()=>{ const r=[]; for(let i=1;i<p.c5.length;i++) r.push(Math.log(p.c5[i]/p.c5[i-1])); return r.slice(-36); })(),
                     fill_prob: 0.5,
                     dyn_floor: Math.max(EXP_LCB_MIN_BPS, 6 + Math.max(0,12-(p.spreadBps||0))/2),
@@ -1251,7 +1307,8 @@ jobs:
                     side_bias: bias,
                     mr_lockout_until: state.mr_lockout?.[p.c.symbol]||0,
                     mp_fill: true,
-                    always3: true
+                    always3: true,
+                    entry_ref_low: refLowFB
                   };
 
                   selected.push(fb);
@@ -1263,6 +1320,21 @@ jobs:
                 }
               }
 
+              // Limit similar longs (cluster by correlation) — keep 1 per cluster
+              function pruneSimilarLongs(list, rhoMax=LONG_SIMILARITY_RHO){
+                const out=[], reps=[];
+                for(const c of list){
+                  if(c.side!=="long"){ out.push(c); continue; }
+                  let similar=false;
+                  for(const s of reps){
+                    if(c.ret5 && s.ret5 && corr(c.ret5, s.ret5) >= rhoMax){ similar=true; break; }
+                  }
+                  if(!similar){ out.push(c); reps.push(c); }
+                }
+                return out;
+              }
+              selected = pruneSimilarLongs(selected);
+
               snapCounts({ selected: (selected?.length||0) });
               console.log("[gha] selection", { tier: selectionTier, selected: (selected||[]).length, viable: refined.filter(c => (c.exp_lcb_bps ?? -1e9) > 0).length });
 
@@ -1273,9 +1345,25 @@ jobs:
                 const mid = (bk?.bid && bk?.ask) ? ((+bk.bid + +bk.ask)/2) : null;
 
                 const slF = x.sl_bps/10000, tpF = x.tp_bps/10000;
-                const entry_limit = mid==null ? null : (x.side==="long" ? mid*(1 - slF) : mid*(1 + slF));
-                const tp_abs = entry_limit==null ? null : (x.side==="long" ? entry_limit*(1 + tpF) : entry_limit*(1 - tpF));
-                const sl_abs = entry_limit==null ? null : (x.side==="long" ? entry_limit*(1 - slF) : entry_limit*(1 + slF));
+                let entry_limit = null, tp_abs = null, sl_abs = null, entry_policy = "limit_at_old_sl";
+
+                if(mid!=null){
+                  if(x.side==="long"){
+                    const refLow = x.swing_lo_px ?? x.entry_ref_low ?? null;
+                    const baseline = mid*(1 - Math.max(0.001, slF*0.5));
+                    const refBased = refLow ? refLow*(1 + LONG_ENTRY_BOUNCE_OFFSET) : baseline;
+                    const anchor = Math.max(refBased, baseline);
+                    entry_limit = anchor;
+                    tp_abs = entry_limit*(1 + tpF);
+                    sl_abs = entry_limit*(1 - slF);
+                    entry_policy = "smart_swing_limit";
+                  }else{
+                    entry_limit = mid*(1 + slF);
+                    tp_abs = entry_limit*(1 - tpF);
+                    sl_abs = entry_limit*(1 + slF);
+                    entry_policy = "limit_at_old_sl";
+                  }
+                }
 
                 const ttl = clamp(Math.round((x.hold_sec||720) + i*12), TTL_MIN, TTL_MAX);
 
@@ -1287,6 +1375,7 @@ jobs:
                   size_bps = Math.round(base * (x.size_scale||1));
                 }
                 if (x.mp_fill) size_bps = Math.max(8, Math.round(size_bps * 0.4));
+                if (longKill && x.side==="long") size_bps = Math.max(4, Math.round(size_bps * LONG_KILL_SIZE_MULT));
 
                 const exec_policy = { exec:"maker_or_strict_limit", max_slip_bps: EXEC_MAX_SLIP_BPS, prefer_post_only: (x.spread_bps||99)<=6 && (x.depth1p_usd||0)>=DEPTH_1P_MIN_USD };
 
@@ -1313,7 +1402,7 @@ jobs:
                   adx:x.adx, atr_bps:x.atr_bps, n_conf:x.n_conf, obi:x.obi,
                   regime:x.regime, style:x.style,
                   liq_pct:x.liq_pct, fill_prob:x.fill_prob,
-                  entry_policy:"limit_at_old_sl", entry_type:"limit", activation:"on_fill",
+                  entry_policy: entry_policy, entry_type:"limit", activation:"on_fill",
                   entry_mid: mid, entry_limit, tp_abs, sl_abs,
                   size_bps, tier: selectionTier,
                   mp_fill: !!x.mp_fill,
@@ -1423,7 +1512,15 @@ jobs:
                   MR_SPREAD_MAX_BPS, MAX_COST_BPS_HARD, MIN_VOL_1H_USD, DEPTH_1P_MIN_USD, EDGE_COST_MULT_MIN
                 },
                 gating_drops: gatingDropCounts,
-                push_classification: countsRun
+                push_classification: countsRun,
+                long_policy: {
+                  btc_green: btcGreen,
+                  strict_cost_cap_bps: LONG_MAX_COST_BPS,
+                  edge_mult_min: LONG_EDGE_MULT_MIN,
+                  bounce: { sl_atr: LONG_BOUNCE_SL_ATR, tp_atr: LONG_BOUNCE_TP_ATR, hold_min_sec: LONG_BOUNCE_HOLD_MIN_SEC, hold_max_sec: LONG_BOUNCE_HOLD_MAX_SEC },
+                  kill_switch: { active: longKill, stats: longKillStats, size_mult_when_paused: LONG_KILL_SIZE_MULT },
+                  naughty_list: Array.from(LONG_NAUGHTY_BASES)
+                }
               };
               const payload={ ts:new Date().toISOString(), mode:"normal", source:"external_pusher", meta:{ origin:"github_actions", reason, ...meta }, top_n:picks.length||0, ideas:picks||[] };
 
