@@ -41,11 +41,11 @@ jobs:
       # Behavior/sizing
       FORCE_SIZE_BPS: ${{ vars.FORCE_SIZE_BPS }}
 
-      # MP overlay + Top‑3 fallback (set both true to force Top‑3 every run when universe >= 3)
-      MP_TOP_POOL: ${{ vars.MP_TOP_POOL }}             # default 20
-      NO_VIABLE_RANK_FILL: ${{ vars.NO_VIABLE_RANK_FILL }}   # with ALWAYS3_ENABLE=true => force Top‑3
-      ALWAYS3_ENABLE: ${{ vars.ALWAYS3_ENABLE }}             # enables Top‑3 fallback mode
-      ALWAYS3_SIZE_FACTOR: ${{ vars.ALWAYS3_SIZE_FACTOR }}   # default 0.4 sizing on fallback fills
+      # MP overlay + Top‑3 fallback (envs left for compatibility; logic updated in code)
+      MP_TOP_POOL: ${{ vars.MP_TOP_POOL }}             # default 20 (not used for top-up in updated logic)
+      NO_VIABLE_RANK_FILL: ${{ vars.NO_VIABLE_RANK_FILL }}
+      ALWAYS3_ENABLE: ${{ vars.ALWAYS3_ENABLE }}
+      ALWAYS3_SIZE_FACTOR: ${{ vars.ALWAYS3_SIZE_FACTOR }}
 
       # Side constraint
       DIRECTION: ${{ vars.DIRECTION }}  # "both" | "long" | "short" (default "both")
@@ -855,31 +855,151 @@ jobs:
                 if(ok) selected.push(cand);
               }
 
-              // MP Top‑20 fallback (quality-aware) before forced Top‑3
-              if(selected.length < TARGET_K){
-                const pool = refined.filter(x=> !selected.find(s=>s.symbol===x.symbol)).slice(0, MP_TOP_POOL);
-                for(const cand of pool){
-                  if(selected.length>=TARGET_K) break;
-                  let ok=true; for(const s of selected){ const r=corr(cand.ret5||[],s.ret5||[]); if(cand.side==="long" && s.side==="long" && r>LONG_SIMILARITY_RHO){ ok=false; break; } if(r>0.90){ ok=false; break; } }
-                  if(ok) selected.push({ ...cand, mp_fill:true });
-                }
-                if(selected.some(x=>x.mp_fill)) selectionTier = selected.some(x=>!x.mp_fill) ? "strict_mp_topup" : "mp_top20";
-              }
-
-              // Forced Top‑3 fallback (when BOTH flags true)
-              const forceTopN = ALWAYS3_ENABLE && NO_VIABLE_RANK_FILL;
+              // Updated selection policy:
+              // - If strict > 0: push only strict (no top-up).
+              // - If strict = 0 and refined > 0: take top 3 from refined ranking.
+              // - If refined = 0: forced fallback — rebuild/rank from full analysis (picksRaw) and push top 3.
+              const strictCount = selected.length;
               const fallbackTarget = Math.min(TARGET_K, universe.length);
-              if(forceTopN && selected.length < fallbackTarget){
-                const have=new Set(selected.map(s=>s.symbol));
-                for(const cand of refined){
-                  if(selected.length>=fallbackTarget) break;
-                  if(have.has(cand.symbol)) continue;
-                  let ok=true; for(const s of selected){ if(cand.side==="long" && s.side==="long" && corr(cand.ret5||[], s.ret5||[])>LONG_SIMILARITY_RHO){ ok=false; break; } }
-                  if(!ok) continue;
-                  selected.push({ ...cand, mp_fill:true, always3:true });
-                  have.add(cand.symbol);
+
+              if (strictCount === 0) {
+                // First, try top-of-refined ranking with correlation guards
+                let fallback = [];
+                const have = new Set();
+                const tryAdd = (candList) => {
+                  for (const cand of candList) {
+                    if (fallback.length >= fallbackTarget) break;
+                    if (have.has(cand.symbol)) continue;
+                    let ok = true;
+                    for (const s of fallback) {
+                      const r = corr(cand.ret5 || [], s.ret5 || []);
+                      if (cand.side === "long" && s.side === "long" && r > LONG_SIMILARITY_RHO) { ok = false; break; }
+                      if (r > 0.90) { ok = false; break; }
+                    }
+                    if (!ok) continue;
+                    fallback.push({ ...cand, mp_fill: true, always3: true });
+                    have.add(cand.symbol);
+                  }
+                };
+
+                if (refined.length > 0) {
+                  tryAdd(refined);
                 }
-                selectionTier = selected.some(x=>!x.always3) ? "strict_always3_topup" : "always3_rank";
+
+                if (fallback.length < fallbackTarget) {
+                  // Forced fallback: rebuild candidates using full analysis (GP, calibration, heavy-tail, costs)
+                  const fbCands = [];
+                  for (const p of picksRaw) {
+                    try {
+                      const book = bookMap.get(p.c.symbol);
+                      if (!book?.bid || !book?.ask) continue;
+                      const mid = (book.bid + book.ask) / 2;
+                      const yR = []; for (let i = 1; i < p.c5.length; i++) yR.push(Math.log(p.c5[i] / p.c5[i-1]));
+                      const mu5 = mean(yR) || 0, sig5 = Math.max(1e-4, std(yR));
+                      const hold_base = clamp(Math.round((weightsReg.wTrend > weightsReg.wMR ? 720 : 560) + 240 * clamp((p.adx5 - 16)/14, 0, 1)), TTL_MIN, TTL_MAX);
+                      const stepsBase = Math.max(1, Math.round(hold_base/300));
+                      const slipL = Math.max(Math.round(p.spreadBps/2), 0);
+                      const slipS = Math.max(Math.round(p.spreadBps/2), 0);
+                      const costLong = COST_BPS + slipL;
+                      const costShort = COST_BPS + slipS;
+                      if (Math.max(costLong, costShort) > MAX_COST_BPS_HARD) continue;
+
+                      // GP features and predictions
+                      const featL = [ clamp((p.adx5 - 16)/14,0,1), clamp(p.z_vwap,-3,3), (p.rsi14||50)/100, 0.0, clamp(p.slope_atr50,0,1) ];
+                      const featS = [ clamp((p.adx5 - 16)/14,0,1), clamp(-p.z_vwap,-3,3),(100-(p.rsi14||50))/100, 0.0, clamp(p.slope_atr50,0,1) ];
+                      let pLong_raw = p.pLong0, pShort_raw = p.pShort0;
+                      if (gpClfLong) pLong_raw = predictGPClass(gpClfLong, featL).p;
+                      if (gpClfShort) pShort_raw = predictGPClass(gpClfShort, featS).p;
+
+                      const strongTrend = (p.adx5 > Math.max(22, MR_ADX_MAX)) || (p.slope_atr50 > MR_SLOPE_MAX_ATR50);
+                      const regime = p.mrLocked ? "trend" : (strongTrend ? "trend" : "meanrevert");
+
+                      const pLong = calibrateP(state,"long",regime,pLong_raw);
+                      const pShort = calibrateP(state,"short",regime,pShort_raw);
+
+                      const pLong_lcb = wilsonLCB(pLong, 80, WILSON_Z);
+                      const pShort_lcb = wilsonLCB(pShort, 80, WILSON_Z);
+
+                      // Long candidate
+                      let candLong = null;
+                      if (ALLOWED.has("long")) {
+                        const styleL = (!strongTrend && !p.mrLocked && p.fadeLongDivergenceOK) ? "mr" : (strongTrend ? "momentum" : "trend");
+                        let slL, tpL, holdL;
+                        if (styleL === "mr") {
+                          slL = Math.round(LONG_BOUNCE_SL_ATR * p.atr_bps);
+                          tpL = Math.round(LONG_BOUNCE_TP_ATR * p.atr_bps);
+                          holdL = clamp(Math.round(Math.max(1800, hold_base)), 1200, 3600);
+                        } else {
+                          slL = Math.round(clamp(p.atr_bps * 0.50, Math.round(0.35 * p.atr_bps), Math.round(0.65 * p.atr_bps)));
+                          tpL = Math.round(clamp(p.atr_bps * 0.95, Math.round(0.60 * p.atr_bps), Math.round(1.20 * p.atr_bps)));
+                          holdL = clamp(Math.round(Math.max(LONG_BOUNCE_HOLD_MIN_SEC, Math.min(hold_base, LONG_BOUNCE_HOLD_MAX_SEC))), LONG_BOUNCE_HOLD_MIN_SEC, LONG_BOUNCE_HOLD_MAX_SEC);
+                        }
+                        const simL = pathEVHeavy({ entry:mid, tp_bps:tpL, sl_bps:slL, side:"long", retSeries:yR, mu:mu5, sigma:sig5, steps:stepsBase, N:192, cost_bps:costLong, t_df:Number(process.env.T_SIM_DF||"5"), boot_block:Number(process.env.BOOT_BLOCK||"3") });
+                        const evLongLCB = Math.round(pLong_lcb*tpL - (1-pLong_lcb)*slL - costLong);
+                        candLong = { side:"long", p_lcb:+pLong_lcb.toFixed(3), p_raw:+pLong.toFixed(3),
+                                     cost_bps:costLong, tp_bps:tpL, sl_bps:slL, exp_lcb_bps:evLongLCB, exp_bps:simL.ev_bps,
+                                     hold_sec:holdL, style:styleL, regime };
+                      }
+
+                      // Short candidate
+                      let candShort = null;
+                      if (ALLOWED.has("short")) {
+                        const styleS = (!strongTrend && !p.mrLocked && p.fadeShortDivergenceOK) ? "mr" : (strongTrend ? "momentum" : "trend");
+                        let slS, tpS, holdS;
+                        if (styleS === "mr") {
+                          slS = Math.round(clamp(0.5,0.4,0.6) * p.atr_bps);
+                          tpS = Math.round(clamp(1.0,0.8,1.2) * p.atr_bps);
+                          holdS = clamp(Math.round(Math.max(1800, hold_base)), 1200, 3600);
+                        } else {
+                          slS = Math.round(clamp(p.atr_bps * 0.55, Math.round(0.35 * p.atr_bps), Math.round(0.75 * p.atr_bps)));
+                          tpS = Math.round(clamp(p.atr_bps * 1.00, Math.round(0.70 * p.atr_bps), Math.round(1.40 * p.atr_bps)));
+                          holdS = hold_base;
+                        }
+                        const simS = pathEVHeavy({ entry:mid, tp_bps:tpS, sl_bps:slS, side:"short", retSeries:yR, mu:mu5, sigma:sig5, steps:stepsBase, N:192, cost_bps:costShort, t_df:Number(process.env.T_SIM_DF||"5"), boot_block:Number(process.env.BOOT_BLOCK||"3") });
+                        const evShortLCB = Math.round(pShort_lcb*tpS - (1-pShort_lcb)*slS - costShort);
+                        candShort = { side:"short", p_lcb:+pShort_lcb.toFixed(3), p_raw:+pShort.toFixed(3),
+                                      cost_bps:costShort, tp_bps:tpS, sl_bps:slS, exp_lcb_bps:evShortLCB, exp_bps:simS.ev_bps,
+                                      hold_sec:holdS, style:styleS, regime };
+                      }
+
+                      let chosen = candLong && candShort ? (candLong.exp_lcb_bps >= candShort.exp_lcb_bps ? candLong : candShort) : (candLong || candShort || null);
+                      if (!chosen) continue;
+
+                      const liq = liqPct.get(p.c.symbol) || 0.5;
+                      const score = clamp(Math.round(60 + 30*(chosen.p_lcb-0.5)*2 + 12*clamp((p.adx5-16)/14,0,1) + 7*((liq-0.5)*2) - Math.min(12, Math.max(0,(p.spreadBps-5)/2))), 1, 99);
+
+                      fbCands.push({
+                        symbol:p.c.symbol, base:p.c.base, quote:p.c.quote, qv:p.c.qv,
+                        side:chosen.side, p_lcb:+chosen.p_lcb, p_raw:+chosen.p_raw, p_win:+(Math.max(p.pLong0,p.pShort0)).toFixed(3),
+                        exp_bps:chosen.exp_bps, exp_lcb_bps:chosen.exp_lcb_bps,
+                        tp_bps:chosen.tp_bps, sl_bps:chosen.sl_bps, rrr:+(chosen.tp_bps/Math.max(1,chosen.sl_bps)).toFixed(2),
+                        spread_bps:p.spreadBps, cost_bps:chosen.cost_bps,
+                        adx:+(p.adx5||0).toFixed(1), atr_bps:p.atr_bps, regime:chosen.regime, style:chosen.style,
+                        score, n_conf:Math.round(60+40*clamp((p.adx5-16)/14,0,1)), obi:0,
+                        hold_sec:chosen.hold_sec, liq_pct:+(liq).toFixed(3),
+                        ret5:(()=>{ const r=[]; for(let i=1;i<p.c5.length;i++) r.push(Math.log(p.c5[i]/p.c5[i-1])); return r.slice(-36); })(),
+                        fill_prob:0.7, dyn_floor:EXP_LCB_MIN_THIS,
+                        rsi14:p.rsi14, z_vwap:p.z_vwap,
+                        vol1h_est_usd:p.vol1h_est_usd, depth1p_usd:0,
+                        direction_env:DIRECTION, side_bias:p.trendBias,
+                        swing_lo_px:(function swingLo(){ const lows=p.k15?.map(x=>+x[3])||[]; if(lows.length<40) return null; return Math.min(...lows.slice(-40)); })()
+                      });
+                    } catch {}
+                  }
+
+                  fbCands.sort((a,b)=> b.exp_lcb_bps!==a.exp_lcb_bps ? b.exp_lcb_bps-a.exp_lcb_bps
+                                         : b.exp_bps!==a.exp_bps ? b.exp_bps-a.exp_bps
+                                         : b.score!==a.score ? b.score-a.score
+                                         : (b.qv||0)-(a.qv||0));
+                  tryAdd(fbCands);
+                }
+
+                selected = fallback.slice(0, fallbackTarget);
+                selectionTier = (refined.length > 0) ? "refined_top3" : "forced_fallback_top3";
+              } else {
+                // Strict picks exist — push only strict (cap to TOP_N)
+                selected = selected.slice(0, fallbackTarget);
+                selectionTier = "strict";
               }
 
               snapCounts({ selected: selected.length });
@@ -975,7 +1095,7 @@ jobs:
                   state.push_log=Array.isArray(state.push_log)? state.push_log : [];
                   state.push_log.push({ ts:new Date().toISOString(), tier:selectionTier, direction_env:DIRECTION, top_n:picks.length,
                     counts:{ strict:picks.filter(p=>!p.mp_fill).length, always3:picks.filter(p=>p.always3).length },
-                    regime_post:weightsReg, bandit_choice:banditChoice, force_top_n: (ALWAYS3_ENABLE&&NO_VIABLE_RANK_FILL),
+                    regime_post:weightsReg, bandit_choice:banditChoice, force_top_n: (selectionTier!=="strict"),
                     symbols:picks.map(p=>({ symbol:p.symbol_full, side:p.side, style:p.style, tier:p.tier, always3:!!p.always3 })) });
                   if(state.push_log.length>300) state.push_log=state.push_log.slice(-300);
                 }catch(e){ console.log("[gha] push_log warn", e?.message||e); }
@@ -997,14 +1117,14 @@ jobs:
                   exp_lcb_min_bps:EXP_LCB_MIN_THIS, wilson_z:WILSON_Z,
                   calibrated:true, gp_cls:true, isotonic:true, platt:true,
                   heavy_tail_sim:true, t_copula_var_es:true,
-                  mp_top_pool:MP_TOP_POOL, always3:ALWAYS3_ENABLE, rank_fill: (ALWAYS3_ENABLE&&NO_VIABLE_RANK_FILL)
+                  mp_top_pool:MP_TOP_POOL, always3:ALWAYS3_ENABLE, rank_fill: (selectionTier!=="strict")
                 },
                 dd_gate:(()=>{ const s=state.equity||[]; const day=Date.now()-24*3600*1000; let pnl24=0,cum=0,peak=0,dd=0; for(const e of s){ if(e.ts_ms>=day) pnl24+=e.pnl_bps; cum+=e.pnl_bps; if(cum>peak) peak=cum; dd=Math.min(dd,cum-peak); } return { pnl24_bps:Math.round(pnl24), peak_dd_bps:Math.round(dd), throttle }; })(),
                 tod:{ active:S_H!=null&&E_H!=null, start:S_H, end:E_H },
                 tier:selectionTier, regime_post:weightsReg, direction_env:DIRECTION, bandit_choice:banditChoice, metrics:state.metrics||{}
               };
               const payload={ ts:new Date().toISOString(), mode:"normal", source:"external_pusher", meta:{ origin:"github_actions", reason, ...meta }, top_n:picks.length||0, ideas:picks||[] };
-              console.log(`[gha] pushing ${picks.length} ideas (${selectionTier}${(ALWAYS3_ENABLE&&NO_VIABLE_RANK_FILL)?" | forced-topN":""}) to ${PUSH_URL}`);
+              console.log(`[gha] pushing ${picks.length} ideas (${selectionTier}) to ${PUSH_URL}`);
               try{
                 const r=await fetchWithTimeout(PUSH_URL,{ method:"POST", headers:{ "Content-Type":"application/json","Authorization":`Bearer ${PUSH_TOKEN}` }, body: JSON.stringify(payload) },15000);
                 let txt=""; try{ txt=await r.text(); }catch{} console.log("[gha] push status", r?.status||"ERR", (txt||"").slice(0,400));
