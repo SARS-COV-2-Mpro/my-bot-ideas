@@ -1,10 +1,9 @@
-```yaml
 name: Ideas Pusher (MEXC ULTIMATE EV@Pusher+, PRIME v6.2 Calibrated HeavyTail MP-Top20+Top3)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/30 * * * *"
 
 permissions:
   contents: read
@@ -70,7 +69,7 @@ jobs:
 
       # Long policy
       LONG_MAX_COST_BPS: ${{ vars.LONG_MAX_COST_BPS }}            # default 12
-      LONG_EDGE_MULT_MIN: ${{ vars.LONG_EDGE_MULT_MIN }}          # default overridden to 6 in code if absent
+      LONG_EDGE_MULT_MIN: ${{ vars.LONG_EDGE_MULT_MIN }}          # default 4
       LONG_BOUNCE_SL_ATR: ${{ vars.LONG_BOUNCE_SL_ATR }}          # default 0.50
       LONG_BOUNCE_TP_ATR: ${{ vars.LONG_BOUNCE_TP_ATR }}          # default 0.90
       LONG_BOUNCE_HOLD_MIN_SEC: ${{ vars.LONG_BOUNCE_HOLD_MIN_SEC }}  # default 900
@@ -240,12 +239,12 @@ jobs:
               return {a,b,n:y.length}; }
             function applyPlatt(p,ab){ const {a,b}=ab||{a:1,b:0}; return p.map(pi=> sigmoidF(a,b, logitF(clamp(pi,1e-6,1-1e-6)) )); }
             function fitIsotonic(p,y){ const idx=[...p.keys()].sort((i,j)=>p[i]-p[j]); const xs=[],ys=[]; for(const i of idx){ xs.push(p[i]); ys.push(y[i]); }
-              const n=xs.length,g=ys.slice(),w=Array(n).fill(1); for(let i=0;i<n-1;i++){ if(g[i]>g[i+1]){ let j=i; while(j>=0 && g[j]>g[j+1]){ const ww=w[j]+w[j+1], gg=(w[j]*g[j]+w[j+1]*g[j+1])/ww; w[j]=ww; g[j]=gg; xs.splice(j,2,(xs[j])); ys.splice(j,2,(gg)); g.splice(j+1,1); if(j>0) j--; } } } return { xs, ys:g, n }; }
+              const n=xs.length,g=ys.slice(),w=Array(n).fill(1); for(let i=0;i<n-1;i++){ if(g[i]>g[i+1]){ let j=i; while(j>=0 && g[j]>g[j+1]){ const ww=w[j]+w[j+1], gg=(w[j]*g[j]+w[j+1]*g[j+1])/ww; w[j]=ww; g[j]=gg; xs.splice(j,2,(xs[j])); ys.splice(j,2,(gg)); g.splice(j+1,1); w.splice(j+1,1); if(j>0) j--; } } } return { xs, ys:g, n }; }
             function applyIsotonic(p,iso){ if(!iso?.xs?.length||!iso?.ys?.length) return p; const xs=iso.xs, ys=iso.ys; return p.map(val=>{ if(val<=xs[0]) return ys[0]; if(val>=xs[xs.length-1]) return ys[ys.length-1]; let lo=0,hi=xs.length-1; while(hi-lo>1){ const mid=((lo+hi)>>1); if(xs[mid]<=val) lo=mid; else hi=mid; } const t=(val-xs[lo])/Math.max(1e-9,(xs[hi]-xs[lo])); return ys[lo]+t*(ys[hi]-ys[lo]); }); }
 
             // ------------- Heavy-tail Monte Carlo (t + bootstrap) -------------
             function pathEVHeavy({entry,tp_bps,sl_bps,side,retSeries,mu,sigma,steps,N=192,cost_bps=10,t_df=5,boot_block=3}){
-              const up=(side==="long"), tpF=tp_bps/10000, slF=sl_bps/10000; let ev=0,wins=0; const rets=retSeries||[];
+              const up=(side==="long"), tpF=tp_bps/10000, slF=sl_bps/10000; let ev=0, wins=0; const rets=retSeries||[];
               const boot1=()=>{ if(rets.length<8) return Array(steps).fill(0).map(()=> sigma*Math.sqrt(1/steps)*randn()); const out=[]; while(out.length<steps){ const start=Math.floor(Math.random()*(rets.length-boot_block)); for(let k=0;k<boot_block && out.length<steps;k++) out.push(rets[start+k]||0); } return out.slice(0,steps); };
               for(let n=0;n<N;n++){
                 const mode=(n%2===0)?"t":"boot";
@@ -401,9 +400,9 @@ jobs:
             const LONG_DOWN_RSI_CUTOFF=Number(process.env.LONG_DOWN_RSI_CUTOFF||"40");
             const LONG_MR_DIVERGENCE_REQ=(process.env.LONG_MR_DIVERGENCE_REQ||"true").toLowerCase()==="true";
 
-            // Long policy (updated defaults for cost-aware TP)
+            // Long policy
             const LONG_MAX_COST_BPS=Number(process.env.LONG_MAX_COST_BPS||"12");
-            const LONG_EDGE_MULT_MIN=Number(process.env.LONG_EDGE_MULT_MIN||"6");  // was 4, default tightened to 6x cost
+            const LONG_EDGE_MULT_MIN=Number(process.env.LONG_EDGE_MULT_MIN||"4");
             const LONG_BOUNCE_SL_ATR=Number(process.env.LONG_BOUNCE_SL_ATR||"0.50");
             const LONG_BOUNCE_TP_ATR=Number(process.env.LONG_BOUNCE_TP_ATR||"0.90");
             const LONG_BOUNCE_HOLD_MIN_SEC=Number(process.env.LONG_BOUNCE_HOLD_MIN_SEC||"900");
@@ -414,9 +413,6 @@ jobs:
             const LONG_KILL_WINRATE=Number(process.env.LONG_KILL_WINRATE||"0.20");
             const LONG_KILL_SIZE_MULT=Number(process.env.LONG_KILL_SIZE_MULT||"0.5");
             const LONG_NAUGHTY_BASES=new Set(String(process.env.LONG_NAUGHTY_BASES||"EDU,THE,HEMI,COOKIE,MNT,ASTER").split(",").map(s=>s.trim().toUpperCase()).filter(Boolean));
-
-            // Short edge minimum (updated default 6x cost)
-            const EDGE_COST_MULT_MIN=Number(process.env.EDGE_COST_MULT_MIN||"6");
 
             // ---------- Worker endpoints ----------
             const cleanURL = (s)=> String(s||"").replace(/[\r\n]/g,"").trim();
@@ -514,7 +510,7 @@ jobs:
 
                 state.closed.push({ ts_ms:p.ts_ms, symbolFull:p.symbolFull, base:p.base, quote:p.quote, side:p.side, tier:p.tier,
                   mp_fill:!!p.mp_fill, always3:!!p.always3, pnl_bps, tp_bps:p.tp_bps, sl_bps:p.sl_bps, cost_bps:p.cost_bps,
-                  regime:p.regime, style:p.style_final, direction_env:p.direction_env, p_raw:p.p_lcb, p_pred:p.p_lcb, p_win0:p.p_win, ev_lcb_pred_bps:p.exp_lcb_bps, calib_key:p.calib_key });
+                  regime:p.regime, style:p.style_final, direction_env:p.direction_env, p_raw:p.p_raw, p_pred:p.p_lcb, p_win0:p.p_win, ev_lcb_pred_bps:p.exp_lcb_bps, calib_key:p.calib_key });
                 if(state.closed.length>5000) state.closed=state.closed.slice(-5000);
 
                 if(Array.isArray(p.gp_feat) && p.gp_feat.length){
@@ -549,9 +545,6 @@ jobs:
               const pl=state.calibration.platt[k]; if(pl?.n>=Number(process.env.CALIB_MIN_PLATT||"30")) return (applyPlatt([pRaw],pl))[0];
               return pRaw;
             }
-
-            // Cost-aware TP guard (avoid micro-TP where fees dominate)
-            const meetsCostTP=(tp_bps, cost_bps)=> tp_bps>=Math.max(90, (EDGE_COST_MULT_MIN||6)*cost_bps) && (cost_bps/Math.max(1,tp_bps))<=0.15;
 
             // ---------- Main ----------
             let reason="ok", selectionTier="strict";
@@ -625,8 +618,7 @@ jobs:
                     const k5=await fetchK(c.symbol,"5m",K5M); if(!k5||k5.length<Math.max(EMA_SLOW+200,ATR_P+50)){ pfStats.dropped.k5++; return null; }
                     const k15=await fetchK(c.symbol,"15m",K15M); const k1h=await fetchK(c.symbol,"1h",K1H);
 
-                    const c5_raw=k5.map(x=>+x[4]);
-                    const c5=kalman1D(c5_raw,{q:1e-4,r:5e-4,x0:c5_raw[0],p0:1e-2});
+                    const c5_raw=k5.map(x=>+x[4]); const c5=kalman1D(c5_raw,{q:1e-4,r:5e-4,x0:c5_raw[0],p0:1e-2});
                     const h5=k5.map(x=>+x[2]), l5=k5.map(x=>+x[3]), v5=k5.map(x=>+x[5]);
                     const em21=emaSeries(c5,EMA_FAST), em50s=emaSeries(c5,EMA_SLOW), em200s=emaSeries(c5,200);
                     const em50=em50s?.at(-1), em200=em200s?.at(-1), em50Prev=em50s?.at(-51);
@@ -795,16 +787,15 @@ jobs:
                   if(allowedLong){
                     const mrOk = allowMR("long") && (LONG_MR_DIVERGENCE_REQ ? p.fadeLongDivergenceOK : true);
                     const styleL = mrOk ? "mr" : (strongTrend ? "momentum":"trend");
+                    let holdL = mrOk ? clamp(Math.round(Math.max(1800, hold_base)), 1200, 3600)
+                                     : clamp(Math.round(Math.max(LONG_BOUNCE_HOLD_MIN_SEC, Math.min(hold_base, LONG_BOUNCE_HOLD_MAX_SEC))), LONG_BOUNCE_HOLD_MIN_SEC, LONG_BOUNCE_HOLD_MAX_SEC);
                     let slL, tpL;
                     if(styleL==="mr"){ slL=Math.round(LONG_BOUNCE_SL_ATR*p.atr_bps); tpL=Math.round(LONG_BOUNCE_TP_ATR*p.atr_bps); }
                     else { slL=Math.round(clamp(p.atr_bps*0.50, Math.round(0.35*p.atr_bps), Math.round(0.65*p.atr_bps)));
                            tpL=Math.round(clamp(p.atr_bps*0.95, Math.round(0.60*p.atr_bps), Math.round(1.20*p.atr_bps))); }
-                    if(slL>Math.round(0.6*tpL)) slL=Math.round(0.6*tpL); // guard SL ≤ 0.6×TP
-                    if(meetsCostTP(tpL, costLong)){
-                      const simL=pathEVHeavy({entry:entryMid,tp_bps:tpL,sl_bps:slL,side:"long",retSeries:yR,mu:mu5,sigma:sig5,steps:stepsBase,N:192,cost_bps:costLong,t_df:Number(process.env.T_SIM_DF||"5"),boot_block:Number(process.env.BOOT_BLOCK||"3")});
-                      const evLongLCB=Math.round(pLong_lcb*tpL - (1-pLong_lcb)*slL - costLong);
-                      candLong={ side:"long", p_lcb:pLong_lcb, p_raw:pLong_raw, cost_bps:costLong, tp_bps:tpL, sl_bps:slL, exp_lcb_bps:evLongLCB, exp_bps:simL.ev_bps, hold_sec:hold_base, style:styleL, regime };
-                    }
+                    const simL=pathEVHeavy({entry:entryMid,tp_bps:tpL,sl_bps:slL,side:"long",retSeries:yR,mu:mu5,sigma:sig5,steps:stepsBase,N:192,cost_bps:costLong,t_df:Number(process.env.T_SIM_DF||"5"),boot_block:Number(process.env.BOOT_BLOCK||"3")});
+                    const evLongLCB=Math.round(pLong_lcb*tpL - (1-pLong_lcb)*slL - costLong);
+                    if(tpL>=LONG_EDGE_MULT_MIN*costLong){ candLong={ side:"long", p_lcb:pLong_lcb, p_raw:pLong_raw, cost_bps:costLong, tp_bps:tpL, sl_bps:slL, exp_lcb_bps:evLongLCB, exp_bps:simL.ev_bps, hold_sec:holdL, style:styleL, regime }; }
                   }
 
                   // Short candidate
@@ -812,34 +803,21 @@ jobs:
                   if(allowedShort){
                     const mrOk = allowMR("short") && p.fadeShortDivergenceOK;
                     const styleS = mrOk ? "mr" : (strongTrend ? "momentum":"trend");
+                    const holdS = mrOk ? clamp(Math.round(Math.max(1800, hold_base)), 1200, 3600) : hold_base;
                     let slS, tpS;
-                    if(styleS==="mr"){ slS=Math.round(clamp(0.5,0.4,0.6)*p.atr_bps); tpS=Math.round(clamp(1.0,0.8,1.2)*p.atr_bps); }
+                    if(styleS==="mr"){ const sl=Math.round(clamp(0.5,0.4,0.6)*p.atr_bps), tp=Math.round(clamp(1.0,0.8,1.2)*p.atr_bps); slS=sl; tpS=tp; }
                     else { slS=Math.round(clamp(p.atr_bps*0.55, Math.round(0.35*p.atr_bps), Math.round(0.75*p.atr_bps)));
                            tpS=Math.round(clamp(p.atr_bps*1.00, Math.round(0.70*p.atr_bps), Math.round(1.40*p.atr_bps))); }
-                    if(slS>Math.round(0.6*tpS)) slS=Math.round(0.6*tpS);
-                    if(meetsCostTP(tpS, costShort)){
-                      const simS=pathEVHeavy({entry:entryMid,tp_bps:tpS,sl_bps:slS,side:"short",retSeries:yR,mu:mu5,sigma:sig5,steps:stepsBase,N:192,cost_bps:costShort,t_df:Number(process.env.T_SIM_DF||"5"),boot_block:Number(process.env.BOOT_BLOCK||"3")});
-                      const evShortLCB=Math.round(pShort_lcb*tpS - (1-pShort_lcb)*slS - costShort);
-                      candShort={ side:"short", p_lcb:pShort_lcb, p_raw:pShort_raw, cost_bps:costShort, tp_bps:tpS, sl_bps:slS, exp_lcb_bps:evShortLCB, exp_bps:simS.ev_bps, hold_sec:hold_base, style:styleS, regime };
-                    }
+                    const simS=pathEVHeavy({entry:entryMid,tp_bps:tpS,sl_bps:slS,side:"short",retSeries:yR,mu:mu5,sigma:sig5,steps:stepsBase,N:192,cost_bps:costShort,t_df:Number(process.env.T_SIM_DF||"5"),boot_block:Number(process.env.BOOT_BLOCK||"3")});
+                    const evShortLCB=Math.round(pShort_lcb*tpS - (1-pShort_lcb)*slS - costShort);
+                    if(tpS>=Math.max(3,Number(process.env.EDGE_COST_MULT_MIN||"3"))*costShort){ candShort={ side:"short", p_lcb:pShort_lcb, p_raw:pShort_raw, cost_bps:costShort, tp_bps:tpS, sl_bps:slS, exp_lcb_bps:evShortLCB, exp_bps:simS.ev_bps, hold_sec:holdS, style:styleS, regime }; }
                   }
 
                   let chosen=candLong&&candShort? (candLong.exp_lcb_bps>=candShort.exp_lcb_bps? candLong : candShort) : (candLong||candShort||null);
                   if(!chosen) continue;
 
                   const liq=liqPct.get(c.symbol)||0.5;
-
-                  // Symbol heat penalty/boost
-                  const st = state.sym_stats?.[c.base] || null;
-                  let heatAdj=0;
-                  if(st && st.n>=2){
-                    const wr=(st.wins||0)/Math.max(1,st.n||0);
-                    const pnl=st.pnl_sum||0;
-                    if(wr<0.35 && pnl<-150) heatAdj=-8;
-                    else if(wr>0.60 && pnl>100) heatAdj=+6;
-                  }
-
-                  const score=clamp(Math.round(60 + 30*(chosen.p_lcb-0.5)*2 + 12*clamp((p.adx5-16)/14,0,1) + 7*((liq-0.5)*2) - Math.min(12, Math.max(0,(p.spreadBps-5)/2)) + heatAdj), 1, 99);
+                  const score=clamp(Math.round(60 + 30*(chosen.p_lcb-0.5)*2 + 12*clamp((p.adx5-16)/14,0,1) + 7*((liq-0.5)*2) - Math.min(12, Math.max(0,(p.spreadBps-5)/2))), 1, 99);
 
                   refined.push({
                     symbol:c.symbol, base:c.base, quote:c.quote, qv:c.qv,
@@ -869,140 +847,174 @@ jobs:
                                 : b.score!==a.score ? b.score-a.score
                                 : b.qv-a.qv);
 
-              // Helper: correlation-guarded chooser
-              function chooseWithCorr(cands, maxK, already=[]){
-                const out=[...already]; const have=new Set(already.map(x=>x.symbol));
-                for(const cand of cands){
-                  if(out.length>=maxK) break;
-                  if(have.has(cand.symbol)) continue;
-                  let ok=true;
-                  for(const s of out){
-                    const r=corr(cand.ret5||[], s.ret5||[]);
-                    if(cand.side==="long" && s.side==="long" && r>LONG_SIMILARITY_RHO){ ok=false; break; }
-                    if(r>0.90){ ok=false; break; }
-                  }
-                  if(!ok) continue;
-                  out.push(cand);
-                  have.add(cand.symbol);
-                }
-                return out;
-              }
-
               // Strict picks
               const strictOk=(cand)=>{
                 const common = cand.p_lcb>=0.60 && cand.exp_lcb_bps>=Math.max(cand.dyn_floor+3, EXP_LCB_MIN_THIS+3) && (cand.fill_prob||0)>=0.65 && cand.spread_bps<=MAX_SPREAD_BPS;
                 if(!common) return false;
                 if(cand.side==="long"){ if(cand.cost_bps>LONG_MAX_COST_BPS) return false; if(cand.tp_bps < LONG_EDGE_MULT_MIN*cand.cost_bps) return false; }
-                else { if(cand.tp_bps < Math.max(90, EDGE_COST_MULT_MIN*cand.cost_bps)) return false; if((cand.cost_bps/Math.max(1,cand.tp_bps))>0.15) return false; }
+                else { if(cand.cost_bps>Math.max(COST_BPS+8,18)) return false; }
                 return true;
               };
               const TARGET_K=Math.min(3, TOP_N||3);
-              let selectedStrict=[]; for(const cand of refined){ if(selectedStrict.length>=TARGET_K) break; if(strictOk(cand)) selectedStrict=chooseWithCorr([cand], TARGET_K, selectedStrict); }
-
-              // Always force 3 picks: fill from refined, then forced fallback if needed
-              let selected=[...selectedStrict];
-              let selectionSources = selectedStrict.length>0? ["strict"] : [];
-
-              if(selected.length<TARGET_K){
-                const refinedFill = refined.filter(r=> !selected.find(s=>s.symbol===r.symbol));
-                const filled = chooseWithCorr(refinedFill, TARGET_K, selected).slice(0,TARGET_K);
-                selectionSources.push("refined_topup");
-                selected = filled;
+              let selected=[];
+              for(const cand of refined){
+                if(selected.length>=TARGET_K) break; if(!strictOk(cand)) continue;
+                let ok=true; for(const s of selected){ const r=corr(cand.ret5||[],s.ret5||[]); if(cand.side==="long" && s.side==="long" && r>LONG_SIMILARITY_RHO) { ok=false; break; } if(r>0.90){ ok=false; break; } }
+                if(ok) selected.push(cand);
               }
 
-              if(selected.length<TARGET_K){
-                // Forced fallback construction (lighter guards)
-                const fbCands=[];
-                for(const p of picksRaw){
-                  try{
-                    const book=bookMap.get(p.c.symbol); if(!book?.bid||!book?.ask) continue;
-                    const mid=(book.bid+book.ask)/2;
-                    const yR=[]; for(let i=1;i<p.c5.length;i++) yR.push(Math.log(p.c5[i]/p.c5[i-1]));
-                    const mu5=mean(yR)||0, sig5=Math.max(1e-4,std(yR));
-                    const hold_base=clamp(Math.round((weightsReg.wTrend>weightsReg.wMR? 720:560)+240*clamp((p.adx5-16)/14,0,1)), TTL_MIN, TTL_MAX);
-                    const stepsBase=Math.max(1,Math.round(hold_base/300));
-                    const cost=Math.max(0, Math.round(p.spreadBps/2)) + COST_BPS;
+              // Updated selection policy:
+              // - If strict > 0: push only strict (no top-up).
+              // - If strict = 0 and refined > 0: take top 3 from refined ranking.
+              // - If refined = 0: forced fallback — rebuild/rank from full analysis (picksRaw) and push top 3.
+              const strictCount = selected.length;
+              const fallbackTarget = Math.min(TARGET_K, universe.length);
 
-                    // Predict both sides, then pick better LCB EV with cost-aware TP guard
-                    const featL=[ clamp((p.adx5-16)/14,0,1), clamp(p.z_vwap,-3,3), (p.rsi14||50)/100, 0.0, clamp(p.slope_atr50,0,1) ];
-                    const featS=[ clamp((p.adx5-16)/14,0,1), clamp(-p.z_vwap,-3,3),(100-(p.rsi14||50))/100, 0.0, clamp(p.slope_atr50,0,1) ];
-                    let pLong_raw=p.pLong0, pShort_raw=p.pShort0;
-                    if(gpClfLong) pLong_raw=predictGPClass(gpClfLong, featL).p;
-                    if(gpClfShort) pShort_raw=predictGPClass(gpClfShort, featS).p;
-
-                    const strongTrend=(p.adx5>Math.max(22,MR_ADX_MAX)) || (p.slope_atr50>MR_SLOPE_MAX_ATR50);
-                    const regime = p.mrLocked ? "trend" : (strongTrend? "trend":"meanrevert");
-                    const pLong=calibrateP(state,"long",regime,pLong_raw), pShort=calibrateP(state,"short",regime,pShort_raw);
-                    const pLong_lcb=wilsonLCB(pLong,80,WILSON_Z), pShort_lcb=wilsonLCB(pShort,80,WILSON_Z);
-
-                    // Long
-                    let slL=Math.round(0.50*p.atr_bps), tpL=Math.round(0.95*p.atr_bps); if(slL>Math.round(0.6*tpL)) slL=Math.round(0.6*tpL);
-                    let candLong=null; if(meetsCostTP(tpL, cost)){ const simL=pathEVHeavy({entry:mid,tp_bps:tpL,sl_bps:slL,side:"long",retSeries:yR,mu:mu5,sigma:sig5,steps:stepsBase,N:192,cost_bps:cost,t_df:Number(process.env.T_SIM_DF||"5"),boot_block:Number(process.env.BOOT_BLOCK||"3")}); candLong={side:"long",p_lcb:pLong_lcb,p_raw:pLong, tp_bps:tpL,sl_bps:slL,exp_lcb_bps:Math.round(pLong_lcb*tpL - (1-pLong_lcb)*slL - cost),exp_bps:simL.ev_bps, cost_bps:cost,hold_sec:hold_base,regime,style:strongTrend?"momentum":"trend"}; }
-
-                    // Short
-                    let slS=Math.round(0.55*p.atr_bps), tpS=Math.round(1.00*p.atr_bps); if(slS>Math.round(0.6*tpS)) slS=Math.round(0.6*tpS);
-                    let candShort=null; if(meetsCostTP(tpS, cost)){ const simS=pathEVHeavy({entry:mid,tp_bps:tpS,sl_bps:slS,side:"short",retSeries:yR,mu:mu5,sigma:sig5,steps:stepsBase,N:192,cost_bps:cost,t_df:Number(process.env.T_SIM_DF||"5"),boot_block:Number(process.env.BOOT_BLOCK||"3")}); candShort={side:"short",p_lcb:pShort_lcb,p_raw:pShort, tp_bps:tpS,sl_bps:slS,exp_lcb_bps:Math.round(pShort_lcb*tpS - (1-pShort_lcb)*slS - cost),exp_bps:simS.ev_bps, cost_bps:cost,hold_sec:hold_base,regime,style:strongTrend?"momentum":"trend"}; }
-
-                    const chosen=(candLong&&candShort)? (candLong.exp_lcb_bps>=candShort.exp_lcb_bps?candLong:candShort):(candLong||candShort||null);
-                    if(!chosen) continue;
-
-                    fbCands.push({
-                      symbol:p.c.symbol, base:p.c.base, quote:p.c.quote, qv:p.c.qv,
-                      side:chosen.side, p_lcb:+chosen.p_lcb, p_raw:+chosen.p_raw, p_win:+(Math.max(p.pLong0,p.pShort0)).toFixed(3),
-                      exp_bps:chosen.exp_bps, exp_lcb_bps:chosen.exp_lcb_bps,
-                      tp_bps:chosen.tp_bps, sl_bps:chosen.sl_bps, rrr:+(chosen.tp_bps/Math.max(1,chosen.sl_bps)).toFixed(2),
-                      spread_bps:p.spreadBps, cost_bps:chosen.cost_bps,
-                      adx:+(p.adx5||0).toFixed(1), atr_bps:p.atr_bps, regime:chosen.regime, style:chosen.style,
-                      score:60, n_conf:Math.round(60+40*clamp((p.adx5-16)/14,0,1)), obi:0,
-                      hold_sec:chosen.hold_sec, liq_pct:+(liqPct.get(p.c.symbol)||0.5).toFixed(3),
-                      ret5:(()=>{ const r=[]; for(let i=1;i<p.c5.length;i++) r.push(Math.log(p.c5[i]/p.c5[i-1])); return r.slice(-36); })(),
-                      fill_prob:0.7, dyn_floor:EXP_LCB_MIN_THIS,
-                      rsi14:p.rsi14, z_vwap:p.z_vwap,
-                      vol1h_est_usd:p.vol1h_est_usd, depth1p_usd:0,
-                      direction_env:DIRECTION, side_bias:p.trendBias,
-                      swing_lo_px:(function swingLo(){ const lows=p.k15?.map(x=>+x[3])||[]; if(lows.length<40) return null; return Math.min(...lows.slice(-40)); })()
-                    });
-                  }catch{}
-                }
-                fbCands.sort((a,b)=> b.exp_lcb_bps!==a.exp_lcb_bps ? b.exp_lcb_bps-a.exp_lcb_bps
-                                           : b.exp_bps!==a.exp_bps ? b.exp_bps-a.exp_bps
-                                           : b.score!==a.score ? b.score-a.score
-                                           : (b.qv||0)-(a.qv||0));
-                const topup = chooseWithCorr(fbCands, TARGET_K, selected);
-                if(topup.length>selected.length) selectionSources.push("forced_fallback_topup");
-                selected = topup.slice(0,TARGET_K);
-              }
-
-              // Ensure minimum short share in chop (at least 1 short in 3 picks when mean-revert weight is high)
-              const needShortHedge = (weightsReg.wMR>=0.50);
-              if(needShortHedge){
-                const shorts=selected.filter(x=>x.side==="short").length;
-                if(shorts<1){
-                  // Try to replace weakest long with best short from refined not already selected
-                  const bestShort = refined.filter(r=> r.side==="short" && !selected.find(s=>s.symbol===r.symbol))
-                                           .sort((a,b)=> b.exp_lcb_bps-a.exp_lcb_bps)[0];
-                  if(bestShort){
-                    let weakestLongIdx=-1, weakestScore=Infinity;
-                    for(let i=0;i<selected.length;i++){ if(selected[i].side==="long" && selected[i].exp_lcb_bps<weakestScore){ weakestScore=selected[i].exp_lcb_bps; weakestLongIdx=i; } }
-                    if(weakestLongIdx>=0){ selected.splice(weakestLongIdx,1,bestShort); selectionSources.push("short_hedge"); }
+              if (strictCount === 0) {
+                // First, try top-of-refined ranking with correlation guards
+                let fallback = [];
+                const have = new Set();
+                const tryAdd = (candList) => {
+                  for (const cand of candList) {
+                    if (fallback.length >= fallbackTarget) break;
+                    if (have.has(cand.symbol)) continue;
+                    let ok = true;
+                    for (const s of fallback) {
+                      const r = corr(cand.ret5 || [], s.ret5 || []);
+                      if (cand.side === "long" && s.side === "long" && r > LONG_SIMILARITY_RHO) { ok = false; break; }
+                      if (r > 0.90) { ok = false; break; }
+                    }
+                    if (!ok) continue;
+                    fallback.push({ ...cand, mp_fill: true, always3: true });
+                    have.add(cand.symbol);
                   }
+                };
+
+                if (refined.length > 0) {
+                  tryAdd(refined);
                 }
+
+                if (fallback.length < fallbackTarget) {
+                  // Forced fallback: rebuild candidates using full analysis (GP, calibration, heavy-tail, costs)
+                  const fbCands = [];
+                  for (const p of picksRaw) {
+                    try {
+                      const book = bookMap.get(p.c.symbol);
+                      if (!book?.bid || !book?.ask) continue;
+                      const mid = (book.bid + book.ask) / 2;
+                      const yR = []; for (let i = 1; i < p.c5.length; i++) yR.push(Math.log(p.c5[i] / p.c5[i-1]));
+                      const mu5 = mean(yR) || 0, sig5 = Math.max(1e-4, std(yR));
+                      const hold_base = clamp(Math.round((weightsReg.wTrend > weightsReg.wMR ? 720 : 560) + 240 * clamp((p.adx5 - 16)/14, 0, 1)), TTL_MIN, TTL_MAX);
+                      const stepsBase = Math.max(1, Math.round(hold_base/300));
+                      const slipL = Math.max(Math.round(p.spreadBps/2), 0);
+                      const slipS = Math.max(Math.round(p.spreadBps/2), 0);
+                      const costLong = COST_BPS + slipL;
+                      const costShort = COST_BPS + slipS;
+                      if (Math.max(costLong, costShort) > MAX_COST_BPS_HARD) continue;
+
+                      // GP features and predictions
+                      const featL = [ clamp((p.adx5 - 16)/14,0,1), clamp(p.z_vwap,-3,3), (p.rsi14||50)/100, 0.0, clamp(p.slope_atr50,0,1) ];
+                      const featS = [ clamp((p.adx5 - 16)/14,0,1), clamp(-p.z_vwap,-3,3),(100-(p.rsi14||50))/100, 0.0, clamp(p.slope_atr50,0,1) ];
+                      let pLong_raw = p.pLong0, pShort_raw = p.pShort0;
+                      if (gpClfLong) pLong_raw = predictGPClass(gpClfLong, featL).p;
+                      if (gpClfShort) pShort_raw = predictGPClass(gpClfShort, featS).p;
+
+                      const strongTrend = (p.adx5 > Math.max(22, MR_ADX_MAX)) || (p.slope_atr50 > MR_SLOPE_MAX_ATR50);
+                      const regime = p.mrLocked ? "trend" : (strongTrend ? "trend" : "meanrevert");
+
+                      const pLong = calibrateP(state,"long",regime,pLong_raw);
+                      const pShort = calibrateP(state,"short",regime,pShort_raw);
+
+                      const pLong_lcb = wilsonLCB(pLong, 80, WILSON_Z);
+                      const pShort_lcb = wilsonLCB(pShort, 80, WILSON_Z);
+
+                      // Long candidate
+                      let candLong = null;
+                      if (ALLOWED.has("long")) {
+                        const styleL = (!strongTrend && !p.mrLocked && p.fadeLongDivergenceOK) ? "mr" : (strongTrend ? "momentum" : "trend");
+                        let slL, tpL, holdL;
+                        if (styleL === "mr") {
+                          slL = Math.round(LONG_BOUNCE_SL_ATR * p.atr_bps);
+                          tpL = Math.round(LONG_BOUNCE_TP_ATR * p.atr_bps);
+                          holdL = clamp(Math.round(Math.max(1800, hold_base)), 1200, 3600);
+                        } else {
+                          slL = Math.round(clamp(p.atr_bps * 0.50, Math.round(0.35 * p.atr_bps), Math.round(0.65 * p.atr_bps)));
+                          tpL = Math.round(clamp(p.atr_bps * 0.95, Math.round(0.60 * p.atr_bps), Math.round(1.20 * p.atr_bps)));
+                          holdL = clamp(Math.round(Math.max(LONG_BOUNCE_HOLD_MIN_SEC, Math.min(hold_base, LONG_BOUNCE_HOLD_MAX_SEC))), LONG_BOUNCE_HOLD_MIN_SEC, LONG_BOUNCE_HOLD_MAX_SEC);
+                        }
+                        const simL = pathEVHeavy({ entry:mid, tp_bps:tpL, sl_bps:slL, side:"long", retSeries:yR, mu:mu5, sigma:sig5, steps:stepsBase, N:192, cost_bps:costLong, t_df:Number(process.env.T_SIM_DF||"5"), boot_block:Number(process.env.BOOT_BLOCK||"3") });
+                        const evLongLCB = Math.round(pLong_lcb*tpL - (1-pLong_lcb)*slL - costLong);
+                        candLong = { side:"long", p_lcb:+pLong_lcb.toFixed(3), p_raw:+pLong.toFixed(3),
+                                     cost_bps:costLong, tp_bps:tpL, sl_bps:slL, exp_lcb_bps:evLongLCB, exp_bps:simL.ev_bps,
+                                     hold_sec:holdL, style:styleL, regime };
+                      }
+
+                      // Short candidate
+                      let candShort = null;
+                      if (ALLOWED.has("short")) {
+                        const styleS = (!strongTrend && !p.mrLocked && p.fadeShortDivergenceOK) ? "mr" : (strongTrend ? "momentum" : "trend");
+                        let slS, tpS, holdS;
+                        if (styleS === "mr") {
+                          slS = Math.round(clamp(0.5,0.4,0.6) * p.atr_bps);
+                          tpS = Math.round(clamp(1.0,0.8,1.2) * p.atr_bps);
+                          holdS = clamp(Math.round(Math.max(1800, hold_base)), 1200, 3600);
+                        } else {
+                          slS = Math.round(clamp(p.atr_bps * 0.55, Math.round(0.35 * p.atr_bps), Math.round(0.75 * p.atr_bps)));
+                          tpS = Math.round(clamp(p.atr_bps * 1.00, Math.round(0.70 * p.atr_bps), Math.round(1.40 * p.atr_bps)));
+                          holdS = hold_base;
+                        }
+                        const simS = pathEVHeavy({ entry:mid, tp_bps:tpS, sl_bps:slS, side:"short", retSeries:yR, mu:mu5, sigma:sig5, steps:stepsBase, N:192, cost_bps:costShort, t_df:Number(process.env.T_SIM_DF||"5"), boot_block:Number(process.env.BOOT_BLOCK||"3") });
+                        const evShortLCB = Math.round(pShort_lcb*tpS - (1-pShort_lcb)*slS - costShort);
+                        candShort = { side:"short", p_lcb:+pShort_lcb.toFixed(3), p_raw:+pShort.toFixed(3),
+                                      cost_bps:costShort, tp_bps:tpS, sl_bps:slS, exp_lcb_bps:evShortLCB, exp_bps:simS.ev_bps,
+                                      hold_sec:holdS, style:styleS, regime };
+                      }
+
+                      let chosen = candLong && candShort ? (candLong.exp_lcb_bps >= candShort.exp_lcb_bps ? candLong : candShort) : (candLong || candShort || null);
+                      if (!chosen) continue;
+
+                      const liq = liqPct.get(p.c.symbol) || 0.5;
+                      const score = clamp(Math.round(60 + 30*(chosen.p_lcb-0.5)*2 + 12*clamp((p.adx5-16)/14,0,1) + 7*((liq-0.5)*2) - Math.min(12, Math.max(0,(p.spreadBps-5)/2))), 1, 99);
+
+                      fbCands.push({
+                        symbol:p.c.symbol, base:p.c.base, quote:p.c.quote, qv:p.c.qv,
+                        side:chosen.side, p_lcb:+chosen.p_lcb, p_raw:+chosen.p_raw, p_win:+(Math.max(p.pLong0,p.pShort0)).toFixed(3),
+                        exp_bps:chosen.exp_bps, exp_lcb_bps:chosen.exp_lcb_bps,
+                        tp_bps:chosen.tp_bps, sl_bps:chosen.sl_bps, rrr:+(chosen.tp_bps/Math.max(1,chosen.sl_bps)).toFixed(2),
+                        spread_bps:p.spreadBps, cost_bps:chosen.cost_bps,
+                        adx:+(p.adx5||0).toFixed(1), atr_bps:p.atr_bps, regime:chosen.regime, style:chosen.style,
+                        score, n_conf:Math.round(60+40*clamp((p.adx5-16)/14,0,1)), obi:0,
+                        hold_sec:chosen.hold_sec, liq_pct:+(liq).toFixed(3),
+                        ret5:(()=>{ const r=[]; for(let i=1;i<p.c5.length;i++) r.push(Math.log(p.c5[i]/p.c5[i-1])); return r.slice(-36); })(),
+                        fill_prob:0.7, dyn_floor:EXP_LCB_MIN_THIS,
+                        rsi14:p.rsi14, z_vwap:p.z_vwap,
+                        vol1h_est_usd:p.vol1h_est_usd, depth1p_usd:0,
+                        direction_env:DIRECTION, side_bias:p.trendBias,
+                        swing_lo_px:(function swingLo(){ const lows=p.k15?.map(x=>+x[3])||[]; if(lows.length<40) return null; return Math.min(...lows.slice(-40)); })()
+                      });
+                    } catch {}
+                  }
+
+                  fbCands.sort((a,b)=> b.exp_lcb_bps!==a.exp_lcb_bps ? b.exp_lcb_bps-a.exp_lcb_bps
+                                         : b.exp_bps!==a.exp_bps ? b.exp_bps-a.exp_bps
+                                         : b.score!==a.score ? b.score-a.score
+                                         : (b.qv||0)-(a.qv||0));
+                  tryAdd(fbCands);
+                }
+
+                selected = fallback.slice(0, fallbackTarget);
+                selectionTier = (refined.length > 0) ? "refined_top3" : "forced_fallback_top3";
+              } else {
+                // Strict picks exist — push only strict (cap to TOP_N)
+                selected = selected.slice(0, fallbackTarget);
+                selectionTier = "strict";
               }
-
-              // Mark top-ups as mp_fill/always3 true; keep strict as-is
-              const strictSet=new Set(selectedStrict.map(s=>s.symbol));
-              selected=selected.map(x=> strictSet.has(x.symbol)? x : ({...x, mp_fill:true, always3:true}));
-
-              // Tier label
-              selectionTier = selectionSources.includes("forced_fallback_topup") ? "forced_fallback_top3"
-                              : selectionSources.includes("refined_topup") ? "refined_top3"
-                              : (selectedStrict.length===TARGET_K ? "strict" : "refined_top3");
 
               snapCounts({ selected: selected.length });
 
               // Build picks
-              const wEv=softmax(selected.slice(0,TARGET_K).map(x=>x.exp_lcb_bps),20);
-              let picks = selected.slice(0,TARGET_K).map((x,i)=>{
+              const wEv=softmax(selected.slice(0,fallbackTarget).map(x=>x.exp_lcb_bps),20);
+              let picks = selected.slice(0,fallbackTarget).map((x,i)=>{
                 const bk=bookMap.get(x.symbol); const mid=(bk?.bid && bk?.ask)? ((+bk.bid + +bk.ask)/2) : null;
                 const slF=x.sl_bps/10000, tpF=x.tp_bps/10000;
                 let entry_limit=null, tp_abs=null, sl_abs=null, entry_policy="limit_at_old_sl";
@@ -1030,15 +1042,6 @@ jobs:
                   size_bps = Math.round(base * ((x.style==="momentum")? clamp(MOMENTUM_SIZE_FACTOR,0.25,0.6):1.0));
                 }
                 if(x.mp_fill) size_bps = Math.max(8, Math.round(size_bps * (x.always3? ALWAYS3_SIZE_FACTOR : 0.55)));
-
-                // Symbol heat sizing tweak
-                try{
-                  const st=state.sym_stats?.[x.base]; if(st && st.n>=2){
-                    const wr=(st.wins||0)/Math.max(1,st.n||0), pnl=st.pnl_sum||0;
-                    if(wr<0.35 && pnl<-150) size_bps=Math.max(4, Math.round(size_bps*0.5));
-                    else if(wr>0.60 && pnl>100) size_bps=Math.round(size_bps*1.2);
-                  }
-                }catch{}
 
                 // Long kill-switch size multiplier
                 try{
@@ -1100,7 +1103,7 @@ jobs:
                   state.push_log=Array.isArray(state.push_log)? state.push_log : [];
                   state.push_log.push({ ts:new Date().toISOString(), tier:selectionTier, direction_env:DIRECTION, top_n:picks.length,
                     counts:{ strict:picks.filter(p=>!p.mp_fill).length, always3:picks.filter(p=>p.always3).length },
-                    regime_post:weightsReg, bandit_choice:banditChoice, force_top_n:true,
+                    regime_post:weightsReg, bandit_choice:banditChoice, force_top_n: (selectionTier!=="strict"),
                     symbols:picks.map(p=>({ symbol:p.symbol_full, side:p.side, style:p.style, tier:p.tier, always3:!!p.always3 })) });
                   if(state.push_log.length>300) state.push_log=state.push_log.slice(-300);
                 }catch(e){ console.log("[gha] push_log warn", e?.message||e); }
@@ -1122,7 +1125,7 @@ jobs:
                   exp_lcb_min_bps:EXP_LCB_MIN_THIS, wilson_z:WILSON_Z,
                   calibrated:true, gp_cls:true, isotonic:true, platt:true,
                   heavy_tail_sim:true, t_copula_var_es:true,
-                  mp_top_pool:MP_TOP_POOL, always3:ALWAYS3_ENABLE, rank_fill:true
+                  mp_top_pool:MP_TOP_POOL, always3:ALWAYS3_ENABLE, rank_fill: (selectionTier!=="strict")
                 },
                 dd_gate:(()=>{ const s=state.equity||[]; const day=Date.now()-24*3600*1000; let pnl24=0,cum=0,peak=0,dd=0; for(const e of s){ if(e.ts_ms>=day) pnl24+=e.pnl_bps; cum+=e.pnl_bps; if(cum>peak) peak=cum; dd=Math.min(dd,cum-peak); } return { pnl24_bps:Math.round(pnl24), peak_dd_bps:Math.round(dd), throttle }; })(),
                 tod:{ active:S_H!=null&&E_H!=null, start:S_H, end:E_H },
@@ -1187,4 +1190,3 @@ jobs:
             fi
             exit 0
           fi
-```
