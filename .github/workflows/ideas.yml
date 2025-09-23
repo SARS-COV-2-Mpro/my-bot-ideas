@@ -1,4 +1,4 @@
-name: Ideas Pusher (MEXC ULTIMATE EV@Pusher PRIME v6.2 — Calibrated, Heavy‑Tail, Bandit, Symmetric Guards, MP Top‑20 + Top‑3)
+name: Ideas Pusher (MEXC ULTIMATE EV@Pusher+, PRIME v6.2 Calibrated HeavyTail MP-Top20+Top3)
 
 on:
   workflow_dispatch:
@@ -38,19 +38,19 @@ jobs:
       ACTIVE_UTC_END: ${{ vars.ACTIVE_UTC_END }}
       MEXC_BASE: ${{ vars.MEXC_BASE }}
 
-      # Sizing/behavior knobs
+      # Behavior/sizing
       FORCE_SIZE_BPS: ${{ vars.FORCE_SIZE_BPS }}
 
-      # MP overlay + Top‑3 fallback (set both true to force Top‑3 every run)
+      # MP overlay + Top‑3 fallback (set both true to force Top‑3 every run when universe >= 3)
       MP_TOP_POOL: ${{ vars.MP_TOP_POOL }}             # default 20
       NO_VIABLE_RANK_FILL: ${{ vars.NO_VIABLE_RANK_FILL }}   # with ALWAYS3_ENABLE=true => force Top‑3
       ALWAYS3_ENABLE: ${{ vars.ALWAYS3_ENABLE }}             # enables Top‑3 fallback mode
       ALWAYS3_SIZE_FACTOR: ${{ vars.ALWAYS3_SIZE_FACTOR }}   # default 0.4 sizing on fallback fills
 
-      # Side constraint (you control this)
+      # Side constraint
       DIRECTION: ${{ vars.DIRECTION }}  # "both" | "long" | "short" (default "both")
 
-      # Additional risk/micro overrides
+      # Risk/micro overrides
       MR_SPREAD_MAX_BPS: ${{ vars.MR_SPREAD_MAX_BPS }}
       MAX_COST_BPS_HARD: ${{ vars.MAX_COST_BPS_HARD }}
       EDGE_COST_MULT_MIN: ${{ vars.EDGE_COST_MULT_MIN }}
@@ -62,12 +62,12 @@ jobs:
       CALIB_MIN_PLATT: ${{ vars.CALIB_MIN_PLATT }}   # default 30
       CALIB_MIN_ISO: ${{ vars.CALIB_MIN_ISO }}       # default 120
 
-      # Symmetric long‑side guards (OMG + fixeshor blend)
+      # Symmetric long‑side guards
       NO_LONG_DOWN_ENABLE: ${{ vars.NO_LONG_DOWN_ENABLE }}        # default "true"
       LONG_DOWN_RSI_CUTOFF: ${{ vars.LONG_DOWN_RSI_CUTOFF }}      # default "40"
       LONG_MR_DIVERGENCE_REQ: ${{ vars.LONG_MR_DIVERGENCE_REQ }}  # default "true"
 
-      # Epiluge long policy
+      # Long policy
       LONG_MAX_COST_BPS: ${{ vars.LONG_MAX_COST_BPS }}            # default 12
       LONG_EDGE_MULT_MIN: ${{ vars.LONG_EDGE_MULT_MIN }}          # default 4
       LONG_BOUNCE_SL_ATR: ${{ vars.LONG_BOUNCE_SL_ATR }}          # default 0.50
@@ -87,7 +87,7 @@ jobs:
         with:
           node-version: 20
 
-      - name: Run pusher (PRIME v6.2: Calibrated GP‑Cls + Heavy‑tail sims + Bandit + Symmetric guards + MP Top‑20 + Top‑3 fallback)
+      - name: Run pusher (Prime v6.2 — Calibrated GP-Cls + Heavy-tail sims + Bandit + Symmetric guards + MP Top-20 + Top-3)
         shell: bash
         run: |
           set -euo pipefail
@@ -134,7 +134,7 @@ jobs:
             const randn=()=>{ if(bmSpare!=null){ const v=bmSpare; bmSpare=null; return v; } let u=0,v=0; while(u===0) u=Math.random(); while(v===0) v=Math.random(); const r=Math.sqrt(-2*Math.log(u)); const th=2*Math.PI*v; bmSpare=r*Math.sin(th); return r*Math.cos(th); };
             function randt(df){ if(df<=2) df=2.01; const z=randn(); let x2=0; for(let i=0;i<Math.floor(df);i++){ const z2=randn(); x2+=z2*z2; } const frac=df-Math.floor(df); if(frac>0){ const zf=randn(); x2+=frac*zf*zf; } const chi=x2||1e-6; return z / Math.sqrt(chi/df); }
 
-            // IO snapshot for counts
+            // IO snapshot for counts (for visibility on failures)
             const fs = require('fs');
             function snapCounts(partial){
               try{
@@ -146,7 +146,7 @@ jobs:
               }catch{}
             }
 
-            // Kalman smooth
+            // Kalman (1D RW)
             function kalman1D(obs,{q=1e-5,r=1e-3,x0=null,p0=1e-2}={}){
               if(!obs?.length) return [];
               let x=(x0==null?obs[0]:x0), p=p0;
@@ -161,7 +161,7 @@ jobs:
               return out;
             }
 
-            // ---------- Kernel & GP Classification (Laplace) ----------
+            // ------------- GP Classification (Laplace) -------------
             function pairwiseD2(X, Y){
               const n=X.length, m=Y.length, d=X[0]?.length||0;
               const M=Array.from({length:n},()=>Array(m).fill(0));
@@ -231,68 +231,32 @@ jobs:
               return { p:clamp(p,0.01,0.99), s2 };
             }
 
-            // ---------- Calibration (Platt / Isotonic) ----------
+            // ------------- Calibration (Platt / Isotonic) -------------
             const sigmoidF=(a,b,z)=>1/(1+Math.exp(-(a*z+b)));
             const logitF=(p)=>Math.log((p+1e-12)/(1-(p-1e-12)));
-            function fitPlatt(p,y){ const eps=1e-6, z=p.map(pp=> clamp(pp, eps, 1-eps)).map(logitF); let a=1,b=0; const lr=0.05,iters=400,l2=0.01;
-              for(let t=0;t<iters;t++){ let ga=0, gb=0; for(let i=0;i<y.length;i++){ const s=sigmoidF(a,b,z[i]), e=s-y[i]; ga+=e*z[i]; gb+=e; } ga+=l2*a; gb+=l2*b; a-=lr*ga/y.length; b-=lr*gb/y.length; }
-              return { a, b, n:y.length };
-            }
+            function fitPlatt(p,y){ const eps=1e-6, z=p.map(pp=> clamp(pp,eps,1-eps)).map(logitF); let a=1,b=0; const lr=0.05,it=400,l2=0.01;
+              for(let t=0;t<it;t++){ let ga=0,gb=0; for(let i=0;i<y.length;i++){ const s=sigmoidF(a,b,z[i]), e=s-y[i]; ga+=e*z[i]; gb+=e; } ga+=l2*a; gb+=l2*b; a-=lr*ga/y.length; b-=lr*gb/y.length; }
+              return {a,b,n:y.length}; }
             function applyPlatt(p,ab){ const {a,b}=ab||{a:1,b:0}; return p.map(pi=> sigmoidF(a,b, logitF(clamp(pi,1e-6,1-1e-6)) )); }
-            function fitIsotonic(p,y){
-              const idx=[...p.keys()].sort((i,j)=> p[i]-p[j]);
-              const xs=[], ys=[];
-              for(const i of idx){ xs.push(p[i]); ys.push(y[i]); }
-              const n=xs.length; const g=ys.slice(); const w=Array(n).fill(1);
-              for(let i=0;i<n-1;i++){
-                if(g[i]>g[i+1]){
-                  let j=i;
-                  while(j>=0 && g[j]>g[j+1]){
-                    const ww=w[j]+w[j+1];
-                    const gg=(w[j]*g[j] + w[j+1]*g[j+1])/ww;
-                    w[j]=ww; g[j]=gg;
-                    xs.splice(j,2,(xs[j]));
-                    ys.splice(j,2,(gg));
-                    g.splice(j+1,1);
-                    w.splice(j+1,1);
-                    if(j>0) j--;
-                  }
-                }
-              }
-              return { xs, ys:g, n };
-            }
-            function applyIsotonic(p, iso){
-              if(!iso||!iso.xs?.length||!iso.ys?.length) return p;
-              const xs=iso.xs, ys=iso.ys;
-              return p.map(val=>{
-                if(val<=xs[0]) return ys[0];
-                if(val>=xs[xs.length-1]) return ys[ys.length-1];
-                let lo=0, hi=xs.length-1;
-                while(hi-lo>1){
-                  const mid=((lo+hi)>>1);
-                  if(xs[mid]<=val) lo=mid; else hi=mid;
-                }
-                const t=(val-xs[lo])/Math.max(1e-9,(xs[hi]-xs[lo]));
-                return ys[lo] + t*(ys[hi]-ys[lo]);
-              });
-            }
+            function fitIsotonic(p,y){ const idx=[...p.keys()].sort((i,j)=>p[i]-p[j]); const xs=[],ys=[]; for(const i of idx){ xs.push(p[i]); ys.push(y[i]); }
+              const n=xs.length,g=ys.slice(),w=Array(n).fill(1); for(let i=0;i<n-1;i++){ if(g[i]>g[i+1]){ let j=i; while(j>=0 && g[j]>g[j+1]){ const ww=w[j]+w[j+1], gg=(w[j]*g[j]+w[j+1]*g[j+1])/ww; w[j]=ww; g[j]=gg; xs.splice(j,2,(xs[j])); ys.splice(j,2,(gg)); g.splice(j+1,1); w.splice(j+1,1); if(j>0) j--; } } } return { xs, ys:g, n }; }
+            function applyIsotonic(p,iso){ if(!iso?.xs?.length||!iso?.ys?.length) return p; const xs=iso.xs, ys=iso.ys; return p.map(val=>{ if(val<=xs[0]) return ys[0]; if(val>=xs[xs.length-1]) return ys[ys.length-1]; let lo=0,hi=xs.length-1; while(hi-lo>1){ const mid=((lo+hi)>>1); if(xs[mid]<=val) lo=mid; else hi=mid; } const t=(val-xs[lo])/Math.max(1e-9,(xs[hi]-xs[lo])); return ys[lo]+t*(ys[hi]-ys[lo]); }); }
 
-            // ---------- Heavy‑tail Monte Carlo (t + bootstrap) ----------
+            // ------------- Heavy-tail Monte Carlo (t + bootstrap) -------------
             function pathEVHeavy({entry,tp_bps,sl_bps,side,retSeries,mu,sigma,steps,N=192,cost_bps=10,t_df=5,boot_block=3}){
               const up=(side==="long"), tpF=tp_bps/10000, slF=sl_bps/10000; let ev=0, wins=0; const rets=retSeries||[];
               const boot1=()=>{ if(rets.length<8) return Array(steps).fill(0).map(()=> sigma*Math.sqrt(1/steps)*randn()); const out=[]; while(out.length<steps){ const start=Math.floor(Math.random()*(rets.length-boot_block)); for(let k=0;k<boot_block && out.length<steps;k++) out.push(rets[start+k]||0); } return out.slice(0,steps); };
               for(let n=0;n<N;n++){
-                const mode=(n%2===0)?"t":"boot"; let S=entry, tp=up? entry*(1+tpF):entry*(1-tpF), sl=up? entry*(1-slF):entry*(1+slF); let pnl_bps=0,win=0;
+                const mode=(n%2===0)?"t":"boot";
+                let S=entry, tp=up? entry*(1+tpF):entry*(1-tpF), sl=up? entry*(1-slF):entry*(1+slF);
+                let pnl_bps=0,win=0;
                 const rs=(mode==="t")? Array(steps).fill(0).map(()=> mu + sigma*randt(t_df)/Math.sqrt(steps)) : boot1();
                 for(let t=0;t<steps;t++){
-                  const r=rs[t]; S=S*(1+r);
-                  if(up){ if(S>=tp){ pnl_bps=tp_bps-cost_bps; win=1; break; } if(S<=sl){ pnl_bps=-sl_bps-cost_bps; win=0; break; } }
-                  else { if(S<=tp){ pnl_bps=tp_bps-cost_bps; win=1; break; } if(S>=sl){ pnl_bps=-sl_bps-cost_bps; win=0; break; } }
-                  if(t===steps-1){
-                    const ret=up? (S/entry-1) : (entry/S-1);
-                    pnl_bps=Math.round(ret*10000)-cost_bps;
-                    win=pnl_bps>0?1:0;
-                  }
+                  const r=rs[t];
+                  S=S*(1+r);
+                  if(up){ if(S>=tp){ pnl_bps=tp_bps-cost_bps; win=1; break;} if(S<=sl){ pnl_bps=-sl_bps-cost_bps; win=0; break;} }
+                  else { if(S<=tp){ pnl_bps=tp_bps-cost_bps; win=1; break;} if(S>=sl){ pnl_bps=-sl_bps-cost_bps; win=0; break;} }
+                  if(t===steps-1){ const ret=up? (S/entry-1):(entry/S-1); pnl_bps=Math.round(ret*10000)-cost_bps; win=pnl_bps>0?1:0; }
                 }
                 ev+=pnl_bps; wins+=win;
               }
@@ -300,7 +264,7 @@ jobs:
               return { p, ev_bps:Math.round(ev_mean) };
             }
 
-            // ---------- t‑copula VaR/ES (fixed: removed stray loop) ----------
+            // ------------- t-copula VaR/ES (FIXED) -------------
             function choleskySafe(S){
               const L=cholesky(S);
               if(L) return L;
@@ -308,7 +272,7 @@ jobs:
               const Sc=S.map((r,i)=> r.map((v,j)=> v + (i===j?1e-6:0)));
               return cholesky(Sc);
             }
-            function sampleMultiT(muVec, Sigma, df=6, M=1000){
+            function sampleMultiT(muVec,Sigma,df=6,M=1000){
               const n=muVec.length;
               const L=choleskySafe(Sigma); if(!L) return [];
               const out=[];
@@ -324,51 +288,48 @@ jobs:
             }
             function portfolioVaR_ES_tCopula(picks, df=6){
               if(!picks.length) return { VaR95_bps:0, ES95_bps:0 };
-              const n=picks.length;
-
-              const mu=Array(n).fill(0), sd=Array(n).fill(0);
+              const n=picks.length, mu=Array(n).fill(0), sd=Array(n).fill(0);
               for(let i=0;i<n;i++){
-                const r5=picks[i].ret5 || [];
-                const rMean=mean(r5), rStd=std(r5) || 1e-4;
-                const steps=Math.max(1, Math.round((picks[i].ttl_sec || 600)/300));
+                const r5=picks[i].ret5||[]; const rMean=mean(r5), rStd=std(r5)||1e-4;
+                const steps=Math.max(1, Math.round((picks[i].ttl_sec||600)/300));
                 mu[i]=rMean*steps*10000;
                 sd[i]=rStd*Math.sqrt(steps)*10000;
               }
-
               const R=Array.from({length:n},()=>Array(n).fill(0));
               for(let i=0;i<n;i++){
-                for(let j=0;j<n;j++){
-                  R[i][j]=corr(picks[i].ret5||[], picks[j].ret5||[]);
-                }
+                for(let j=0;j<n;j++) R[i][j]=corr(picks[i].ret5||[], picks[j].ret5||[]);
                 R[i][i]=1;
               }
-
               const Sigma=Array.from({length:n},()=>Array(n).fill(0));
-              for(let i=0;i<n;i++){
-                for(let j=0;j<n;j++){
-                  Sigma[i][j]=R[i][j]*sd[i]*sd[j];
-                }
-              }
+              for(let i=0;i<n;i++) for(let j=0;j<n;j++) Sigma[i][j]=R[i][j]*sd[i]*sd[j];
 
               const draws=sampleMultiT(mu,Sigma,df,1200);
-              const w0=picks.map(p=> p.size_bps || 0);
-              const ws=sum(w0) || 1;
-              const w=w0.map(x=>x/ws);
+              if(!draws.length) return { VaR95_bps:0, ES95_bps:0 };
 
+              const w0=picks.map(p=> p.size_bps||0); const ws=sum(w0)||1; const w=w0.map(x=> x/ws);
               const port=draws.map(d=> d.reduce((acc,di,ii)=> acc + w[ii]*di, 0));
               port.sort((a,b)=>a-b);
               const idx=Math.floor(0.05*port.length);
               const VaR95=port[idx]||0;
-              const ES95=mean(port.slice(0,idx+1));
-              return { VaR95_bps:Math.round(VaR95), ES95_bps:Math.round(ES95) };
+              const ES=mean(port.slice(0,idx+1));
+              return { VaR95_bps:Math.round(VaR95), ES95_bps:Math.round(ES) };
             }
 
-            // ---------- Metrics / Calibration / Drift ----------
+            // ------------- Metrics / Calibration / Drift -------------
             function brier(y,p){ let s=0; for(let i=0;i<y.length;i++) s+=(y[i]-p[i])**2; return s/y.length; }
             function logloss(y,p){ const e=1e-12; let s=0; for(let i=0;i<y.length;i++){ const pp=clamp(p[i],e,1-e); s+=-(y[i]*Math.log(pp)+(1-y[i])*Math.log(1-pp)); } return s/y.length; }
             function auc(y,p){ const pos=[],neg=[]; for(let i=0;i<y.length;i++) (y[i]?pos:neg).push(p[i]); if(!pos.length||!neg.length) return NaN; let wins=0,ties=0; for(const a of pos) for(const b of neg){ if(a>b) wins++; else if(a===b) ties++; } const total=pos.length*neg.length; return (wins+0.5*ties)/total; }
             function pageHinkleyInit(){ return { mean:0, ph:0, minPH:0, alarms:0 }; }
-            function pageHinkleyUpdate(st, x, delta=0.01, lambda=0.05){ st.mean=st.mean+(x-st.mean)*0.01; const d=(x-st.mean)-delta; st.ph+=d; st.minPH=Math.min(st.minPH, st.ph); const stat=st.ph-st.minPH; const drift=stat>lambda; if(drift){ st.ph=0; st.minPH=0; st.alarms++; } return drift; }
+            function pageHinkleyUpdate(st, x, delta=0.01, lambda=0.05){
+              st.mean=st.mean+(x-st.mean)*0.01;
+              const d=(x-st.mean)-delta;
+              st.ph+=d;
+              st.minPH=Math.min(st.minPH, st.ph);
+              const stat=st.ph-st.minPH;
+              const drift=stat>lambda;
+              if(drift){ st.ph=0; st.minPH=0; st.alarms++; }
+              return drift;
+            }
 
             // ---------- Config / ENV ----------
             const UA="gh-actions-ideas-mexc-ultimate/6.2-prime (+https://github.com/)";
@@ -434,12 +395,12 @@ jobs:
             const DEPTH_1P_MIN_USD=Number(process.env.DEPTH_1P_MIN_USD||"200000");
             const MOMENTUM_SIZE_FACTOR=Number(process.env.MOMENTUM_SIZE_FACTOR||"0.5");
 
-            // Symmetric guards
+            // Symmetric guards (long side)
             const NO_LONG_DOWN_ENABLE=(process.env.NO_LONG_DOWN_ENABLE||"true").toLowerCase()==="true";
             const LONG_DOWN_RSI_CUTOFF=Number(process.env.LONG_DOWN_RSI_CUTOFF||"40");
             const LONG_MR_DIVERGENCE_REQ=(process.env.LONG_MR_DIVERGENCE_REQ||"true").toLowerCase()==="true";
 
-            // Long policy (epiluge)
+            // Long policy
             const LONG_MAX_COST_BPS=Number(process.env.LONG_MAX_COST_BPS||"12");
             const LONG_EDGE_MULT_MIN=Number(process.env.LONG_EDGE_MULT_MIN||"4");
             const LONG_BOUNCE_SL_ATR=Number(process.env.LONG_BOUNCE_SL_ATR||"0.50");
@@ -453,20 +414,14 @@ jobs:
             const LONG_KILL_SIZE_MULT=Number(process.env.LONG_KILL_SIZE_MULT||"0.5");
             const LONG_NAUGHTY_BASES=new Set(String(process.env.LONG_NAUGHTY_BASES||"EDU,THE,HEMI,COOKIE,MNT,ASTER").split(",").map(s=>s.trim().toUpperCase()).filter(Boolean));
 
-            // Heavy tails + calibration params
-            const T_VA_DF=Number(process.env.T_VA_DF||"6");
-            const T_SIM_DF=Number(process.env.T_SIM_DF||"5");
-            const BOOT_BLOCK=Number(process.env.BOOT_BLOCK||"3");
-            const CALIB_MIN_PLATT=Number(process.env.CALIB_MIN_PLATT||"30");
-            const CALIB_MIN_ISO=Number(process.env.CALIB_MIN_ISO||"120");
-
             // ---------- Worker endpoints ----------
             const PUSH_URL=process.env.WORKER_PUSH_URL||"";
             const PUSH_TOKEN=process.env.PUSH_TOKEN||"";
             const HEALTH_URL=(()=>{ try{ const u=new URL(PUSH_URL); return `${u.origin}${u.pathname.replace(/\/signals\/push(\?.*)?$/,"/health")}`;}catch{return PUSH_URL.replace(/\/signals\/push(\?.*)?$/,"/health");}})();
 
             // Health ping
-            try{ const r=await fetchWithTimeout(HEALTH_URL,{ headers:{ "Authorization":`Bearer ${PUSH_TOKEN}`, "User-Agent":UA }},5000); let t=""; try{ t=await r.text(); }catch{} console.log("[gha] health", r?.status||"ERR", (t||"").slice(0,160)); }catch(e){ console.log("[gha] health error", e?.message||e); }
+            console.log("[gha] health GET", HEALTH_URL);
+            try{ const r=await fetchWithTimeout(HEALTH_URL,{ headers:{ "Authorization":`Bearer ${PUSH_TOKEN}`, "User-Agent":UA }},5000); let t=""; try{ t=await r.text(); }catch{} console.log("[gha] health status", r?.status||"ERR", (t||"").slice(0,160)); }catch(e){ console.log("[gha] health error", e?.message||e); }
 
             // ---------- MEXC Adapter ----------
             async function pickMexcBase(){ for(const b of MEXC_BASES){ try{ const r=await fetchWithTimeout(`${b}/api/v3/time`,{},4000); if(r?.ok) return b; }catch{} } throw new Error("No healthy MEXC base"); }
@@ -486,24 +441,41 @@ jobs:
             // ---------- State (Gist) ----------
             async function loadState(){
               const token=process.env.GIST_TOKEN, id=process.env.GIST_ID;
-              const init={ v:"mexc-ultimate-6.2-prime", cooldown:{}, cooldown_side:{}, pending:[], equity:[], closed:[],
-                gp_data_clf:[], calibration:{ platt:{}, isotonic:{}, last_fit_ts:0 }, metrics:{ global:{}, by_key:{} }, drift:{},
-                sym_stats:{}, mr_lockout:{}, push_log:[], bandit:{ arms:[ {exp_lcb_min:10, mr_adx_max:18, tries:0, wins:0}, {exp_lcb_min:12, mr_adx_max:20, tries:0, wins:0}, {exp_lcb_min:15, mr_adx_max:22, tries:0, wins:0} ], last_choice:1 } };
+              const init={ v:"mexc-ultimate-6.2-prime",
+                cooldown:{}, cooldown_side:{},
+                pending:[], equity:[], closed:[],
+                gp_data_clf:[],
+                calibration:{ platt:{}, isotonic:{}, last_fit_ts:0 },
+                metrics:{ global:{}, by_key:{} },
+                drift:{}, sym_stats:{}, mr_lockout:{},
+                push_log:[],
+                bandit:{ arms:[ {exp_lcb_min:10, mr_adx_max:18, tries:0, wins:0}, {exp_lcb_min:12, mr_adx_max:20, tries:0, wins:0}, {exp_lcb_min:15, mr_adx_max:22, tries:0, wins:0} ], last_choice:1 }
+              };
               if(!token||!id) return { state:init, persist:null };
-              try{ const r=await fetchWithTimeout(`https://api.github.com/gists/${id}`,{ headers:{Authorization:`Bearer ${token}`,"Accept":"application/vnd.github+json","User-Agent":UA}}); if(!r.ok) return { state:init, persist:null };
+              try{
+                const r=await fetchWithTimeout(`https://api.github.com/gists/${id}`,{ headers:{Authorization:`Bearer ${token}`,"Accept":"application/vnd.github+json","User-Agent":UA}}); if(!r.ok) return { state:init, persist:null };
                 const g=await r.json(); const c=g.files?.["state.json"]?.content; const s=c?JSON.parse(c):init;
-                for(const k of ["mr_lockout","closed","push_log","gp_data_clf"]) if(!s[k]) s[k]= (k==="mr_lockout"? {}: []);
+                if(!s.mr_lockout) s.mr_lockout={};
+                if(!Array.isArray(s.closed)) s.closed=[];
+                if(!Array.isArray(s.push_log)) s.push_log=[];
                 if(!s.calibration) s.calibration={ platt:{}, isotonic:{}, last_fit_ts:0 };
                 if(!s.metrics) s.metrics={ global:{}, by_key:{} };
-                if(!s.drift) s.drift={}; if(!s.sym_stats) s.sym_stats={};
+                if(!s.drift) s.drift={};
+                if(!s.sym_stats) s.sym_stats={};
+                if(!s.gp_data_clf) s.gp_data_clf=[];
                 if(!s.bandit) s.bandit={ arms:[{exp_lcb_min:12,mr_adx_max:20,tries:0,wins:0}], last_choice:0 };
                 return { state:s, persist:{id,token} };
               }catch{ return { state:init, persist:null }; }
             }
             async function saveState(persist,state){
-              if(!persist) return; try{ await fetchWithTimeout(`https://api.github.com/gists/${persist.id}`,{ method:"PATCH",
-                headers:{Authorization:`Bearer ${persist.token}`,"Accept":"application/vnd.github+json","Content-Type":"application/json","User-Agent":UA},
-                body: JSON.stringify({ files:{ "state.json":{ content: JSON.stringify(state) } } }) }); }catch{}
+              if(!persist) return;
+              try{
+                await fetchWithTimeout(`https://api.github.com/gists/${persist.id}`,{
+                  method:"PATCH",
+                  headers:{Authorization:`Bearer ${persist.token}`,"Accept":"application/vnd.github+json","Content-Type":"application/json","User-Agent":UA},
+                  body: JSON.stringify({ files:{ "state.json":{ content: JSON.stringify(state) } } })
+                });
+              }catch{}
             }
 
             // ---------- Pending eval / labels ----------
@@ -538,7 +510,7 @@ jobs:
                   if(state.gp_data_clf.length>1200) state.gp_data_clf=state.gp_data_clf.slice(-1200);
                 }
                 const sb=state.sym_stats?.[p.base]||{ n:0,wins:0,pnl_sum:0 }; sb.n++; if(pnl_bps>0) sb.wins++; sb.pnl_sum+=pnl_bps; state.sym_stats[p.base]=sb;
-                // bandit reward: +1 on win
+
                 if(state.bandit?.arms){ const idx=state.bandit.last_choice??-1; if(idx>=0){ const arm=state.bandit.arms[idx]; arm.tries=(arm.tries||0)+1; if(pnl_bps>0) arm.wins=(arm.wins||0)+1; } }
               }
               state.pending=keep;
@@ -560,8 +532,10 @@ jobs:
               state.calibration.last_fit_ts=Date.now();
             }
             function calibrateP(state,side,regime,pRaw){
-              const k=`${side}_${String(regime).includes("mean")?"mr":"trend"}`; const iso=state.calibration.isotonic[k]; if(iso?.n>=Number(process.env.CALIB_MIN_ISO||"120")) return (applyIsotonic([pRaw],iso))[0];
-              const pl=state.calibration.platt[k]; if(pl?.n>=Number(process.env.CALIB_MIN_PLATT||"30")) return (applyPlatt([pRaw],pl))[0]; return pRaw;
+              const k=`${side}_${String(regime).includes("mean")?"mr":"trend"}`;
+              const iso=state.calibration.isotonic[k]; if(iso?.n>=Number(process.env.CALIB_MIN_ISO||"120")) return (applyIsotonic([pRaw],iso))[0];
+              const pl=state.calibration.platt[k]; if(pl?.n>=Number(process.env.CALIB_MIN_PLATT||"30")) return (applyPlatt([pRaw],pl))[0];
+              return pRaw;
             }
 
             // ---------- Main ----------
@@ -583,7 +557,6 @@ jobs:
               const universe=filt.slice(0,UNIV_TARGET_MAX);
               console.log("[gha] universe", universe.length, "dyn_min_qv", dynMinQV);
               snapCounts({ universe: universe.length });
-              if(!universe.length) reason = (reason!=="ok"?reason:"no_universe");
 
               // Benchmarks
               const BTC="BTCUSDT", ETH="ETHUSDT", SOL="SOLUSDT";
@@ -594,7 +567,7 @@ jobs:
               let btcRoc15=0; try{ const c=kBTC15?.map(x=>+x[4])||[]; const prev3=c.at(-4)||c.at(-2)||c.at(-1)||0; const last=c.at(-1)||0; btcRoc15=prev3? (last/prev3 - 1) : 0; }catch{}
               const btcGreen=(btc15.up && btc1h.up && btcRoc15>0.001);
 
-              // Lightweight regime weights
+              // Regime weights (lightweight)
               function regimeFeatures(k15){ if(!k15||k15.length<ADX_P+5) return []; const h=k15.map(x=>+x[2]), l=k15.map(x=>+x[3]), c=k15.map(x=>+x[4]); const {adx}=computeADX_ATR(h,l,c,ADX_P)||{adx:0}; const roc=(c.at(-1)/c.at(-5)-1); const winS=20, retW=[]; for(let i=c.length-winS;i<c.length;i++) retW.push((c[i]/c[i-1])-1); const bbWidth=std(retW)*Math.sqrt(winS); const atr=(computeADX_ATR(h,l,c,ADX_P)||{atr:1}).atr||1; const kelWidth=atr/c.at(-1); const squeeze=kelWidth>0? (bbWidth/kelWidth):1; return [roc, clamp((adx-10)/30,0,1), clamp((1.15-squeeze)/0.45,0,1)]; }
               const seqFeat=[]; const rollSeq=(k)=>{ if(!k) return; for(let i=5;i<Math.min(k.length,80);i++){ const seg=k.slice(i-5,i+1); const f=regimeFeatures(seg); if(f.length) seqFeat.push(f); } };
               rollSeq(kBTC15); rollSeq(kETH15);
@@ -696,7 +669,6 @@ jobs:
 
                     const boUp=(last>dcHi), boDn=(last<dcLo);
                     let boBase=(boUp||boDn?1.0:0.35)*(0.6+0.4*adxF);
-                    // squeeze bonus
                     { const winS=20, retW=[]; for(let i=c5.length-winS;i<c5.length;i++) retW.push((c5[i]/c5[i-1])-1); const bbWidth=std(retW)*Math.sqrt(winS); const kelWidth=(atr5/last); const sqRatio=kelWidth>0? (bbWidth/kelWidth):1; const sqScore=clamp((1.15-sqRatio)/0.45,0,1); boBase*=(1+0.4*sqScore); }
                     const sideBO= boUp?"long": boDn?"short": ((0.6*roc5+0.4*roc15)>=0?"long":"short");
                     let pBO = clamp(0.5 + 0.29*(boBase*(sideBO==="long"?1:-1)), 0.35, 0.96);
@@ -740,7 +712,7 @@ jobs:
                     for(let i=0;i<Math.min(OBI_TOPN,depth.asks.length);i++){ const pr=+depth.asks[i][0], q=+depth.asks[i][1]; if(pr>0&&q>0) askNot+=pr*q*w(i); }
                     obi = (bidNot+askNot>0)? (bidNot-askNot)/(bidNot+askNot) : 0;
 
-                    const vwapFill=(levels,targetUSD)=>{ let remain=targetUSD,val=0,qty=0; for(const [ps,qs] of levels){ const pr=+ps, q=+qs; if(!(pr>0&&q>0)) continue; const can=pr*q; const take=Math.min(remain,can), tq=take/pr; val+=pr*tq; qty+=tq; remain-=take; if(remain<=1e-6) break; } return { px: qty>0? val/qty : null, filledUSD:(targetUSD-remain) }; };
+                    const vwapFill=(levels,targetUSD)=>{ let remain=targetUSD,val=0,qty=0; for(const [ps,qs] of levels){ const pr=+ps, q=+qs; if(!(pr>0&&q>0)) continue; const can=pr*q, take=Math.min(remain,can), tq=take/pr; val+=pr*tq; qty+=tq; remain-=take; if(remain<=1e-6) break; } return { px: qty>0? val/qty : null, filledUSD:(targetUSD-remain) }; };
                     const buy=vwapFill(depth.asks, Math.max(50,NOTIONAL)), sell=vwapFill(depth.bids, Math.max(50,NOTIONAL));
                     slipL= buy.px? Math.max(0, Math.round((buy.px-mid)/mid*10000)) : slipL;
                     slipS= sell.px? Math.max(0, Math.round((mid-sell.px)/mid*10000)) : slipS;
@@ -752,7 +724,7 @@ jobs:
                     depth1pUSD=depth1p;
                   }
 
-                  // Allowed sides (direction + bias + epiluge long policy)
+                  // Allowed sides (direction + bias + long policy)
                   const envAllowed=(dir)=>ALLOWED.has(dir), biasAllows=(dir)=> (p.trendBias==="both")? true : (p.trendBias==="long_only"? dir==="long" : dir==="short");
                   const shortAllowedByTrend=!p.noShortUp;
                   const coinUpMultiTF=(p.up15 && p.up1h);
@@ -805,7 +777,7 @@ jobs:
                   // Long candidate
                   let candLong=null;
                   if(allowedLong){
-                    const mrOk = allowMR("long") && (p.fadeLongDivergenceOK || !LONG_MR_DIVERGENCE_REQ);
+                    const mrOk = allowMR("long") && (LONG_MR_DIVERGENCE_REQ ? p.fadeLongDivergenceOK : true);
                     const styleL = mrOk ? "mr" : (strongTrend ? "momentum":"trend");
                     let holdL = mrOk ? clamp(Math.round(Math.max(1800, hold_base)), 1200, 3600)
                                      : clamp(Math.round(Math.max(LONG_BOUNCE_HOLD_MIN_SEC, Math.min(hold_base, LONG_BOUNCE_HOLD_MAX_SEC))), LONG_BOUNCE_HOLD_MIN_SEC, LONG_BOUNCE_HOLD_MAX_SEC);
@@ -891,13 +863,12 @@ jobs:
                   let ok=true; for(const s of selected){ const r=corr(cand.ret5||[],s.ret5||[]); if(cand.side==="long" && s.side==="long" && r>LONG_SIMILARITY_RHO){ ok=false; break; } if(r>0.90){ ok=false; break; } }
                   if(ok) selected.push({ ...cand, mp_fill:true });
                 }
-                if(selected.some(x=>!x.mp_fill)) selectionTier = "strict_mp_topup";
-                else if(selected.length) selectionTier = "mp_top20";
+                if(selected.some(x=>x.mp_fill)) selectionTier = selected.some(x=>!x.mp_fill) ? "strict_mp_topup" : "mp_top20";
               }
 
-              // Forced Top‑3 fallback
+              // Forced Top‑3 fallback (when BOTH flags true)
               const forceTopN = ALWAYS3_ENABLE && NO_VIABLE_RANK_FILL;
-              const fallbackTarget=TARGET_K;
+              const fallbackTarget = Math.min(TARGET_K, universe.length);
               if(forceTopN && selected.length < fallbackTarget){
                 const have=new Set(selected.map(s=>s.symbol));
                 for(const cand of refined){
@@ -923,7 +894,7 @@ jobs:
                   if(x.side==="long"){
                     const refLow = x.swing_lo_px || null;
                     const baseline = mid*(1 - Math.max(0.001, slF*0.5));
-                    const refBased = refLow? refLow*(1 + Number(process.env.LONG_ENTRY_BOUNCE_OFFSET||"0.0015")): baseline;
+                    const refBased = refLow? refLow*(1 + LONG_ENTRY_BOUNCE_OFFSET): baseline;
                     entry_limit = Math.max(refBased, baseline);
                     tp_abs = entry_limit*(1 + tpF);
                     sl_abs = entry_limit*(1 - slF);
@@ -944,7 +915,15 @@ jobs:
                 }
                 if(x.mp_fill) size_bps = Math.max(8, Math.round(size_bps * (x.always3? ALWAYS3_SIZE_FACTOR : 0.55)));
 
-                const exec_policy = { exec:"maker_or_strict_limit", max_slip_bps:3, prefer_post_only: (x.spread_bps||99)<=6 && (x.depth1p_usd||0)>=Number(process.env.DEPTH_1P_MIN_USD||"200000") };
+                // Long kill-switch size multiplier
+                try{
+                  const last200=(state.closed||[]).slice(-200);
+                  const longs=last200.filter(r=>r.side==="long"); const n=longs.length, wins=longs.filter(r=>(r.pnl_bps||0)>0).length, pnlSum=sum(longs.map(r=>r.pnl_bps||0));
+                  const wr = n>0? wins/n : 1; const killActive=(n>=LONG_KILL_MIN_TRADES)&&((wr<LONG_KILL_WINRATE)|| (pnlSum<0));
+                  if(killActive && x.side==="long") size_bps=Math.max(4, Math.round(size_bps*LONG_KILL_SIZE_MULT));
+                }catch{}
+
+                const exec_policy = { exec:"maker_or_strict_limit", max_slip_bps:3, prefer_post_only: (x.spread_bps||99)<=6 && (x.depth1p_usd||0)>=DEPTH_1P_MIN_USD };
 
                 // GP training feature vector
                 const r = x.rsi14 ?? 50, z = x.z_vwap ?? 0;
@@ -954,7 +933,7 @@ jobs:
                 return { symbol:x.base, symbol_full:x.symbol, quote:x.quote,
                   side:x.side, rank:i+1, ttl_sec:ttl, p_win:x.p_win, p_lcb:x.p_lcb, p_raw:x.p_raw, calib_key,
                   tp_bps:x.tp_bps, sl_bps:x.sl_bps, rrr:+(x.tp_bps/Math.max(1,x.sl_bps)).toFixed(2),
-                  exp_lcb_bps:x.exp_lcb_bps, ev_bps:x.ev_bps,
+                  exp_lcb_bps:x.exp_lcb_bps, ev_bps:x.exp_bps,
                   spread_bps:x.spread_bps, cost_bps:x.cost_bps, adx:x.adx, atr_bps:x.atr_bps, n_conf:x.n_conf, obi:x.obi||0,
                   regime:x.regime, style:x.style, liq_pct:x.liq_pct, fill_prob:x.fill_prob||0.5,
                   entry_policy, entry_type:"limit", activation:"on_fill", entry_mid:mid, entry_limit, tp_abs, sl_abs,
@@ -1028,7 +1007,7 @@ jobs:
               console.log(`[gha] pushing ${picks.length} ideas (${selectionTier}${(ALWAYS3_ENABLE&&NO_VIABLE_RANK_FILL)?" | forced-topN":""}) to ${PUSH_URL}`);
               try{
                 const r=await fetchWithTimeout(PUSH_URL,{ method:"POST", headers:{ "Content-Type":"application/json","Authorization":`Bearer ${PUSH_TOKEN}` }, body: JSON.stringify(payload) },15000);
-                let txt=""; try{ txt=await r.text(); }catch{} console.log(`[gha] push status ${r?.status||"ERR"} ${(txt||"").slice(0,400)}`);
+                let txt=""; try{ txt=await r.text(); }catch{} console.log("[gha] push status", r?.status||"ERR", (txt||"").slice(0,400));
               }catch(e){ console.log("[gha] push failed", e?.message||e); }
 
             }catch(e){
@@ -1038,18 +1017,18 @@ jobs:
               console.log("[gha] pushing 0 ideas to", process.env.WORKER_PUSH_URL||"");
               try{
                 const r=await fetchWithTimeout(process.env.WORKER_PUSH_URL,{ method:"POST", headers:{ "Content-Type":"application/json","Authorization":`Bearer ${process.env.PUSH_TOKEN||""}` }, body: JSON.stringify(payload) },15000);
-                let txt=""; try{ txt=await r.text(); }catch{} console.log(`[gha] push status ${r?.status||"ERR"} ${(txt||"").slice(0,200)}`);
+                let txt=""; try{ txt=await r.text(); }catch{} console.log("[gha] push status", r?.status||"ERR", (txt||"").slice(0,200));
               }catch(e2){ console.log("[gha] push failed", e2?.message||e2); }
             }
           })();
           NODE
           EXIT_CODE=$?
 
-          # Shell-level fallback
+          # Shell-level fallback (in case node crashed before posting)
           set -e
           if [[ $EXIT_CODE -ne 0 ]]; then
             echo "[gha] pusher exited with code $EXIT_CODE — sending minimal payload so tail shows a [push] line"
-            if [[ -n "${WORKER_PUSH_URL:-}" ]] ; then
+            if [[ -n "${WORKER_PUSH_URL:-}" ]]; then
               health_url="${WORKER_PUSH_URL/\/signals\/push/\/health}"
               echo "[gha] fallback health GET ${health_url}"
               curl -sS -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${PUSH_TOKEN}" --max-time 8 "${health_url}" || true
