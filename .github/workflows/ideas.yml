@@ -1,3 +1,4 @@
+```yaml
 name: Ideas Pusher (MEXC ULTIMATE EV@Pusher+, PRIME v6.2 Calibrated HeavyTail MP-Top20+Top3)
 
 on:
@@ -418,9 +419,17 @@ jobs:
             const EDGE_COST_MULT_MIN=Number(process.env.EDGE_COST_MULT_MIN||"6");
 
             // ---------- Worker endpoints ----------
-            const PUSH_URL=process.env.WORKER_PUSH_URL||"";
-            const PUSH_TOKEN=process.env.PUSH_TOKEN||"";
-            const HEALTH_URL=(()=>{ try{ const u=new URL(PUSH_URL); return `${u.origin}${u.pathname.replace(/\/signals\/push(\?.*)?$/,"/health")}`;}catch{return PUSH_URL.replace(/\/signals\/push(\?.*)?$/,"/health");}})();
+            const cleanURL = (s)=> String(s||"").replace(/[\r\n]/g,"").trim();
+            const PUSH_URL = cleanURL(process.env.WORKER_PUSH_URL||"");
+            const PUSH_TOKEN = cleanURL(process.env.PUSH_TOKEN||"");
+            const HEALTH_URL = (()=>{
+              try{
+                const u=new URL(PUSH_URL);
+                return `${u.origin}${u.pathname.replace(/\/signals\/push(\?.*)?$/,"/health")}`;
+              }catch{
+                return cleanURL(PUSH_URL).replace(/\/signals\/push(\?.*)?$/,"/health");
+              }
+            })();
 
             // Health ping
             console.log("[gha] health GET", HEALTH_URL);
@@ -616,7 +625,8 @@ jobs:
                     const k5=await fetchK(c.symbol,"5m",K5M); if(!k5||k5.length<Math.max(EMA_SLOW+200,ATR_P+50)){ pfStats.dropped.k5++; return null; }
                     const k15=await fetchK(c.symbol,"15m",K15M); const k1h=await fetchK(c.symbol,"1h",K1H);
 
-                    const c5_raw=k5.map(x=>+x[4]); const c5=kalman1D(c5_raw,{q:1e-4,r:5e-4,x0:c5_raw[0],p0=1e-2});
+                    const c5_raw=k5.map(x=>+x[4]);
+                    const c5=kalman1D(c5_raw,{q:1e-4,r:5e-4,x0:c5_raw[0],p0:1e-2});
                     const h5=k5.map(x=>+x[2]), l5=k5.map(x=>+x[3]), v5=k5.map(x=>+x[5]);
                     const em21=emaSeries(c5,EMA_FAST), em50s=emaSeries(c5,EMA_SLOW), em200s=emaSeries(c5,200);
                     const em50=em50s?.at(-1), em200=em200s?.at(-1), em50Prev=em50s?.at(-51);
@@ -1143,10 +1153,18 @@ jobs:
           set -e
           if [[ $EXIT_CODE -ne 0 ]]; then
             echo "[gha] pusher exited with code $EXIT_CODE — sending minimal payload so tail shows a [push] line"
-            if [[ -n "${WORKER_PUSH_URL:-}" ]]; then
-              health_url="${WORKER_PUSH_URL/\/signals\/push/\/health}"
+
+            CLEAN_PUSH_URL="$(printf %s "${WORKER_PUSH_URL:-}" | tr -d '\r\n')"
+            CLEAN_PUSH_TOKEN="$(printf %s "${PUSH_TOKEN:-}" | tr -d '\r\n')"
+
+            if [[ -n "$CLEAN_PUSH_URL" ]]; then
+              health_url="$(printf %s "$CLEAN_PUSH_URL" | sed -E 's#/signals/push(\?.*)?$#/health#')"
               echo "[gha] fallback health GET ${health_url}"
-              curl -sS -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${PUSH_TOKEN}" --max-time 8 "${health_url}" || true
+              curl -sS -o /dev/null -w "%{http_code}" \
+                -H "Authorization: Bearer ${CLEAN_PUSH_TOKEN}" \
+                --max-time 8 \
+                "$health_url" || true
+
               if [[ -f /tmp/pusher_counts.json ]]; then
                 echo "[gha] last counts snapshot: $(cat /tmp/pusher_counts.json)"
                 counts=$(cat /tmp/pusher_counts.json)
@@ -1156,15 +1174,17 @@ jobs:
               fi
               now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
               payload='{"ts":"'"$now"'","mode":"normal","source":"external_pusher","meta":{"origin":"github_actions","reason":"fallback_node_error","counts":'"$counts"'},"top_n":0,"ideas":[]}'
-              echo "[gha] pushing 0 ideas to ${WORKER_PUSH_URL}"
+
+              echo "[gha] pushing 0 ideas to ${CLEAN_PUSH_URL}"
               curl -sS -o /tmp/push_resp.txt -w "%{http_code}" -X POST \
                 -H "Content-Type: application/json" \
-                -H "Authorization: Bearer ${PUSH_TOKEN}" \
+                -H "Authorization: Bearer ${CLEAN_PUSH_TOKEN}" \
                 --data "${payload}" \
                 --max-time 12 \
-                "${WORKER_PUSH_URL}" || true
+                "$CLEAN_PUSH_URL" || true
             else
               echo "[gha] WORKER_PUSH_URL is empty; skip fallback curl"
             fi
             exit 0
           fi
+```
