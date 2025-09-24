@@ -3,7 +3,7 @@ name: Ideas Pusher (MEXC ULTIMATE EV@Pusher+, PRIME v6.2 Calibrated HeavyTail MP
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/20 * * * *"
+    - cron: "*/45 * * * *"
 
 permissions:
   contents: read
@@ -415,17 +415,9 @@ jobs:
             const LONG_NAUGHTY_BASES=new Set(String(process.env.LONG_NAUGHTY_BASES||"EDU,THE,HEMI,COOKIE,MNT,ASTER").split(",").map(s=>s.trim().toUpperCase()).filter(Boolean));
 
             // ---------- Worker endpoints ----------
-            const cleanURL = (s)=> String(s||"").replace(/[\r\n]/g,"").trim();
-            const PUSH_URL = cleanURL(process.env.WORKER_PUSH_URL||"");
-            const PUSH_TOKEN = cleanURL(process.env.PUSH_TOKEN||"");
-            const HEALTH_URL = (()=>{
-              try{
-                const u=new URL(PUSH_URL);
-                return `${u.origin}${u.pathname.replace(/\/signals\/push(\?.*)?$/,"/health")}`;
-              }catch{
-                return cleanURL(PUSH_URL).replace(/\/signals\/push(\?.*)?$/,"/health");
-              }
-            })();
+            const PUSH_URL=process.env.WORKER_PUSH_URL||"";
+            const PUSH_TOKEN=process.env.PUSH_TOKEN||"";
+            const HEALTH_URL=(()=>{ try{ const u=new URL(PUSH_URL); return `${u.origin}${u.pathname.replace(/\/signals\/push(\?.*)?$/,"/health")}`;}catch{return PUSH_URL.replace(/\/signals\/push(\?.*)?$/,"/health");}})();
 
             // Health ping
             console.log("[gha] health GET", HEALTH_URL);
@@ -1144,7 +1136,7 @@ jobs:
               const payload={ ts:new Date().toISOString(), mode:"normal", source:"external_pusher", meta:{ origin:"github_actions", reason, error:(e?.message||String(e)).slice(0,220), counts:countsSnap }, top_n:0, ideas:[] };
               console.log("[gha] pushing 0 ideas to", process.env.WORKER_PUSH_URL||"");
               try{
-                const r=await fetchWithTimeout(process.env.WORKER_PUSH_URL,{ method:"POST", headers:{ "Content-Type": "application/json","Authorization":`Bearer ${process.env.PUSH_TOKEN||""}` }, body: JSON.stringify(payload) },15000);
+                const r=await fetchWithTimeout(process.env.WORKER_PUSH_URL,{ method:"POST", headers:{ "Content-Type":"application/json","Authorization":`Bearer ${process.env.PUSH_TOKEN||""}` }, body: JSON.stringify(payload) },15000);
                 let txt=""; try{ txt=await r.text(); }catch{} console.log("[gha] push status", r?.status||"ERR", (txt||"").slice(0,200));
               }catch(e2){ console.log("[gha] push failed", e2?.message||e2); }
             }
@@ -1156,18 +1148,10 @@ jobs:
           set -e
           if [[ $EXIT_CODE -ne 0 ]]; then
             echo "[gha] pusher exited with code $EXIT_CODE — sending minimal payload so tail shows a [push] line"
-
-            CLEAN_PUSH_URL="$(printf %s "${WORKER_PUSH_URL:-}" | tr -d '\r\n')"
-            CLEAN_PUSH_TOKEN="$(printf %s "${PUSH_TOKEN:-}" | tr -d '\r\n')"
-
-            if [[ -n "$CLEAN_PUSH_URL" ]]; then
-              health_url="$(printf %s "$CLEAN_PUSH_URL" | sed -E 's#/signals/push(\?.*)?$#/health#')"
+            if [[ -n "${WORKER_PUSH_URL:-}" ]]; then
+              health_url="${WORKER_PUSH_URL/\/signals\/push/\/health}"
               echo "[gha] fallback health GET ${health_url}"
-              curl -sS -o /dev/null -w "%{http_code}" \
-                -H "Authorization: Bearer ${CLEAN_PUSH_TOKEN}" \
-                --max-time 8 \
-                "$health_url" || true
-
+              curl -sS -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${PUSH_TOKEN}" --max-time 8 "${health_url}" || true
               if [[ -f /tmp/pusher_counts.json ]]; then
                 echo "[gha] last counts snapshot: $(cat /tmp/pusher_counts.json)"
                 counts=$(cat /tmp/pusher_counts.json)
@@ -1177,14 +1161,13 @@ jobs:
               fi
               now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
               payload='{"ts":"'"$now"'","mode":"normal","source":"external_pusher","meta":{"origin":"github_actions","reason":"fallback_node_error","counts":'"$counts"'},"top_n":0,"ideas":[]}'
-
-              echo "[gha] pushing 0 ideas to ${CLEAN_PUSH_URL}"
+              echo "[gha] pushing 0 ideas to ${WORKER_PUSH_URL}"
               curl -sS -o /tmp/push_resp.txt -w "%{http_code}" -X POST \
                 -H "Content-Type: application/json" \
-                -H "Authorization: Bearer ${CLEAN_PUSH_TOKEN}" \
+                -H "Authorization: Bearer ${PUSH_TOKEN}" \
                 --data "${payload}" \
                 --max-time 12 \
-                "$CLEAN_PUSH_URL" || true
+                "${WORKER_PUSH_URL}" || true
             else
               echo "[gha] WORKER_PUSH_URL is empty; skip fallback curl"
             fi
