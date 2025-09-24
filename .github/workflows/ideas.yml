@@ -1,4 +1,4 @@
-name: Ideas Pusher (MEXC ULTIMATE EV@Pusher+, PRIME v6.2 Calibrated HeavyTail MP-Top20+Top3)
+name: Ideas Pusher (MEXC ULTIMATE EV@Pusher+, PRIME v6.3 Omega-aware)
 
 on:
   workflow_dispatch:
@@ -81,13 +81,26 @@ jobs:
       LONG_KILL_SIZE_MULT: ${{ vars.LONG_KILL_SIZE_MULT }}        # default 0.5
       LONG_NAUGHTY_BASES: ${{ vars.LONG_NAUGHTY_BASES }}          # default "EDU,THE,HEMI,COOKIE,MNT,ASTER"
 
+      # OMEGA integration
+      OMEGA_ENABLE: ${{ vars.OMEGA_ENABLE }}           # "true" | "false" (default true)
+      OMEGA_URL: ${{ secrets.OMEGA_URL }}
+      OMEGA_TOKEN: ${{ secrets.OMEGA_TOKEN }}
+      OMEGA_TIMEOUT_MS: ${{ vars.OMEGA_TIMEOUT_MS }}    # default 3500
+      OMEGA_MAX_W: ${{ vars.OMEGA_MAX_W }}              # default 0.45 (cap 0.0–0.6)
+      OMEGA_VETO_LOW: ${{ vars.OMEGA_VETO_LOW }}        # default 0.35
+      OMEGA_BOOST_HIGH: ${{ vars.OMEGA_BOOST_HIGH }}    # default 0.65
+      OMEGA_BETA: ${{ vars.OMEGA_BETA }}                # default 0.25
+      OMEGA_FAIL_OPEN: ${{ vars.OMEGA_FAIL_OPEN }}      # default "true"
+      OMEGA_LIMIT_CALLS: ${{ vars.OMEGA_LIMIT_CALLS }}  # default 30
+      OMEGA_TOPN_FALLBACK: ${{ vars.OMEGA_TOPN_FALLBACK }} # default 30
+
     steps:
       - name: Setup Node 20
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Run pusher (Prime v6.2 — Calibrated GP-Cls + Heavy-tail sims + Bandit + Symmetric guards + MP Top-20 + Top-3)
+      - name: Run pusher (Prime v6.3 — Omega-aware GP-Cls + Heavy-tail sims + Bandit + Symmetric guards + MP Top-20 + Top-3 + OMEGA prior/veto)
         shell: bash
         run: |
           set -euo pipefail
@@ -115,7 +128,7 @@ jobs:
               for(let i=1;i<n;i++){ const up=h[i]-h[i-1], down=l[i-1]-l[i]; plusDM.push((up>down&&up>0)?up:0); minusDM.push((down>up&&down>0)?down:0);
                 TR.push(Math.max(h[i]-l[i], Math.abs(h[i]-c[i-1]), Math.abs(l[i]-c[i-1]))); }
               let trN=0,pdmN=0,ndmN=0; for(let i=0;i<p;i++){ trN+=TR[i]; pdmN+=plusDM[i]; ndmN+=minusDM[i]; }
-              let pDI=100*(pdmN/(trN||1)), nDI=100*(ndmN/(trN||1)); let dx=100*Math.abs(pDI-nDI)/((pDI+nDI)||1), adx=dx;
+              let pDI=100*(pdmN/(trN||1)), nDI=100*(ndmN/(trN||1)); let dx=100*Math.abs(pDI-nDI)/((pDI+nDI)||1); let adx=dx;
               for(let i=p;i<TR.length;i++){ trN=trN-(trN/p)+TR[i]; pdmN=pdmN-(pdmN/p)+plusDM[i]; ndmN=ndmN-(ndmN/p)+minusDM[i];
                 pDI=100*(pdmN/(trN||1)); nDI=100*(ndmN/(trN||1)); dx=100*Math.abs(pDI-nDI)/((pDI+nDI)||1); adx=((adx*(p-1))+dx)/p; }
               const atr=trN/p; return { adx, atr, trLast: TR.at(-1) };
@@ -282,8 +295,8 @@ jobs:
                 }
                 ev+=pnl_bps; wins+=win;
               }
-              const p=wins/N, ev_mean=ev/N;
-              return { p, ev_bps:Math.round(ev_mean) };
+              const p=wins/N, ev_bps=ev/N;
+              return { p, ev_bps:Math.round(ev_bps) };
             }
 
             // ------------- t-copula VaR/ES (FIXED) -------------
@@ -395,7 +408,7 @@ jobs:
             }
 
             // ---------- Config / ENV ----------
-            const UA="gh-actions-ideas-mexc-ultimate/6.2-prime (+https://github.com/)";
+            const UA="gh-actions-ideas-mexc-ultimate/6.3-omega (+https://github.com/)";
             async function fetchWithTimeout(url,opts={},ms=12000){ const ac=new AbortController(); const t=setTimeout(()=>ac.abort(),ms); try{ return await fetch(url,{...opts,signal:ac.signal,headers:{"User-Agent":UA,...(opts?.headers||{})}});} finally{ clearTimeout(t);} }
             async function getJSON(url,ms=12000,tries=2){ for(let a=0;a<tries;a++){ try{ const r=await fetchWithTimeout(url,{},ms); if(r?.ok){ return await r.json(); } }catch{} await sleep(jitter(220)); } return null; }
 
@@ -477,6 +490,82 @@ jobs:
             const LONG_KILL_SIZE_MULT=Number(process.env.LONG_KILL_SIZE_MULT||"0.5");
             const LONG_NAUGHTY_BASES=new Set(String(process.env.LONG_NAUGHTY_BASES||"EDU,THE,HEMI,COOKIE,MNT,ASTER").split(",").map(s=>s.trim().toUpperCase()).filter(Boolean));
 
+            // ---------- OMEGA integration ----------
+            const OMEGA_ENABLE = (process.env.OMEGA_ENABLE||"true").toLowerCase()==="true";
+            const OMEGA_URL = process.env.OMEGA_URL||"";
+            const OMEGA_TOKEN = process.env.OMEGA_TOKEN||"";
+            const OMEGA_TIMEOUT = Number(process.env.OMEGA_TIMEOUT_MS||"3500");
+            const OMEGA_MAX_W = Number(process.env.OMEGA_MAX_W||"0.45"); // cap reliability weight
+            const OMEGA_VETO_LOW = Number(process.env.OMEGA_VETO_LOW||"0.35");
+            const OMEGA_BOOST_HIGH = Number(process.env.OMEGA_BOOST_HIGH||"0.65");
+            const OMEGA_BETA = Number(process.env.OMEGA_BETA||"0.25");
+            const OMEGA_FAIL_OPEN = (process.env.OMEGA_FAIL_OPEN||"true").toLowerCase()==="true";
+            const OMEGA_LIMIT_CALLS = Number(process.env.OMEGA_LIMIT_CALLS||"30");
+            const OMEGA_TOPN_FALLBACK = Number(process.env.OMEGA_TOPN_FALLBACK||"30");
+
+            const invlogit=(z)=>1/(1+Math.exp(-z));
+            const toLogit=(p)=>Math.log(clamp(p,1e-6,1-1e-6)/(1-clamp(p,1e-6,1-1e-6)));
+
+            const omegaCache=new Map();
+            let omegaBudget=OMEGA_LIMIT_CALLS;
+
+            async function fetchOmega(symbol){
+              if(!OMEGA_ENABLE||!OMEGA_URL||!OMEGA_TOKEN) return { ok:false, reason:"disabled" };
+              if(omegaCache.has(symbol)) return omegaCache.get(symbol);
+              if(omegaBudget<=0) return { ok:false, reason:"budget" };
+              omegaBudget--;
+              try{
+                const url = new URL(OMEGA_URL);
+                url.searchParams.set("symbol", symbol);
+                url.searchParams.set("tf", "30m");
+                const r = await fetchWithTimeout(url.toString(), {
+                  headers:{ "Authorization":`Bearer ${OMEGA_TOKEN}`, "User-Agent":UA }
+                }, OMEGA_TIMEOUT);
+                if(!r?.ok){ const out={ ok:false, reason:"http_"+(r?.status||"ERR") }; omegaCache.set(symbol,out); return out; }
+                const j = await r.json();
+                const out = {
+                  ok: typeof j?.p_up==="number",
+                  p_up: clamp(+j?.p_up||0.5, 1e-4, 1-1e-4),
+                  seg: j?.segment_id || null,
+                  rel_auc: (typeof j?.rel?.auc==="number")? +j.rel.auc : null,
+                  rel_brier: (typeof j?.rel?.brier==="number")? +j.rel.brier : null,
+                  flags: {
+                    jump: !!(j?.flags?.jump),
+                    coherence_mismatch: !!(j?.flags?.coherence_mismatch)
+                  },
+                  ts: j?.ts || null
+                };
+                omegaCache.set(symbol,out);
+                return out;
+              }catch(e){
+                const out={ ok:false, reason:"err", err: (e?.message||String(e)).slice(0,120) };
+                omegaCache.set(symbol,out);
+                return out;
+              }
+            }
+            function omegaWeight(meta){
+              if(!meta?.ok) return 0;
+              let w=0;
+              if(typeof meta.rel_auc==="number"){
+                w = Math.max(0, Math.min(OMEGA_MAX_W, 2*meta.rel_auc - 1)); // AUC 0.5→0, 0.8→0.6 (capped)
+              }else if(typeof meta.rel_brier==="number"){
+                const base=0.25; // naive Brier for p=0.5
+                const gain = Math.max(0, base - meta.rel_brier)/base; // 0..1
+                w = Math.max(0, Math.min(OMEGA_MAX_W, gain*OMEGA_MAX_W));
+              }
+              return w;
+            }
+            function omegaPenalty(meta){
+              if(!meta?.ok) return 0;
+              const coh = meta.flags?.coherence_mismatch ? 1.0 : 0.0;
+              const jmp = meta.flags?.jump ? 0.5 : 0.0;
+              return OMEGA_BETA * (coh + jmp); // units: logit penalty
+            }
+            function poolWithOmega(pPrime, pOmega, w, pen){
+              const L = (1-w)*toLogit(pPrime) + w*toLogit(pOmega) - (pen||0);
+              return invlogit(L);
+            }
+
             // ---------- Worker endpoints ----------
             const PUSH_URL=process.env.WORKER_PUSH_URL||"";
             const PUSH_TOKEN=process.env.PUSH_TOKEN||"";
@@ -519,13 +608,14 @@ jobs:
                 LONG_SIMILARITY_RHO, LONG_KILL_MIN_TRADES, LONG_KILL_WINRATE, LONG_KILL_SIZE_MULT,
                 T_VA_DF: Number(process.env.T_VA_DF||"6"), T_SIM_DF: Number(process.env.T_SIM_DF||"5"), BOOT_BLOCK: Number(process.env.BOOT_BLOCK||"3"),
                 CALIB_MIN_PLATT: Number(process.env.CALIB_MIN_PLATT||"30"), CALIB_MIN_ISO: Number(process.env.CALIB_MIN_ISO||"120"),
-                EMA_FAST, EMA_SLOW, ADX_P, ATR_P, VWAP_5M_WIN, WILSON_Z, TTL_MIN, TTL_MAX, TARGET_PORT_RISK_BPS
+                EMA_FAST, EMA_SLOW, ADX_P, ATR_P, VWAP_5M_WIN, WILSON_Z, TTL_MIN, TTL_MAX, TARGET_PORT_RISK_BPS,
+                OMEGA_ENABLE, OMEGA_MAX_W, OMEGA_VETO_LOW, OMEGA_BOOST_HIGH, OMEGA_BETA, OMEGA_LIMIT_CALLS
               };
               return "sha256:"+sha256Hex(stableStringify(cfg));
             }
-            const pusher_version="mexc-ultimate-6.2-prime";
+            const pusher_version="mexc-ultimate-6.3-omega";
             const code_commit_sha=process.env.GITHUB_SHA||"";
-            const run_id=new Date().toISOString()+"#6.2";
+            const run_id=new Date().toISOString()+"#6.3";
             const mexcTime=await getMexcTime();
             const config_hash=buildConfigHash();
             let run_prov={ run_id, code_commit_sha, pusher_version, config_hash, exchange_base:BASE, ...mexcTime, p_model:{ gp_hash:null, calib_type:"mixed", calib_n:0 } };
@@ -533,7 +623,7 @@ jobs:
             // ---------- State (Gist) ----------
             async function loadState(){
               const token=process.env.GIST_TOKEN, id=process.env.GIST_ID;
-              const init={ v:"mexc-ultimate-6.2-prime",
+              const init={ v:"mexc-ultimate-6.3-omega",
                 schema_version:"1.2.0", append_only:true, run: run_prov,
                 cooldown:{}, cooldown_side:{},
                 pending:[], equity:[], closed:[],
@@ -700,6 +790,7 @@ jobs:
                   size_bps: p.size_bps, notional_usd: p.notional_usd,
                   exit_delay_ms, hit_ambiguous,
                   p_raw: p.p_raw, p_pred: p.p_lcb, calib_key: p.calib_key, calib_type: p.calib_type||"raw", calib_n: p.calib_n||0,
+                  p_omega: p.p_omega || null, w_omega: p.w_omega || null, omega: p.omega || null,
                   gp_feat: p.gp_feat||[],
                   regime: p.regime, style: p.style_final||p.style,
                   book_entry: p.entry_book||null, book_exit: book_exit||null,
@@ -795,7 +886,6 @@ jobs:
 
               // Load state / eval / calibration
               const { state, persist } = await loadState();
-              // attach run provenance
               state.run = { ...state.run, ...run_prov };
 
               try{ await evalPending(state); }catch(e){ console.log("[gha] evalPending warn", e?.message||e); }
@@ -833,7 +923,7 @@ jobs:
                     const k5=await fetchK(c.symbol,"5m",K5M); if(!k5||k5.length<Math.max(EMA_SLOW+200,ATR_P+50)){ pfStats.dropped.k5++; return null; }
                     const k15=await fetchK(c.symbol,"15m",K15M); const k1h=await fetchK(c.symbol,"1h",K1H);
 
-                    const c5_raw=k5.map(x=>+x[4]); const c5=kalman1D(c5_raw,{q:1e-4,r:5e-4,x0:c5_raw[0],p0:1e-2});
+                    const c5_raw=k5.map(x=>+x[4]); const c5=kalman1D(c5_raw,{q:1e-4,r:5e-4,x0:c5_raw[0],p0=1e-2});
                     const h5=k5.map(x=>+x[2]), l5=k5.map(x=>+x[3]), v5=k5.map(x=>+x[5]);
                     const em21=emaSeries(c5,EMA_FAST), em50s=emaSeries(c5,EMA_SLOW), em200s=emaSeries(c5,200);
                     const em50=em50s?.at(-1), em200=em200s?.at(-1), em50Prev=em50s?.at(-51);
@@ -917,7 +1007,6 @@ jobs:
               const trL=buildTrainSet("long"), trS=buildTrainSet("short");
               const gpClfLong=(trL.X.length>=25)? trainGPClass(trL.X, trL.y, 0.12, 12) : null;
               const gpClfShort=(trS.X.length>=25)? trainGPClass(trS.X, trS.y, 0.12, 12): null;
-              // set run model hash
               run_prov.p_model = { gp_hash: "long="+(gpClfHash(gpClfLong)||"none")+"|short="+(gpClfHash(gpClfShort)||"none"), calib_type:"mixed", calib_n:(state.gp_data_clf?.length||0) };
               state.run.p_model = run_prov.p_model;
 
@@ -1055,6 +1144,49 @@ jobs:
               }
               snapCounts({ refined: refined.length });
 
+              // ---------- Omega adjust (prior + veto/boost) ----------
+              try{
+                if(OMEGA_ENABLE && OMEGA_URL && OMEGA_TOKEN){
+                  const sliceN = Math.min(refined.length, Math.max(10, Math.min(OMEGA_LIMIT_CALLS, 30)));
+                  for(let i=0;i<sliceN;i++){
+                    const cand = refined[i];
+                    const om = await fetchOmega(cand.symbol);
+                    if(!om.ok){
+                      if(!OMEGA_FAIL_OPEN) { cand._drop_reason="omega_fail"; }
+                      cand.omega = { used:false, reason:om.reason||"no" };
+                      continue;
+                    }
+                    const pOmegaSide = cand.side==="long" ? om.p_up : (1 - om.p_up);
+                    const w = omegaWeight(om);
+                    const pen = omegaPenalty(om);
+                    const pPrime = clamp(+cand.p_raw||0.5, 1e-4, 1-1e-4);
+                    const pStar = poolWithOmega(pPrime, pOmegaSide, w, pen);
+                    const pStarLCB = wilsonLCB(pStar, 80, WILSON_Z);
+                    const newEV = Math.round(pStarLCB * cand.tp_bps - (1 - pStarLCB) * cand.sl_bps - cand.cost_bps);
+
+                    const veto = (pOmegaSide < OMEGA_VETO_LOW) && (newEV < Math.max(cand.dyn_floor+4, 12));
+                    if(veto && !cand.mp_fill){ cand._omega_veto = true; }
+
+                    let scoreBoost = 0;
+                    if(pOmegaSide > OMEGA_BOOST_HIGH) scoreBoost += 2;
+
+                    cand.p_raw = +pPrime.toFixed(3);
+                    cand.p_lcb = +pStarLCB.toFixed(3);
+                    cand.exp_lcb_bps = newEV;
+                    cand.score = clamp((cand.score||60) + scoreBoost, 1, 99);
+                    cand.omega = {
+                      used:true, p_up: +om.p_up.toFixed(4),
+                      p_side: +pOmegaSide.toFixed(4),
+                      w:+w.toFixed(3), penalty:+pen.toFixed(3),
+                      seg: om.seg, auc: om.rel_auc, brier: om.rel_brier,
+                      flags: om.flags
+                    };
+                  }
+                  // drop vetoed
+                  for(let i=refined.length-1;i>=0;i--) if(refined[i]._omega_veto) refined.splice(i,1);
+                }
+              }catch(e){ console.log("[gha] omega adjust warn", e?.message||e); }
+
               // Rank refined
               refined.sort((a,b)=> b.exp_lcb_bps!==a.exp_lcb_bps ? b.exp_lcb_bps-a.exp_lcb_bps
                                 : b.exp_bps!==a.exp_bps ? b.exp_bps-a.exp_bps
@@ -1077,114 +1209,181 @@ jobs:
                 if(ok) selected.push(cand);
               }
 
-              // Updated selection policy with fallback
+              // Updated selection policy with Omega-guided fallback
               const strictCount = selected.length;
               const fallbackTarget = Math.min(TARGET_K, universe.length);
 
               if (strictCount === 0) {
-                let fallback = [];
-                const have = new Set();
-                const tryAdd = (candList) => {
-                  for (const cand of candList) {
-                    if (fallback.length >= fallbackTarget) break;
-                    if (have.has(cand.symbol)) continue;
-                    let ok = true;
-                    for (const s of fallback) {
-                      const r = corr(cand.ret5 || [], s.ret5 || []);
-                      if (cand.side === "long" && s.side === "long" && r > LONG_SIMILARITY_RHO) { ok = false; break; }
-                      if (r > 0.90) { ok = false; break; }
+                let omegaFilled=false;
+                if (OMEGA_ENABLE && OMEGA_URL && OMEGA_TOKEN) {
+                  try{
+                    const uni = universe.slice(0, Math.min(universe.length, OMEGA_TOPN_FALLBACK));
+                    const scored=[];
+                    for(const u of uni){
+                      const om = await fetchOmega(u.symbol);
+                      if(!om.ok) continue;
+                      const conf = Math.abs(om.p_up - 0.5);
+                      scored.push({ u, om, conf });
                     }
-                    if (!ok) continue;
-                    fallback.push({ ...cand, mp_fill: true, always3: true });
-                    have.add(cand.symbol);
-                  }
-                };
-                if (refined.length > 0) {
-                  tryAdd(refined);
-                }
-                if (fallback.length < fallbackTarget) {
-                  const fbCands = [];
-                  for (const p of picksRaw) {
-                    try {
-                      const book = bookMap.get(p.c.symbol);
-                      if (!book?.bid || !book?.ask) continue;
-                      const mid = (book.bid + book.ask) / 2;
-                      const yR = []; for (let i = 1; i < p.c5.length; i++) yR.push(Math.log(p.c5[i] / p.c5[i-1]));
-                      const mu5 = mean(yR) || 0, sig5 = Math.max(1e-4, std(yR));
-                      const hold_base = clamp(Math.round((weightsReg.wTrend > weightsReg.wMR ? 720 : 560) + 240 * clamp((p.adx5 - 16)/14, 0, 1)), TTL_MIN, TTL_MAX);
-                      const stepsBase = Math.max(1, Math.round(hold_base/300));
-                      const slipL = Math.max(Math.round(p.spreadBps/2), 0);
-                      const slipS = Math.max(Math.round(p.spreadBps/2), 0);
-                      const costLong = COST_BPS + slipL;
-                      const costShort = COST_BPS + slipS;
-                      if (Math.max(costLong, costShort) > MAX_COST_BPS_HARD) continue;
-
-                      const featL = [ clamp((p.adx5 - 16)/14,0,1), clamp(p.z_vwap,-3,3), (p.rsi14||50)/100, 0.0, clamp(p.slope_atr50,0,1) ];
-                      const featS = [ clamp((p.adx5 - 16)/14,0,1), clamp(-p.z_vwap,-3,3),(100-(p.rsi14||50))/100, 0.0, clamp(p.slope_atr50,0,1) ];
-                      let pLong_raw = p.pLong0, pShort_raw = p.pShort0;
-                      if (gpClfLong) pLong_raw = predictGPClass(gpClfLong, featL).p;
-                      if (gpClfShort) pShort_raw = predictGPClass(gpClfShort, featS).p;
-
-                      const strongTrend = (p.adx5 > Math.max(22, MR_ADX_MAX)) || (p.slope_atr50 > MR_SLOPE_MAX_ATR50);
-                      const regime = p.mrLocked ? "trend" : (strongTrend ? "trend" : "meanrevert");
-
-                      const pLong = calibrateP(state,"long",regime,pLong_raw);
-                      const pShort = calibrateP(state,"short",regime,pShort_raw);
-
-                      const pLong_lcb = wilsonLCB(pLong, 80, WILSON_Z);
-                      const pShort_lcb = wilsonLCB(pShort, 80, WILSON_Z);
-
-                      let candLong = null;
-                      { const slL=Math.round(clamp(p.atr_bps * 0.50, Math.round(0.35 * p.atr_bps), Math.round(0.65 * p.atr_bps)));
-                        const tpL=Math.round(clamp(p.atr_bps * 0.95, Math.round(0.60 * p.atr_bps), Math.round(1.20 * p.atr_bps)));
-                        const simL = pathEVHeavy({ entry:mid, tp_bps:tpL, sl_bps:slL, side:"long", retSeries:yR, mu:mu5, sigma:sig5, steps:stepsBase, N:192, cost_bps:costLong, t_df:Number(process.env.T_SIM_DF||"5"), boot_block:Number(process.env.BOOT_BLOCK||"3") });
-                        const evLongLCB = Math.round(pLong_lcb*tpL - (1-pLong_lcb)*slL - costLong);
-                        candLong = { side:"long", p_lcb:+pLong_lcb.toFixed(3), p_raw:+pLong.toFixed(3), cost_bps:costLong, tp_bps:tpL, sl_bps:slL, exp_lcb_bps:evLongLCB, exp_bps:simL.ev_bps, hold_sec:hold_base, style:"trend", regime };
+                    scored.sort((a,b)=> b.conf - a.conf);
+                    const fb=[];
+                    const have=new Set();
+                    for(const s of scored){
+                      if(fb.length>=fallbackTarget) break;
+                      const side = (s.om.p_up>=0.5) ? "long":"short";
+                      let cand = refined.find(r=> r.symbol===s.u.symbol && r.side===side);
+                      if(!cand){
+                        const pr = picksRaw.find(p=> p.c.symbol===s.u.symbol);
+                        if(!pr) continue;
+                        const book = bookMap.get(pr.c.symbol); if(!book?.bid||!book?.ask) continue;
+                        const mid=(book.bid+book.ask)/2;
+                        const yR=[]; for(let i=1;i<pr.c5.length;i++) yR.push(Math.log(pr.c5[i]/pr.c5[i-1]));
+                        const mu5=mean(yR)||0, sig5=Math.max(1e-4,std(yR));
+                        const stepsBase=Math.max(1,Math.round(600/300));
+                        const cost = COST_BPS + Math.round(pr.spreadBps/2);
+                        const sl = Math.round(0.55*pr.atr_bps), tp = Math.round(1.00*pr.atr_bps);
+                        const sim = pathEVHeavy({ entry:mid, tp_bps:tp, sl_bps:sl, side, retSeries:yR, mu:mu5, sigma:sig5, steps:stepsBase, N:160, cost_bps:cost });
+                        const pPrime = 0.55;
+                        const w = omegaWeight(s.om);
+                        const pen = omegaPenalty(s.om);
+                        const pOmegaSide = (side==="long")? s.om.p_up : (1 - s.om.p_up);
+                        const pStar = poolWithOmega(pPrime, pOmegaSide, w, pen);
+                        const pStarLCB = wilsonLCB(pStar,80,WILSON_Z);
+                        cand = {
+                          symbol: s.u.symbol, base:s.u.base, quote:s.u.quote, qv:s.u.qv,
+                          side, p_lcb:+pStarLCB.toFixed(3), p_raw:+pPrime.toFixed(3), p_win:+Math.max(pPrime,pOmegaSide).toFixed(3),
+                          exp_bps: sim.ev_bps, exp_lcb_bps: Math.round(pStarLCB*tp - (1-pStarLCB)*sl - cost),
+                          tp_bps: tp, sl_bps: sl, rrr:+(tp/Math.max(1,sl)).toFixed(2),
+                          spread_bps: pr.spreadBps, cost_bps: cost, adx:+(pr.adx5||0).toFixed(1), atr_bps: pr.atr_bps,
+                          regime: pr.mrLocked? "trend":"trend", style:"trend",
+                          score: 60, n_conf: 80, obi: 0, hold_sec: 900, liq_pct:+(liqPct.get(s.u.symbol)||0.5).toFixed(3),
+                          ret5: (()=>{ const r=[]; for(let i=1;i<pr.c5.length;i++) r.push(Math.log(pr.c5[i]/pr.c5[i-1])); return r.slice(-36); })(),
+                          fill_prob: 0.7, dyn_floor: EXP_LCB_MIN_THIS, rsi14: pr.rsi14, z_vwap: pr.z_vwap,
+                          vol1h_est_usd: pr.vol1h_est_usd, depth1p_usd: 0, direction_env:DIRECTION, side_bias: pr.trendBias,
+                          entry_book: { bid:book.bid, ask:book.ask }, slip_bps_long: Math.round(pr.spreadBps/2), slip_bps_short: Math.round(pr.spreadBps/2), spread_bps_entry: pr.spreadBps,
+                          omega: { used:true, p_up:+s.om.p_up.toFixed(4), p_side:+pOmegaSide.toFixed(4), w:+w.toFixed(3), penalty:+pen.toFixed(3), seg:s.om.seg, auc:s.om.rel_auc, brier:s.om.rel_brier, flags:s.om.flags },
+                          mp_fill:true, always3:true
+                        };
+                      }else{
+                        const pOmegaSide = cand.side==="long"? s.om.p_up : (1 - s.om.p_up);
+                        const w = omegaWeight(s.om), pen=omegaPenalty(s.om);
+                        const pStar = poolWithOmega(cand.p_raw||0.55, pOmegaSide, w, pen);
+                        const pStarLCB=wilsonLCB(pStar,80,WILSON_Z);
+                        cand.p_lcb=+pStarLCB.toFixed(3);
+                        cand.exp_lcb_bps=Math.round(pStarLCB*cand.tp_bps - (1-pStarLCB)*cand.sl_bps - cand.cost_bps);
+                        cand.omega={ used:true, p_up:+s.om.p_up.toFixed(4), p_side:+pOmegaSide.toFixed(4), w:+w.toFixed(3), penalty:+pen.toFixed(3), seg:s.om.seg, auc:s.om.rel_auc, brier:s.om.rel_brier, flags:s.om.flags };
+                        cand.mp_fill=true; cand.always3=true;
                       }
-
-                      let candShort = null;
-                      { const slS=Math.round(clamp(p.atr_bps * 0.55, Math.round(0.35 * p.atr_bps), Math.round(0.75 * p.atr_bps)));
-                        const tpS=Math.round(clamp(p.atr_bps * 1.00, Math.round(0.70 * p.atr_bps), Math.round(1.40 * p.atr_bps)));
-                        const simS = pathEVHeavy({ entry:mid, tp_bps:tpS, sl_bps:slS, side:"short", retSeries:yR, mu:mu5, sigma:sig5, steps:stepsBase, N:192, cost_bps:costShort, t_df:Number(process.env.T_SIM_DF||"5"), boot_block:Number(process.env.BOOT_BLOCK||"3") });
-                        const evShortLCB = Math.round(pShort_lcb*tpS - (1-pShort_lcb)*slS - costShort);
-                        candShort = { side:"short", p_lcb:+pShort_lcb.toFixed(3), p_raw:+pShort.toFixed(3), cost_bps:costShort, tp_bps:tpS, sl_bps:slS, exp_lcb_bps:evShortLCB, exp_bps:simS.ev_bps, hold_sec:hold_base, style:"trend", regime };
-                      }
-
-                      let chosen = candLong && candShort ? (candLong.exp_lcb_bps >= candShort.exp_lcb_bps ? candLong : candShort) : (candLong || candShort || null);
-                      if (!chosen) continue;
-
-                      const liq = liqPct.get(p.c.symbol) || 0.5;
-                      const score = clamp(Math.round(60 + 30*(chosen.p_lcb-0.5)*2 + 12*clamp((p.adx5-16)/14,0,1) + 7*((liq-0.5)*2) - Math.min(12, Math.max(0,(p.spreadBps-5)/2))), 1, 99);
-
-                      fbCands.push({
-                        symbol:p.c.symbol, base:p.c.base, quote:p.c.quote, qv:p.c.qv,
-                        side:chosen.side, p_lcb:+chosen.p_lcb, p_raw:+chosen.p_raw, p_win:+(Math.max(p.pLong0,p.pShort0)).toFixed(3),
-                        exp_bps:chosen.exp_bps, exp_lcb_bps:chosen.exp_lcb_bps,
-                        tp_bps:chosen.tp_bps, sl_bps:chosen.sl_bps, rrr:+(chosen.tp_bps/Math.max(1,chosen.sl_bps)).toFixed(2),
-                        spread_bps:p.spreadBps, cost_bps:chosen.cost_bps,
-                        adx:+(p.adx5||0).toFixed(1), atr_bps:p.atr_bps, regime:chosen.regime, style:chosen.style,
-                        score, n_conf:Math.round(60+40*clamp((p.adx5-16)/14,0,1)), obi:0,
-                        hold_sec:chosen.hold_sec, liq_pct:+(liq).toFixed(3),
-                        ret5:(()=>{ const r=[]; for(let i=1;i<p.c5.length;i++) r.push(Math.log(p.c5[i]/p.c5[i-1])); return r.slice(-36); })(),
-                        fill_prob:0.7, dyn_floor:EXP_LCB_MIN_THIS,
-                        rsi14:p.rsi14, z_vwap:p.z_vwap,
-                        vol1h_est_usd:p.vol1h_est_usd, depth1p_usd:0,
-                        direction_env:DIRECTION, side_bias:p.trendBias,
-                        swing_lo_px:(function swingLo(){ const lows=p.k15?.map(x=>+x[3])||[]; if(lows.length<40) return null; return Math.min(...lows.slice(-40)); })(),
-                        entry_book: { bid: book.bid, ask: book.ask },
-                        slip_bps_long: Math.max(Math.round(p.spreadBps/2),0), slip_bps_short: Math.max(Math.round(p.spreadBps/2),0),
-                        spread_bps_entry: p.spreadBps
-                      });
-                    } catch {}
-                  }
-                  fbCands.sort((a,b)=> b.exp_lcb_bps!==a.exp_lcb_bps ? b.exp_lcb_bps-a.exp_lcb_bps
-                                         : b.exp_bps!==a.exp_bps ? b.exp_bps-a.exp_bps
-                                         : b.score!==a.score ? b.score-a.score
-                                         : (b.qv||0)-(a.qv||0));
-                  tryAdd(fbCands);
+                      if(!have.has(cand.symbol)) { fb.push(cand); have.add(cand.symbol); }
+                    }
+                    if(fb.length>0){ selected = fb.slice(0, fallbackTarget); selectionTier = "omega_fallback_top3"; omegaFilled=true; }
+                  }catch(e){ console.log("[gha] omega fallback warn", e?.message||e); }
                 }
-                selected = fallback.slice(0, fallbackTarget);
-                selectionTier = (refined.length > 0) ? "refined_top3" : "forced_fallback_top3";
+
+                if(!omegaFilled){
+                  // original fallback (refined / forced)
+                  let fallback = [];
+                  const have = new Set();
+                  const tryAdd = (candList) => {
+                    for (const cand of candList) {
+                      if (fallback.length >= fallbackTarget) break;
+                      if (have.has(cand.symbol)) continue;
+                      let ok = true;
+                      for (const s of fallback) {
+                        const r = corr(cand.ret5 || [], s.ret5 || []);
+                        if (cand.side === "long" && s.side === "long" && r > LONG_SIMILARITY_RHO) { ok = false; break; }
+                        if (r > 0.90) { ok = false; break; }
+                      }
+                      if (!ok) continue;
+                      fallback.push({ ...cand, mp_fill: true, always3: true });
+                      have.add(cand.symbol);
+                    }
+                  };
+                  if (refined.length > 0) tryAdd(refined);
+                  if (fallback.length < fallbackTarget) {
+                    const fbCands = [];
+                    for (const p of picksRaw) {
+                      try {
+                        const book = bookMap.get(p.c.symbol);
+                        if (!book?.bid || !book?.ask) continue;
+                        const mid = (book.bid + book.ask) / 2;
+                        const yR = []; for (let i = 1; i < p.c5.length; i++) yR.push(Math.log(p.c5[i] / p.c5[i-1]));
+                        const mu5 = mean(yR) || 0, sig5 = Math.max(1e-4, std(yR));
+                        const hold_base = clamp(Math.round((weightsReg.wTrend > weightsReg.wMR ? 720 : 560) + 240 * clamp((p.adx5 - 16)/14, 0, 1)), TTL_MIN, TTL_MAX);
+                        const stepsBase = Math.max(1, Math.round(hold_base/300));
+                        const slipL = Math.max(Math.round(p.spreadBps/2), 0);
+                        const slipS = Math.max(Math.round(p.spreadBps/2), 0);
+                        const costLong = COST_BPS + slipL;
+                        const costShort = COST_BPS + slipS;
+                        if (Math.max(costLong, costShort) > MAX_COST_BPS_HARD) continue;
+
+                        const featL = [ clamp((p.adx5 - 16)/14,0,1), clamp(p.z_vwap,-3,3), (p.rsi14||50)/100, 0.0, clamp(p.slope_atr50,0,1) ];
+                        const featS = [ clamp((p.adx5 - 16)/14,0,1), clamp(-p.z_vwap,-3,3),(100-(p.rsi14||50))/100, 0.0, clamp(p.slope_atr50,0,1) ];
+                        let pLong_raw = p.pLong0, pShort_raw = p.pShort0;
+                        if (gpClfLong) pLong_raw = predictGPClass(gpClfLong, featL).p;
+                        if (gpClfShort) pShort_raw = predictGPClass(gpClfShort, featS).p;
+
+                        const strongTrend = (p.adx5 > Math.max(22, MR_ADX_MAX)) || (p.slope_atr50 > MR_SLOPE_MAX_ATR50);
+                        const regime = p.mrLocked ? "trend" : (strongTrend ? "trend" : "meanrevert");
+
+                        const pLong = calibrateP(state,"long",regime,pLong_raw);
+                        const pShort = calibrateP(state,"short",regime,pShort_raw);
+
+                        const pLong_lcb = wilsonLCB(pLong, 80, WILSON_Z);
+                        const pShort_lcb = wilsonLCB(pShort, 80, WILSON_Z);
+
+                        let candLong = null;
+                        { const slL=Math.round(clamp(p.atr_bps * 0.50, Math.round(0.35 * p.atr_bps), Math.round(0.65 * p.atr_bps)));
+                          const tpL=Math.round(clamp(p.atr_bps * 0.95, Math.round(0.60 * p.atr_bps), Math.round(1.20 * p.atr_bps)));
+                          const simL = pathEVHeavy({ entry:mid, tp_bps:tpL, sl_bps:slL, side:"long", retSeries:yR, mu:mu5, sigma:sig5, steps:stepsBase, N:192, cost_bps:costLong, t_df:Number(process.env.T_SIM_DF||"5"), boot_block:Number(process.env.BOOT_BLOCK||"3") });
+                          const evLongLCB = Math.round(pLong_lcb*tpL - (1-pLong_lcb)*slL - costLong);
+                          candLong = { side:"long", p_lcb:+pLong_lcb.toFixed(3), p_raw:+pLong.toFixed(3), cost_bps:costLong, tp_bps:tpL, sl_bps:slL, exp_lcb_bps:evLongLCB, exp_bps:simL.ev_bps, hold_sec:hold_base, style:"trend", regime };
+                        }
+
+                        let candShort = null;
+                        { const slS=Math.round(clamp(p.atr_bps * 0.55, Math.round(0.35 * p.atr_bps), Math.round(0.75 * p.atr_bps)));
+                          const tpS=Math.round(clamp(p.atr_bps * 1.00, Math.round(0.70 * p.atr_bps), Math.round(1.40 * p.atr_bps)));
+                          const simS = pathEVHeavy({ entry:mid, tp_bps:tpS, sl_bps:slS, side:"short", retSeries:yR, mu:mu5, sigma:sig5, steps:stepsBase, N:192, cost_bps:costShort, t_df:Number(process.env.T_SIM_DF||"5"), boot_block:Number(process.env.BOOT_BLOCK||"3") });
+                          const evShortLCB = Math.round(pShort_lcb*tpS - (1-pShort_lcb)*slS - costShort);
+                          candShort = { side:"short", p_lcb:+pShort_lcb.toFixed(3), p_raw:+pShort.toFixed(3), cost_bps:costShort, tp_bps:tpS, sl_bps:slS, exp_lcb_bps:evShortLCB, exp_bps:simS.ev_bps, hold_sec:hold_base, style:"trend", regime };
+                        }
+
+                        let chosen = candLong && candShort ? (candLong.exp_lcb_bps >= candShort.exp_lcb_bps ? candLong : candShort) : (candLong || candShort || null);
+                        if (!chosen) continue;
+
+                        const liq = liqPct.get(p.c.symbol) || 0.5;
+                        const score = clamp(Math.round(60 + 30*(chosen.p_lcb-0.5)*2 + 12*clamp((p.adx5-16)/14,0,1) + 7*((liq-0.5)*2) - Math.min(12, Math.max(0,(p.spreadBps-5)/2))), 1, 99);
+
+                        fbCands.push({
+                          symbol:p.c.symbol, base:p.c.base, quote:p.c.quote, qv:p.c.qv,
+                          side:chosen.side, p_lcb:+chosen.p_lcb, p_raw:+chosen.p_raw, p_win:+(Math.max(p.pLong0,p.pShort0)).toFixed(3),
+                          exp_bps:chosen.exp_bps, exp_lcb_bps:chosen.exp_lcb_bps,
+                          tp_bps:chosen.tp_bps, sl_bps:chosen.sl_bps, rrr:+(chosen.tp_bps/Math.max(1,chosen.sl_bps)).toFixed(2),
+                          spread_bps:p.spreadBps, cost_bps:chosen.cost_bps,
+                          adx:+(p.adx5||0).toFixed(1), atr_bps:p.atr_bps, regime:chosen.regime, style:chosen.style,
+                          score, n_conf:Math.round(60+40*clamp((p.adx5-16)/14,0,1)), obi:0,
+                          hold_sec:chosen.hold_sec, liq_pct:+(liq).toFixed(3),
+                          ret5:(()=>{ const r=[]; for(let i=1;i<p.c5.length;i++) r.push(Math.log(p.c5[i]/p.c5[i-1])); return r.slice(-36); })(),
+                          fill_prob:0.7, dyn_floor:EXP_LCB_MIN_THIS,
+                          rsi14:p.rsi14, z_vwap:p.z_vwap,
+                          vol1h_est_usd:p.vol1h_est_usd, depth1p_usd:0,
+                          direction_env:DIRECTION, side_bias:p.trendBias,
+                          swing_lo_px:(function swingLo(){ const lows=p.k15?.map(x=>+x[3])||[]; if(lows.length<40) return null; return Math.min(...lows.slice(-40)); })(),
+                          entry_book: { bid: book.bid, ask: book.ask },
+                          slip_bps_long: Math.max(Math.round(p.spreadBps/2),0), slip_bps_short: Math.max(Math.round(p.spreadBps/2),0),
+                          spread_bps_entry: p.spreadBps
+                        });
+                      } catch {}
+                    }
+                    fbCands.sort((a,b)=> b.exp_lcb_bps!==a.exp_lcb_bps ? b.exp_lcb_bps-a.exp_lcb_bps
+                                           : b.exp_bps!==a.exp_bps ? b.exp_bps-a.exp_bps
+                                           : b.score!==a.score ? b.score-a.score
+                                           : (b.qv||0)-(a.qv||0));
+                    tryAdd(fbCands);
+                  }
+                  selected = fallback.slice(0, fallbackTarget);
+                  selectionTier = (refined.length > 0) ? "refined_top3" : "forced_fallback_top3";
+                }
               } else {
                 selected = selected.slice(0, fallbackTarget);
                 selectionTier = "strict";
@@ -1237,6 +1436,11 @@ jobs:
                 const calib_key=`${x.side}_${String(x.regime).includes("mean")?"mr":"trend"}`;
                 const calInfo = calibratorInfo(state, x.side, x.regime);
 
+                const omega_meta = x.omega && x.omega.used ? {
+                  p_up: x.omega.p_up, p_side: x.omega.p_side, w: x.omega.w, penalty: x.omega.penalty,
+                  seg: x.omega.seg, auc: x.omega.auc, brier: x.omega.brier, flags: x.omega.flags
+                } : null;
+
                 const entry_book = x.entry_book || { bid: bk?.bid||null, ask: bk?.ask||null };
                 const spread_bps_entry = x.spread_bps_entry ?? (bk?.bid&&bk?.ask ? Math.round(((bk.ask-bk.bid)/((bk.ask+bk.bid)/2))*10000) : null);
                 const slip_bps_entry = x.side==="long" ? (x.slip_bps_long??null) : (x.slip_bps_short??null);
@@ -1261,6 +1465,7 @@ jobs:
                   trade_id, entry_ts_ms, ttl_ts_ms,
                   entry_book, spread_bps_entry, slip_bps_entry, depth1p_entry_usd, obi_entry:x.obi||0,
                   notional_usd: NOTIONAL, size_bps,
+                  omega: omega_meta, p_omega: omega_meta? omega_meta.p_side : null, w_omega: omega_meta? omega_meta.w : null,
                   run_id: run_prov.run_id, code_commit_sha: run_prov.code_commit_sha, pusher_version,
                   config_hash, exchange_base: BASE, mexc_server_time_ms: mexcTime.mexc_server_time_ms, mexc_time_offset_ms: mexcTime.mexc_time_offset_ms,
                   p_model: run_prov.p_model, calib_type: calInfo.type, calib_n: calInfo.n,
@@ -1299,6 +1504,7 @@ jobs:
                     entry_book: p.entry_book, spread_bps_entry: p.spread_bps_entry, slip_bps_entry: p.slip_bps_entry,
                     depth1p_entry_usd: p.depth1p_entry_usd, obi_entry: p.obi_entry,
                     notional_usd: p.notional_usd, size_bps: p.size_bps,
+                    p_omega: p.p_omega || null, w_omega: p.w_omega || null, omega: p.omega || null,
                     run_id: p.run_id, code_commit_sha: p.code_commit_sha, pusher_version: p.pusher_version,
                     config_hash: p.config_hash, exchange_base: p.exchange_base,
                     mexc_server_time_ms: p.mexc_server_time_ms, mexc_time_offset_ms: p.mexc_time_offset_ms,
@@ -1312,7 +1518,8 @@ jobs:
                   state.push_log.push({ ts:new Date().toISOString(), tier:selectionTier, direction_env:DIRECTION, top_n:picks.length,
                     counts:{ strict:picks.filter(p=>!p.mp_fill).length, always3:picks.filter(p=>p.always3).length },
                     regime_post:weightsReg, bandit_choice:banditChoice, force_top_n: (selectionTier!=="strict"),
-                    symbols:picks.map(p=>({ symbol:p.symbol_full, side:p.side, style:p.style, tier:p.tier, always3:!!p.always3 })) });
+                    omega_summary:{ enabled:OMEGA_ENABLE, used: picks.some(p=>p.omega), limit_calls: OMEGA_LIMIT_CALLS },
+                    symbols:picks.map(p=>({ symbol:p.symbol_full, side:p.side, style:p.style, tier:p.tier, always3:!!p.always3, w_omega:p.w_omega })) });
                   if(state.push_log.length>300) state.push_log=state.push_log.slice(-300);
                 }catch(e){ console.log("[gha] push_log warn", e?.message||e); }
                 fitCalibrators(state); updateMetricsAndDrift(state);
@@ -1333,7 +1540,8 @@ jobs:
                   exp_lcb_min_bps:EXP_LCB_MIN_THIS, wilson_z:WILSON_Z,
                   calibrated:true, gp_cls:true, isotonic:true, platt:true,
                   heavy_tail_sim:true, t_copula_var_es:true,
-                  mp_top_pool:MP_TOP_POOL, always3:ALWAYS3_ENABLE, rank_fill: (selectionTier!=="strict")
+                  mp_top_pool:MP_TOP_POOL, always3:ALWAYS3_ENABLE, rank_fill: (selectionTier!=="strict"),
+                  omega: { enabled: OMEGA_ENABLE, max_w: OMEGA_MAX_W, veto: OMEGA_VETO_LOW, boost: OMEGA_BOOST_HIGH, beta: OMEGA_BETA, limit_calls: OMEGA_LIMIT_CALLS }
                 },
                 dd_gate:(()=>{ const s=state.equity||[]; const day=Date.now()-24*3600*1000; let pnl24=0,cum=0,peak=0,dd=0; for(const e of s){ if(e.ts_ms>=day) pnl24+=e.pnl_bps; cum+=e.pnl_bps; if(cum>peak) peak=cum; dd=Math.min(dd,cum-peak); } return { pnl24_bps:Math.round(pnl24), peak_dd_bps:Math.round(dd), throttle }; })(),
                 tod:{ active:S_H!=null&&E_H!=null, start:S_H, end:E_H },
