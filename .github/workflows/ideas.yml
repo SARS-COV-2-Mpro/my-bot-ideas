@@ -923,7 +923,9 @@ jobs:
                     const k5=await fetchK(c.symbol,"5m",K5M); if(!k5||k5.length<Math.max(EMA_SLOW+200,ATR_P+50)){ pfStats.dropped.k5++; return null; }
                     const k15=await fetchK(c.symbol,"15m",K15M); const k1h=await fetchK(c.symbol,"1h",K1H);
 
-                    const c5_raw=k5.map(x=>+x[4]); const c5=kalman1D(c5_raw,{q:1e-4,r:5e-4,x0:c5_raw[0],p0=1e-2});
+                    const c5_raw = k5.map(x => +x[4]); const c5 = kalman1D(c5_raw, { q: 1e-4, r: 5e-4, x0: c5_raw[0], p0: 1e-2 });
+
+
                     const h5=k5.map(x=>+x[2]), l5=k5.map(x=>+x[3]), v5=k5.map(x=>+x[5]);
                     const em21=emaSeries(c5,EMA_FAST), em50s=emaSeries(c5,EMA_SLOW), em200s=emaSeries(c5,200);
                     const em50=em50s?.at(-1), em200=em200s?.at(-1), em50Prev=em50s?.at(-51);
