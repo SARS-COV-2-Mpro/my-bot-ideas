@@ -1301,7 +1301,6 @@ jobs:
 
         snapCounts({ selected: selected.length });
 
-        // carry forward for next section
         globalThis.__SELECTION__ = { selected, refined, universe, selectionTier, reason, booksRaw, bookMap, weightsReg, banditChoice, EXP_LCB_MIN_THIS, btcGreen, dynMinQV, throttle };
       }catch(e){
         reason=reason!=="ok"?reason:"data_error";
