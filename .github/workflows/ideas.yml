@@ -1,9 +1,9 @@
-name: Ideas Pusher (MEXC ULTIMATE EV@Pusher+, PRIME v6.2 Calibrated HeavyTail MP-Top20+Top3)
+name: Ideas Pusher (MEXC ULTIMATE EV@Pusher+, Stochastic Pro, GP PRC+)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "*/20 * * * *"
 
 permissions:
   contents: read
@@ -24,12 +24,12 @@ jobs:
       GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
       GIST_ID: ${{ secrets.GIST_ID }}
 
-      # Exchange + tuning knobs (from Repo/Org Variables)
+      # Exchange + tuning knobs (via Repo/Org Variables)
       EXCHANGE: mexc
       MIN_QV_USD: ${{ vars.MIN_QV_USD }}
       TOP_N: ${{ vars.TOP_N }}
       MAX_SPREAD_BPS: ${{ vars.MAX_SPREAD_BPS }}
-      EXP_LCB_MIN_BPS: ${{ vars.EXP_LCB_MIN_BPS }}     # default raised inside code (12) if absent
+      EXP_LCB_MIN_BPS: ${{ vars.EXP_LCB_MIN_BPS }}
       FEES_BPS: ${{ vars.FEES_BPS }}
       NOTIONAL_USD: ${{ vars.NOTIONAL_USD }}
       MEXC_DEPTH_LIMIT: ${{ vars.MEXC_DEPTH_LIMIT }}
@@ -38,48 +38,9 @@ jobs:
       ACTIVE_UTC_END: ${{ vars.ACTIVE_UTC_END }}
       MEXC_BASE: ${{ vars.MEXC_BASE }}
 
-      # Behavior/sizing
-      FORCE_SIZE_BPS: ${{ vars.FORCE_SIZE_BPS }}
-
-      # MP overlay + Top‑3 fallback (envs left for compatibility; logic updated in code)
-      MP_TOP_POOL: ${{ vars.MP_TOP_POOL }}             # default 20 (not used for top-up in updated logic)
-      NO_VIABLE_RANK_FILL: ${{ vars.NO_VIABLE_RANK_FILL }}
-      ALWAYS3_ENABLE: ${{ vars.ALWAYS3_ENABLE }}
-      ALWAYS3_SIZE_FACTOR: ${{ vars.ALWAYS3_SIZE_FACTOR }}
-
-      # Side constraint
-      DIRECTION: ${{ vars.DIRECTION }}  # "both" | "long" | "short" (default "both")
-
-      # Risk/micro overrides
-      MR_SPREAD_MAX_BPS: ${{ vars.MR_SPREAD_MAX_BPS }}
-      MAX_COST_BPS_HARD: ${{ vars.MAX_COST_BPS_HARD }}
-      EDGE_COST_MULT_MIN: ${{ vars.EDGE_COST_MULT_MIN }}
-
-      # Tougher tails + calibration knobs
-      T_VA_DF: ${{ vars.T_VA_DF }}             # default 6
-      T_SIM_DF: ${{ vars.T_SIM_DF }}           # default 5
-      BOOT_BLOCK: ${{ vars.BOOT_BLOCK }}       # default 3 (block bootstrap)
-      CALIB_MIN_PLATT: ${{ vars.CALIB_MIN_PLATT }}   # default 30
-      CALIB_MIN_ISO: ${{ vars.CALIB_MIN_ISO }}       # default 120
-
-      # Symmetric long‑side guards
-      NO_LONG_DOWN_ENABLE: ${{ vars.NO_LONG_DOWN_ENABLE }}        # default "true"
-      LONG_DOWN_RSI_CUTOFF: ${{ vars.LONG_DOWN_RSI_CUTOFF }}      # default "40"
-      LONG_MR_DIVERGENCE_REQ: ${{ vars.LONG_MR_DIVERGENCE_REQ }}  # default "true"
-
-      # Long policy
-      LONG_MAX_COST_BPS: ${{ vars.LONG_MAX_COST_BPS }}            # default 12
-      LONG_EDGE_MULT_MIN: ${{ vars.LONG_EDGE_MULT_MIN }}          # default 4
-      LONG_BOUNCE_SL_ATR: ${{ vars.LONG_BOUNCE_SL_ATR }}          # default 0.50
-      LONG_BOUNCE_TP_ATR: ${{ vars.LONG_BOUNCE_TP_ATR }}          # default 0.90
-      LONG_BOUNCE_HOLD_MIN_SEC: ${{ vars.LONG_BOUNCE_HOLD_MIN_SEC }}  # default 900
-      LONG_BOUNCE_HOLD_MAX_SEC: ${{ vars.LONG_BOUNCE_HOLD_MAX_SEC }}  # default 2400
-      LONG_ENTRY_BOUNCE_OFFSET: ${{ vars.LONG_ENTRY_BOUNCE_OFFSET }}  # default 0.0015
-      LONG_SIMILARITY_RHO: ${{ vars.LONG_SIMILARITY_RHO }}        # default 0.84
-      LONG_KILL_MIN_TRADES: ${{ vars.LONG_KILL_MIN_TRADES }}      # default 20
-      LONG_KILL_WINRATE: ${{ vars.LONG_KILL_WINRATE }}            # default 0.20
-      LONG_KILL_SIZE_MULT: ${{ vars.LONG_KILL_SIZE_MULT }}        # default 0.5
-      LONG_NAUGHTY_BASES: ${{ vars.LONG_NAUGHTY_BASES }}          # default "EDU,THE,HEMI,COOKIE,MNT,ASTER"
+      # Sizing/behavior knobs
+      FORCE_SIZE_BPS: ${{ vars.FORCE_SIZE_BPS }}       # e.g., 1000 = 10% fixed; 0 = risk-based
+      NO_VIABLE_RANK_FILL: ${{ vars.NO_VIABLE_RANK_FILL }}  # "true" (default) or "false"
 
     steps:
       - name: Setup Node 20
@@ -87,7 +48,7 @@ jobs:
         with:
           node-version: 20
 
-      - name: Run pusher (Prime v6.2 — Calibrated GP-Cls + Heavy-tail sims + Bandit + Symmetric guards + MP Top-20 + Top-3)
+      - name: Run pusher (Stochastic Pro, strict-first; strict=0 → rank-fill + top-up to K + counts snapshot)
         shell: bash
         run: |
           set -euo pipefail
@@ -108,9 +69,8 @@ jobs:
             const sum=(a)=>a.reduce((x,y)=>x+y,0);
             const mean=(a)=>a.length?sum(a)/a.length:0;
             const std=(a)=>{const m=mean(a); let v=0; for(const x of a)v+=(x-m)*(x-m); return a.length>1?Math.sqrt(v/(a.length-1)):0;};
-            const ema=(arr,p)=>{ if(!arr||arr.length<p) return null; const k=2/(p+1); let e=arr.slice(0,p).reduce((a,b)=>a+b,0)/p; for(let i=p;i<arr.length;i++) e=arr[i]*k+e*(1-k); return e; };
-            const emaSeries=(arr,p)=>{ if(!arr||arr.length<p) return null; const k=2/(p+1); const out=Array(arr.length).fill(null); let e=arr.slice(0,p).reduce((a,b)=>a+b,0)/p; out[p-1]=e; for(let i=p;i<arr.length;i++){ e=arr[i]*k+e*(1-k); out[i]=e; } return out; };
-            const rsi=(cl,p=14)=>{ if(!cl||cl.length<=p) return null; let g=0,l=0; for(let i=1;i<=p;i++){ const d=cl[i]-cl[i-1]; g+=Math.max(0,d); l+=Math.max(0,-d); } let ag=g/p, al=l/p; for(let i=p+1;i<cl.length;i++){ const d=cl[i]-cl[i-1]; ag=(ag*(p-1)+Math.max(0,d))/p; al=(al*(p-1)+Math.max(0,-d))/p; } const rs=al===0?100:ag/al; return 100-100/(1+rs); };
+            const ema=(arr,p)=>{ if(arr.length<p) return null; const k=2/(p+1); let e=arr.slice(0,p).reduce((a,b)=>a+b,0)/p; for(let i=p;i<arr.length;i++) e=arr[i]*k+e*(1-k); return e; };
+            const rsi=(cl,p=14)=>{ if(cl.length<=p) return null; let g=0,l=0; for(let i=1;i<=p;i++){ const d=cl[i]-cl[i-1]; g+=d>0?d:0; l+=d<0?-d:0; } let ag=g/p, al=l/p; for(let i=p+1;i<cl.length;i++){ const d=cl[i]-cl[i-1]; ag=(ag*(p-1)+(d>0?d:0))/p; al=(al*(p-1)+(d<0?-d:0))/p; } const rs=al===0?100:ag/al; return 100-100/(1+rs); };
             const computeADX_ATR=(h,l,c,p=14)=>{ const n=c.length; if(n<p+2) return null; const TR=[],plusDM=[],minusDM=[];
               for(let i=1;i<n;i++){ const up=h[i]-h[i-1], down=l[i-1]-l[i]; plusDM.push((up>down&&up>0)?up:0); minusDM.push((down>up&&down>0)?down:0);
                 TR.push(Math.max(h[i]-l[i], Math.abs(h[i]-c[i-1]), Math.abs(l[i]-c[i-1]))); }
@@ -120,21 +80,18 @@ jobs:
                 pDI=100*(pdmN/(trN||1)); nDI=100*(ndmN/(trN||1)); dx=100*Math.abs(pDI-nDI)/((pDI+nDI)||1); adx=((adx*(p-1))+dx)/p; }
               const atr=trN/p; return { adx, atr, trLast: TR.at(-1) };
             };
-            const vwapAnchored=(h,l,c,v,win)=>{ if(!c?.length) return null; const n=c.length,s=Math.max(0,n-win); let pv=0,vv=0; for(let i=s;i<n;i++){ const tp=(h[i]+l[i]+c[i])/3; const vol=+v[i]||0; pv+=tp*vol; vv+=vol; } return vv>0?pv/vv:c.at(-1); };
-            const corr=(a,b)=>{ const n=Math.min(a?.length||0,b?.length||0); if(n<5) return 0; const as=a.slice(-n), bs=b.slice(-n); const ma=mean(as), mb=mean(bs); let num=0,da=0,db=0; for(let i=0;i<n;i++){ const xa=as[i]-ma, xb=bs[i]-mb; num+=xa*xb; da+=xa*xa; db+=xb*xb; } const den=Math.sqrt(da*db)||1; return num/den; };
+            const vwapAnchored=(h,l,c,v,win)=>{ const n=c.length,s=Math.max(0,n-win); let pv=0,vv=0; for(let i=s;i<n;i++){ const tp=(h[i]+l[i]+c[i])/3; const vol=+v[i]||0; pv+=tp*vol; vv+=vol; } return vv>0?pv/vv:c.at(-1); };
+            const corr=(a,b)=>{ const n=Math.min(a.length,b.length); if(n<5) return 0; const as=a.slice(-n), bs=b.slice(-n);
+              const ma=mean(as), mb=mean(bs); let num=0,da=0,db=0; for(let i=0;i<n;i++){ const xa=as[i]-ma, xb=bs[i]-mb; num+=xa*xb; da+=xa*xa; db+=xb*xb; }
+              const den=Math.sqrt(da*db)||1; return num/den;
+            };
             const wilsonLCB=(p,n,z=1.34)=>{ if(n<=0) return p; const z2=z*z; const a=p + z2/(2*n); const b=z*Math.sqrt((p*(1-p)+z2/(4*n))/n); const c=1+z2/n; return clamp((a-b)/c, 0, 1); };
             const sleep=(ms)=>new Promise(r=>setTimeout(r,ms));
             const jitter=(ms)=>ms + Math.floor(Math.random()*ms*0.25);
             const softmax=(arr,t=20)=>{ const m=Math.max(...arr,0); const ex=arr.map(x=>Math.exp((x-m)/t)); const s=ex.reduce((a,b)=>a+b,0)||1; return ex.map(x=>x/s); };
-            const sigmoid=(z)=>1/(1+Math.exp(-z));
-            const logit=(p)=>Math.log((p+1e-12)/(1-(p-1e-12)));
+            const log=(...a)=>console.log("[gha]",...a);
 
-            // RNG
-            let bmSpare=null;
-            const randn=()=>{ if(bmSpare!=null){ const v=bmSpare; bmSpare=null; return v; } let u=0,v=0; while(u===0) u=Math.random(); while(v===0) v=Math.random(); const r=Math.sqrt(-2*Math.log(u)); const th=2*Math.PI*v; bmSpare=r*Math.sin(th); return r*Math.cos(th); };
-            function randt(df){ if(df<=2) df=2.01; const z=randn(); let x2=0; for(let i=0;i<Math.floor(df);i++){ const z2=randn(); x2+=z2*z2; } const frac=df-Math.floor(df); if(frac>0){ const zf=randn(); x2+=frac*zf*zf; } const chi=x2||1e-6; return z / Math.sqrt(chi/df); }
-
-            // IO snapshot for counts
+            // IO snapshot for counts (for visibility on failures)
             const fs = require('fs');
             function snapCounts(partial){
               try{
@@ -145,6 +102,10 @@ jobs:
                 fs.writeFileSync('/tmp/pusher_counts.json', JSON.stringify(next));
               }catch{}
             }
+
+            // RNG
+            let bmSpare=null;
+            const randn=()=>{ if(bmSpare!=null){ const v=bmSpare; bmSpare=null; return v; } let u=0,v=0; while(u===0) u=Math.random(); while(v===0) v=Math.random(); const r=Math.sqrt(-2*Math.log(u)); const th=2*Math.PI*v; bmSpare=r*Math.sin(th); return r*Math.cos(th); };
 
             // Kalman (1D RW)
             function kalman1D(obs,{q=1e-5,r=1e-3,x0=null,p0=1e-2}={}){
@@ -161,242 +122,202 @@ jobs:
               return out;
             }
 
-            // ---- Crypto + stable stringify for hashes ----
-            const crypto = require('crypto');
-            const stableStringify=(obj)=>{
-              const seen=new WeakSet();
-              const sort=(v)=>{
-                if(v===null||typeof v!=='object') return v;
-                if(seen.has(v)) return null;
-                seen.add(v);
-                if(Array.isArray(v)) return v.map(sort);
-                const keys=Object.keys(v).sort();
-                const o={}; for(const k of keys) o[k]=sort(v[k]); return o;
-              };
-              return JSON.stringify(sort(obj));
-            };
-            const sha256Hex=(s)=>crypto.createHash('sha256').update(String(s)).digest('hex');
-
-            // ------------- GP Classification (Laplace) -------------
-            function pairwiseD2(X, Y){
-              const n=X.length, m=Y.length, d=X[0]?.length||0;
-              const M=Array.from({length:n},()=>Array(m).fill(0));
-              for(let i=0;i<n;i++) for(let j=0;j<m;j++){ let s=0; for(let k=0;k<d;k++){ const dv=X[i][k]-Y[j][k]; s+=dv*dv; } M[i][j]=s; }
-              return M;
-            }
+            // ------------- GP (RBF) for p_win with uncertainty -------------
             function medianPairwiseDist(X){
               const n=X.length; if(n<2) return 1;
-              const idx=[]; for(let i=0;i<n;i+=Math.max(1,Math.floor(n/20))) idx.push(i);
-              const d=[]; for(let i=0;i<idx.length;i++) for(let j=i+1;j<idx.length;j++){ const a=X[idx[i]], b=X[idx[j]]; let s=0; for(let k=0;k<a.length;k++){ const dv=a[k]-b[k]; s+=dv*dv; } d.push(Math.sqrt(s)); }
-              d.sort((a,b)=>a-b); return d[Math.floor(d.length/2)]||1;
+              const sampleIdx=[]; for(let i=0;i<n;i+=Math.max(1,Math.floor(n/20))) sampleIdx.push(i);
+              const dists=[];
+              for(let i=0;i<sampleIdx.length;i++){
+                for(let j=i+1;j<sampleIdx.length;j++){
+                  const a=X[sampleIdx[i]], b=X[sampleIdx[j]];
+                  let d2=0; for(let k=0;k<a.length;k++){ const dv=(a[k]-b[k]); d2+=dv*dv; }
+                  dists.push(Math.sqrt(d2));
+                }
+              }
+              dists.sort((a,b)=>a-b);
+              return dists[Math.floor(dists.length/2)]||1;
             }
-            function rbfKernel(X, Y, ell){
-              const inv2l2 = 1/(2*Math.max(1e-9, ell*ell));
-              const D2=pairwiseD2(X,Y);
-              const K=Array.from({length:D2.length},()=>Array(D2[0].length).fill(0));
-              for(let i=0;i<D2.length;i++) for(let j=0;j<D2[0].length;j++) K[i][j]=Math.exp(-D2[i][j]*inv2l2);
-              return { K, inv2l2 };
+            function buildGP(X,Y,lam=0.10){
+              const n=X.length; if(n===0) return null;
+              const ell = medianPairwiseDist(X) || 1;
+              const inv2l2 = 1/(2*ell*ell);
+              const K = Array.from({length:n},()=>Array(n).fill(0));
+              for(let i=0;i<n;i++){
+                for(let j=0;j<n;j++){
+                  let d2=0; for(let k=0;k<X[i].length;k++){ const dv=X[i][k]-X[j][k]; d2+=dv*dv; }
+                  K[i][j]=Math.exp(-d2*inv2l2);
+                }
+                K[i][i]+=lam;
+              }
+              const L=cholesky(K); if(!L) return null;
+              const y=Y.slice();
+              const z=forwardSub(L,y);
+              const LT=L.map((row,i)=>row.map((v,j)=> L[j]?.[i]??0));
+              const alpha=backSub(LT,z);
+              return { X, alpha, L, ell, inv2l2 };
             }
+            function gpPredict(model,x){
+              if(!model) return { mu:0.5, sigma:0.25 };
+              const {X,alpha,L,inv2l2}=model;
+              const n=X.length;
+              const kstar=Array(n).fill(0);
+              for(let i=0;i<n;i++){
+                let d2=0; for(let k=0;k<X[i].length;k++){ const dv=X[i][k]-x[k]; d2+=dv*dv; }
+                kstar[i]=Math.exp(-d2*inv2l2);
+              }
+              let mu=0; for(let i=0;i<n;i++) mu+=kstar[i]*alpha[i];
+              const v=forwardSub(L,kstar);
+              let vtv=0; for(const vi of v) vtv+=vi*vi;
+              let varp=Math.max(1e-6, 1 - vtv);
+              return { mu:clamp(mu,0,1), sigma:Math.sqrt(varp) };
+            }
+            function dot(a,b){ let s=0; for(let i=0;i<a.length;i++) s+=a[i]*(b[i]||0); return s; }
             function cholesky(A){
               const n=A.length; const L=Array.from({length:n},()=>Array(n).fill(0));
               for(let i=0;i<n;i++){
                 for(let j=0;j<=i;j++){
                   let s=0; for(let k=0;k<j;k++) s+=L[i][k]*L[j][k];
                   const v=A[i][j]-s;
-                  if(i===j){ if(v<=1e-12) return null; L[i][j]=Math.sqrt(Math.max(v,1e-12)); }
+                  if(i===j){ if(v<=1e-12) return null; L[i][j]=Math.sqrt(v); }
                   else { L[i][j]=v/(L[j][j]||1e-12); }
                 }
               }
               return L;
             }
-            function solveChol(L, b){
-              const n=L.length, y=Array(n).fill(0), x=Array(n).fill(0);
+            function forwardSub(L,b){
+              const n=L.length; const y=Array(n).fill(0);
               for(let i=0;i<n;i++){ let s=0; for(let k=0;k<i;k++) s+=L[i][k]*y[k]; y[i]=(b[i]-s)/(L[i][i]||1e-12); }
-              for(let i=n-1;i>=0;i--){ let s=0; for(let k=i+1;k<n;k++) s+=L[k][i]*x[k]; x[i]=(y[i]-s)/(L[i][i]||1e-12); }
+              return y;
+            }
+            function backSub(U,y){
+              const n=U.length; const x=Array(n).fill(0);
+              for(let i=n-1;i>=0;i--){ let s=0; for(let k=i+1;k<n;k++) s+=U[i][k]*x[k]; x[i]=(y[i]-s)/(U[i][i]||1e-12); }
               return x;
             }
-            function trainGPClass(X, y01, lam=0.10, iters=10){
-              const n=X.length; if(n===0) return null;
-              const ell = medianPairwiseDist(X) || 1;
-              const { K } = rbfKernel(X, X, ell);
-              for(let i=0;i<n;i++) K[i][i]+=lam;
-              let f=Array(n).fill(0);
-              for(let it=0; it<iters; it++){
-                const pi=f.map(sigmoid);
-                const W=pi.map(p=> p*(1-p)+1e-6), Winv=W.map(w=>1/(w||1e-6));
-                const A=Array.from({length:n},(_,i)=> K[i].map((v,j)=> v + (i===j?Winv[i]:0)));
-                const ypi=y01.map((yy,i)=> yy - pi[i]);
-                const b=Array(n).fill(0); for(let i=0;i<n;i++){ let s=0; for(let j=0;j<n;j++) s+=K[i][j]*ypi[j]; b[i]=s - f[i]; }
-                const L=cholesky(A); if(!L) break;
-                const h=solveChol(L,b); let maxStep=0; for(let i=0;i<n;i++){ f[i]+=h[i]; maxStep=Math.max(maxStep,Math.abs(h[i])); } if(maxStep<1e-4) break;
-              }
-              const pi=f.map(sigmoid), W=pi.map(p=> p*(1-p)+1e-6), Winv=W.map(w=>1/(w||1e-6));
-              const A=Array.from({length:n},(_,i)=> K[i].map((v,j)=> v + (i===j?Winv[i]:0)));
-              const L=cholesky(A); if(!L) return null;
-              return { X, y:y01, K, L, f, pi, ell };
-            }
-            function predictGPClass(model, x){
-              if(!model) return { p:0.5, s2:0.2 };
-              const { X, L, pi, y, ell } = model;
-              const inv2l2=1/(2*ell*ell);
-              let kstar=Array(X.length).fill(0);
-              for(let i=0;i<X.length;i++){ let d2=0; for(let k=0;k<X[i].length;k++){ const dv=X[i][k]-x[k]; d2+=dv*dv; } kstar[i]=Math.exp(-d2*inv2l2); }
-              let m=0; for(let i=0;i<X.length;i++) m+=kstar[i]*((y[i]||0)-(pi[i]||0));
-              const v=solveChol(L,kstar); let vtv=0; for(const vi of v) vtv+=vi*vi;
-              const s2=Math.max(1e-6,1-vtv); const scale=Math.sqrt(1+(Math.PI*s2/8)); const p=sigmoid(m/scale);
-              return { p:clamp(p,0.01,0.99), s2 };
-            }
-            const gpClfHash=(m)=>{
-              if(!m) return null;
-              const diag=(m.L||[]).map((r,i)=>r[i]).slice(0,16).map(x=>+x||0);
-              const meta={ ell:+(m.ell||0), nX:m.X?.length||0, L_diag:diag };
-              return "sha256:"+sha256Hex(stableStringify(meta));
-            };
 
-            // ------------- Calibration (Platt / Isotonic) -------------
-            const sigmoidF=(a,b,z)=>1/(1+Math.exp(-(a*z+b)));
-            const logitF=(p)=>Math.log((p+1e-12)/(1-(p-1e-12)));
-            function fitPlatt(p,y){ const eps=1e-6, z=p.map(pp=> clamp(pp,eps,1-eps)).map(logitF); let a=1,b=0; const lr=0.05,it=400,l2=0.01;
-              for(let t=0;t<it;t++){ let ga=0,gb=0; for(let i=0;i<y.length;i++){ const s=sigmoidF(a,b,z[i]), e=s-y[i]; ga+=e*z[i]; gb+=e; } ga+=l2*a; gb+=l2*b; a-=lr*ga/y.length; b-=lr*gb/y.length; }
-              return {a,b,n:y.length}; }
-            function applyPlatt(p,ab){ const {a,b}=ab||{a:1,b:0}; return p.map(pi=> sigmoidF(a,b, logitF(clamp(pi,1e-6,1-1e-6)) )); }
-            function fitIsotonic(p,y){ const idx=[...p.keys()].sort((i,j)=>p[i]-p[j]); const xs=[],ys=[]; for(const i of idx){ xs.push(p[i]); ys.push(y[i]); }
-              const n=xs.length,g=ys.slice(),w=Array(n).fill(1); for(let i=0;i<n-1;i++){ if(g[i]>g[i+1]){ let j=i; while(j>=0 && g[j]>g[j+1]){ const ww=w[j]+w[j+1], gg=(w[j]*g[j]+w[j+1]*g[j+1])/ww; w[j]=ww; g[j]=gg; xs.splice(j,2,(xs[j])); ys.splice(j,2,(gg)); g.splice(j+1,1); w.splice(j+1,1); if(j>0) j--; } } } return { xs, ys:g, n }; }
-            function applyIsotonic(p,iso){ if(!iso?.xs?.length||!iso?.ys?.length) return p; const xs=iso.xs, ys=iso.ys; return p.map(val=>{ if(val<=xs[0]) return ys[0]; if(val>=xs[xs.length-1]) return ys[ys.length-1]; let lo=0,hi=xs.length-1; while(hi-lo>1){ const mid=((lo+hi)>>1); if(xs[mid]<=val) lo=mid; else hi=mid; } const t=(val-xs[lo])/Math.max(1e-9,(xs[hi]-xs[lo])); return ys[lo]+t*(ys[hi]-ys[lo]); }); }
-
-            // ------------- Heavy-tail Monte Carlo (t + bootstrap) -------------
-            function pathEVHeavy({entry,tp_bps,sl_bps,side,retSeries,mu,sigma,steps,N=192,cost_bps=10,t_df=5,boot_block=3}){
-              const up=(side==="long"), tpF=tp_bps/10000, slF=sl_bps/10000; let ev=0, wins=0; const rets=retSeries||[];
-              const boot1=()=>{ if(rets.length<8) return Array(steps).fill(0).map(()=> sigma*Math.sqrt(1/steps)*randn()); const out=[]; while(out.length<steps){ const start=Math.floor(Math.random()*(rets.length-boot_block)); for(let k=0;k<boot_block && out.length<steps;k++) out.push(rets[start+k]||0); } return out.slice(0,steps); };
+            // ------------- SDE Monte Carlo (GBM) -------------
+            function gbmSimEV({entry,tp_bps,sl_bps,side,mu, sigma, dt, steps, N=192, cost_bps=10}){
+              let hitTP=0, ev=0;
+              const up=(side==="long");
+              const tpF=tp_bps/10000, slF=sl_bps/10000;
               for(let n=0;n<N;n++){
-                const mode=(n%2===0)?"t":"boot";
-                let S=entry, tp=up? entry*(1+tpF):entry*(1-tpF), sl=up? entry*(1-slF):entry*(1+slF);
-                let pnl_bps=0,win=0;
-                const rs=(mode==="t")? Array(steps).fill(0).map(()=> mu + sigma*randt(t_df)/Math.sqrt(steps)) : boot1();
+                let S=entry;
+                let tp=up? entry*(1+tpF): entry*(1-tpF);
+                let sl=up? entry*(1-slF): entry*(1+slF);
+                let win=0, pnl_bps=0;
                 for(let t=0;t<steps;t++){
-                  const r=rs[t];
-                  S=S*(1+r);
-                  if(up){ if(S>=tp){ pnl_bps=tp_bps-cost_bps; win=1; break;} if(S<=sl){ pnl_bps=-sl_bps-cost_bps; win=0; break;} }
-                  else { if(S<=tp){ pnl_bps=tp_bps-cost_bps; win=1; break;} if(S>=sl){ pnl_bps=-sl_bps-cost_bps; win=0; break;} }
-                  if(t===steps-1){ const ret=up? (S/entry-1):(entry/S-1); pnl_bps=Math.round(ret*10000)-cost_bps; win=pnl_bps>0?1:0; }
+                  const z=randn();
+                  S = S * Math.exp((mu - 0.5*sigma*sigma)*dt + sigma*Math.sqrt(dt)*z);
+                  if(up){
+                    if(S>=tp){ win=1; pnl_bps=tp_bps - cost_bps; break; }
+                    if(S<=sl){ win=0; pnl_bps=-sl_bps - cost_bps; break; }
+                  }else{
+                    if(S<=tp){ win=1; pnl_bps=tp_bps - cost_bps; break; }
+                    if(S>=sl){ win=0; pnl_bps=-sl_bps - cost_bps; break; }
+                  }
+                  if(t===steps-1){
+                    const ret = up? (S/entry - 1) : (entry/S - 1);
+                    pnl_bps = Math.round(ret*10000) - cost_bps;
+                    win = pnl_bps>0?1:0;
+                  }
                 }
-                ev+=pnl_bps; wins+=win;
+                hitTP+=win;
+                ev += pnl_bps;
               }
-              const p=wins/N, ev_mean=ev/N;
-              return { p, ev_bps:Math.round(ev_mean) };
+              const p=hitTP/N;
+              const p_lcb = wilsonLCB(p, N, 1.34);
+              const ev_mean = ev/N;
+              const ev_lcb = p_lcb*tp_bps - (1-p_lcb)*sl_bps - cost_bps;
+              return { p, p_lcb, ev_bps: Math.round(ev_mean), ev_lcb_bps: Math.round(ev_lcb) };
             }
 
-            // ------------- t-copula VaR/ES (FIXED) -------------
-            function choleskySafe(S){
-              const L=cholesky(S);
-              if(L) return L;
-              const n=S.length;
-              const Sc=S.map((r,i)=> r.map((v,j)=> v + (i===j?1e-6:0)));
-              return cholesky(Sc);
+            function optimizeRRR_MC({atr_bps,cost_bps,spread_bps,entry,side,mu,sigma,ttl_sec}){
+              const slMults=[0.35,0.5,0.7,1.0,1.3,1.5];
+              const tpMults=[0.5,0.8,1.1,1.4,1.8,2.1];
+              const dt=1;
+              const steps=Math.max(1, Math.round(ttl_sec/300));
+              let best=null;
+              for(const sm of slMults){
+                for(const tm of tpMults){
+                  const sl_bps=Math.round(sm*atr_bps);
+                  const tp_bps=Math.round(tm*atr_bps);
+                  if(tp_bps <= cost_bps+2) continue;
+                  const { ev_lcb_bps } = gbmSimEV({entry,tp_bps,sl_bps,side,mu,sigma,dt,steps,N:128,cost_bps});
+                  const qual=ev_lcb_bps - Math.max(0, (spread_bps-6));
+                  if(!best || qual>(best.qual||-1e9)){
+                    best={ tp_bps, sl_bps, r:tp_bps/Math.max(1,sl_bps), ev_lcb_bps, qual };
+                  }
+                }
+              }
+              if(best){
+                const refine=[-0.15, -0.05, 0, +0.05, +0.15];
+                for(const ds of refine){
+                  for(const dtp of refine){
+                    const sm=clamp(best.sl_bps/atr_bps + ds, 0.30, 1.50);
+                    const tm=clamp(best.tp_bps/atr_bps + dtp, 0.40, 2.10);
+                    const sl_bps=Math.round(sm*atr_bps);
+                    const tp_bps=Math.round(tm*atr_bps);
+                    const { ev_lcb_bps } = gbmSimEV({entry,tp_bps,sl_bps,side,mu,sigma,dt,steps,N:192,cost_bps});
+                    const qual=ev_lcb_bps;
+                    if(qual>(best.qual||-1e9)) best={ tp_bps, sl_bps, r:tp_bps/Math.max(1,sl_bps), ev_lcb_bps, qual };
+                  }
+                }
+              }
+              return best;
             }
-            function sampleMultiT(muVec,Sigma,df=6,M=1000){
-              const n=muVec.length;
-              const L=choleskySafe(Sigma); if(!L) return [];
+
+            // ------------- Portfolio VaR / ES (MC) -------------
+            function mvnSample(meanVec, Sigma, M=1000){
+              const n=meanVec.length; const L=cholesky(Sigma); if(!L) return [];
               const out=[];
               for(let m=0;m<M;m++){
                 const z=Array(n).fill(0).map(()=>randn());
                 const y=Array(n).fill(0);
-                for(let i=0;i<n;i++){ let s=0; for(let k=0;k<=i;k++) s+=L[i][k]*z[k]; y[i]=s; }
-                let chi=0; for(let i=0;i<df;i++){ const zc=randn(); chi+=zc*zc; }
-                const scale=Math.sqrt(df/Math.max(1e-9,chi));
-                out.push(y.map((yi,i)=> (muVec[i]||0) + yi*scale));
+                for(let i=0;i<n;i++){ let s=0; for(let k=0;k<=i;k++) s+=L[i][k]*z[k]; y[i]=s + (meanVec[i]||0); }
+                out.push(y);
               }
               return out;
             }
-            function portfolioVaR_ES_tCopula(picks, df=6){
-              if(!picks.length) return { VaR95_bps:0, ES95_bps:0 };
-              const n=picks.length, mu=Array(n).fill(0), sd=Array(n).fill(0);
+            function portfolioVaR_ES(picks){
+              if(picks.length===0) return { VaR95_bps:0, ES95_bps:0, scale:1 };
+              const n=picks.length;
+              const mu=Array(n).fill(0);
+              const sd=Array(n).fill(0);
               for(let i=0;i<n;i++){
-                const r5=picks[i].ret5||[]; const rMean=mean(r5), rStd=std(r5)||1e-4;
+                const r5=picks[i].ret5||[];
+                const rMean=mean(r5), rStd=std(r5);
                 const steps=Math.max(1, Math.round((picks[i].ttl_sec||600)/300));
-                mu[i]=rMean*steps*10000;
-                sd[i]=rStd*Math.sqrt(steps)*10000;
-              }
-              const R=Array.from({length:n},()=>Array(n).fill(0));
-              for(let i=0;i<n;i++){
-                for(let j=0;j<n;j++) R[i][j]=corr(picks[i].ret5||[], picks[j].ret5||[]);
-                R[i][i]=1;
+                const muH=rMean*steps;
+                const sdH=rStd*Math.sqrt(steps);
+                mu[i]=muH*10000;
+                sd[i]=sdH*10000;
               }
               const Sigma=Array.from({length:n},()=>Array(n).fill(0));
-              for(let i=0;i<n;i++) for(let j=0;j<n;j++) Sigma[i][j]=R[i][j]*sd[i]*sd[j];
+              for(let i=0;i<n;i++){
+                for(let j=0;j<n;j++){
+                  const rho=corr(picks[i].ret5||[], picks[j].ret5||[]);
+                  Sigma[i][j]=rho * sd[i] * sd[j];
+                }
+                Sigma[i][i]=Math.max(Sigma[i][i], 1e-3 + sd[i]*sd[i]);
+              }
+              const weights=picks.map(p=> (p.size_bps||0)); const wSum=sum(weights)||1; for(let i=0;i<weights.length;i++) weights[i]/=wSum;
 
-              const draws=sampleMultiT(mu,Sigma,df,1200);
-              if(!draws.length) return { VaR95_bps:0, ES95_bps:0 };
-
-              const w0=picks.map(p=> p.size_bps||0); const ws=sum(w0)||1; const w=w0.map(x=> x/ws);
-              const port=draws.map(d=> d.reduce((acc,di,ii)=> acc + w[ii]*di, 0));
+              const draws=mvnSample(mu,Sigma,1200);
+              const port=[];
+              for(const d of draws){
+                let pr=0; for(let i=0;i<n;i++) pr += (weights[i]||0) * (d[i]||0);
+                port.push(pr);
+              }
               port.sort((a,b)=>a-b);
               const idx=Math.floor(0.05*port.length);
               const VaR95=port[idx]||0;
               const ES=mean(port.slice(0,idx+1));
-              return { VaR95_bps:Math.round(VaR95), ES95_bps:Math.round(ES) };
-            }
-
-            // ------------- Metrics / Calibration / Drift -------------
-            function brier(y,p){ let s=0; for(let i=0;i<y.length;i++) s+=(y[i]-p[i])**2; return s/y.length; }
-            function logloss(y,p){ const e=1e-12; let s=0; for(let i=0;i<y.length;i++){ const pp=clamp(p[i],e,1-e); s+=-(y[i]*Math.log(pp)+(1-y[i])*Math.log(1-pp)); } return s/y.length; }
-            function auc(y,p){ const pos=[],neg=[]; for(let i=0;i<y.length;i++) (y[i]?pos:neg).push(p[i]); if(!pos.length||!neg.length) return NaN; let wins=0,ties=0; for(const a of pos) for(const b of neg){ if(a>b) wins++; else if(a===b) ties++; } const total=pos.length*neg.length; return (wins+0.5*ties)/total; }
-            function pageHinkleyInit(){ return { mean:0, ph:0, minPH:0, alarms:0 }; }
-            function pageHinkleyUpdate(st, x, delta=0.01, lambda=0.05){
-              st.mean=st.mean+(x-st.mean)*0.01;
-              const d=(x-st.mean)-delta;
-              st.ph+=d;
-              st.minPH=Math.min(st.minPH, st.ph);
-              const stat=st.ph-st.minPH;
-              const drift=stat>lambda;
-              if(drift){ st.ph=0; st.minPH=0; st.alarms++; }
-              return drift;
-            }
-
-            // ---------- Microstructure helpers ----------
-            function computeOBI(depth, topN=12){
-              if(!depth?.asks?.length || !depth?.bids?.length) return 0;
-              const w=(i)=>Math.exp(-i*0.18);
-              let bidNot=0, askNot=0;
-              for(let i=0;i<Math.min(topN, depth.bids.length); i++){ const p=+depth.bids[i][0], q=+depth.bids[i][1]; if(p>0&&q>0) bidNot += p*q*w(i); }
-              for(let i=0;i<Math.min(topN, depth.asks.length); i++){ const p=+depth.asks[i][0], q=+depth.asks[i][1]; if(p>0&&q>0) askNot += p*q*w(i); }
-              return (bidNot+askNot>0) ? (bidNot-askNot)/(bidNot+askNot) : 0;
-            }
-            function depthWithinPctUSD(depth, mid, pct=0.01){
-              if(!depth?.asks?.length || !depth?.bids?.length || !(mid>0)) return { bidsUSD:0, asksUSD:0 };
-              const askLim=mid*(1+pct), bidLim=mid*(1-pct);
-              let asksUSD=0, bidsUSD=0;
-              for(const [ps,qs] of depth.asks){ const p=+ps, q=+qs; if(!(p>0&&q>0)) continue; if(p<=askLim) asksUSD += p*q; else break; }
-              for(const [ps,qs] of depth.bids){ const p=+ps, q=+qs; if(!(p>0&&q>0)) continue; if(p>=bidLim) bidsUSD += p*q; else break; }
-              return { bidsUSD, asksUSD };
-            }
-            function vwapFillLevels(levels,targetUSD){
-              let remain=targetUSD,val=0,qty=0;
-              for(const [ps,qs] of levels){
-                const p=+ps, q=+qs; if(!(p>0&&q>0)) continue;
-                const can=p*q, take=Math.min(remain,can), tq=take/p;
-                val+=p*tq; qty+=tq; remain-=take; if(remain<=1e-6) break;
-              }
-              return { px: qty>0? val/qty : null, filledUSD: (targetUSD-remain) };
-            }
-            function slipFromDepth(depth, mid, side, notionalUSD){
-              if(!depth?.asks?.length || !depth?.bids?.length || !(mid>0)) return { slip_bps:null, fill_prob:null };
-              if(side==="long"){
-                const buy=vwapFillLevels(depth.asks, Math.max(50,notionalUSD));
-                const slip = buy.px? Math.max(0, Math.round((buy.px - mid)/mid*10000)) : null;
-                const fill = Math.min(1, (buy.filledUSD||0)/Math.max(1,notionalUSD));
-                return { slip_bps: slip, fill_prob: +fill.toFixed(4) };
-              }else{
-                const sell=vwapFillLevels(depth.bids, Math.max(50,notionalUSD));
-                const slip = sell.px? Math.max(0, Math.round((mid - sell.px)/mid*10000)) : null;
-                const fill = Math.min(1, (sell.filledUSD||0)/Math.max(1,notionalUSD));
-                return { slip_bps: slip, fill_prob: +fill.toFixed(4) };
-              }
+              return { VaR95_bps: Math.round(VaR95), ES95_bps: Math.round(ES), scale:1 };
             }
 
             // ---------- Config / ENV ----------
-            const UA="gh-actions-ideas-mexc-ultimate/6.2-prime (+https://github.com/)";
-            async function fetchWithTimeout(url,opts={},ms=12000){ const ac=new AbortController(); const t=setTimeout(()=>ac.abort(),ms); try{ return await fetch(url,{...opts,signal:ac.signal,headers:{"User-Agent":UA,...(opts?.headers||{})}});} finally{ clearTimeout(t);} }
+            const UA="gh-actions-ideas-mexc-ultimate/4.0-stoch (+https://github.com/)";
+            async function fetchWithTimeout(url,opts={},ms=12000){ const ac=new AbortController(); const t=setTimeout(()=>ac.abort(),ms); try{ return await fetch(url,{...opts,signal:ac.signal,headers:{"User-Agent":UA,...(opts.headers||{})}});} finally{ clearTimeout(t);} }
             async function getJSON(url,ms=12000,tries=2){ for(let a=0;a<tries;a++){ try{ const r=await fetchWithTimeout(url,{},ms); if(r?.ok){ return await r.json(); } }catch{} await sleep(jitter(220)); } return null; }
 
             const EXCHANGE=(process.env.EXCHANGE||"mexc").toLowerCase().replace("mexci","mexc");
@@ -406,29 +327,34 @@ jobs:
             // Universe sizing
             const MIN_QV_ENV = Number(process.env.MIN_QV_USD||"0") || 0;
             const UNIV_TARGET_MIN=100, UNIV_TARGET_MAX=120;
-            const DYN_QV_MIN=Number(process.env.DYN_QV_MIN||"10000000");
-            const DYN_QV_STEP=5_000_000;
+            const DYN_QV_MIN=10_000_000, DYN_QV_STEP=5_000_000;
 
             // Core knobs
             const TOP_N = Number(process.env.TOP_N||"3");
             const MAX_SPREAD_BPS = Number(process.env.MAX_SPREAD_BPS||"12");
-            const EXP_LCB_MIN_BPS_BASE = Number(process.env.EXP_LCB_MIN_BPS||"12");
+            const EXP_LCB_MIN_BPS = Number(process.env.EXP_LCB_MIN_BPS||"5");
 
+            // TA + windows
             const EMA_FAST=21, EMA_SLOW=50, ADX_P=14, ATR_P=14;
-            const K1M=240, K5M=300, K15M=120, K1H=96;
+            const K1M=240, K5M=120, K15M=96, K1H=96;
             const VWAP_5M_WIN=36;
 
+            // Costs & micro
             const COST_BPS = Number(process.env.FEES_BPS||"10");
             const NOTIONAL = Number(process.env.NOTIONAL_USD||"300");
             const DEPTH_LIMIT = Number(process.env.MEXC_DEPTH_LIMIT||"50");
             const OBI_TOPN = Number(process.env.OBI_TOPN||"12");
 
+            // Risk & timing
             const COOLDOWN_MS=3*60*60*1000, FLIP_GUARD_MS=30*60*1000;
             const DD_24H_LIMIT_BPS=-150, DD_PEAK_LIMIT_BPS=-300;
             const WILSON_Z=1.34, TARGET_PORT_RISK_BPS=52;
             const TTL_MIN=540, TTL_MAX=1200;
 
-            // ToD active window
+            // EV gate
+            const EV_MIN_BPS=3;
+
+            // ToD gate
             const S_H = process.env.ACTIVE_UTC_START? Number(process.env.ACTIVE_UTC_START): null;
             const E_H = process.env.ACTIVE_UTC_END?   Number(process.env.ACTIVE_UTC_END):   null;
             const nowH = new Date().getUTCHours();
@@ -436,46 +362,8 @@ jobs:
 
             const STABLES=new Set(["USDT","USDC","USD","USDE","USDD","BUSD","FDUSD","TUSD","DAI","USDP","PAX","USTC"]);
 
-            // Fallback + MP
-            const NO_VIABLE_RANK_FILL = (process.env.NO_VIABLE_RANK_FILL || "false").toLowerCase()==="true";
-            const ALWAYS3_ENABLE = (process.env.ALWAYS3_ENABLE || "true").toLowerCase()==="true";
-            const ALWAYS3_SIZE_FACTOR = Number(process.env.ALWAYS3_SIZE_FACTOR || "0.4");
-            const MP_TOP_POOL = Number(process.env.MP_TOP_POOL || "20");
-
-            // Direction env
-            const DIRECTION=(process.env.DIRECTION||"both").trim().toLowerCase();
-            const ALLOWED=new Set(DIRECTION==="both"? ["long","short"] : [DIRECTION]);
-
-            // MR & cost
-            const MR_ADX_MAX_DEFAULT=20;
-            const MR_SLOPE_MAX_ATR50=Number(process.env.MR_SLOPE_MAX_ATR50||"0.5");
-            const MR_BREAKOUT_DC_N=Number(process.env.MR_BREAKOUT_DC_N||"120");
-            const MR_BREAKOUT_RET15_ATR=Number(process.env.MR_BREAKOUT_RET15_ATR||"1.5");
-            const MR_LOCKOUT_SEC=Number(process.env.MR_LOCKOUT_SEC||"1800");
-            const MR_SPREAD_MAX_BPS=Number(process.env.MR_SPREAD_MAX_BPS||"8");
-            const MAX_COST_BPS_HARD=Number(process.env.MAX_COST_BPS_HARD||"15");
-            const MIN_VOL_1H_USD=Number(process.env.MIN_VOL_1H_USD||"5000000");
-            const DEPTH_1P_MIN_USD=Number(process.env.DEPTH_1P_MIN_USD||"200000");
-            const MOMENTUM_SIZE_FACTOR=Number(process.env.MOMENTUM_SIZE_FACTOR||"0.5");
-
-            // Symmetric guards (long side)
-            const NO_LONG_DOWN_ENABLE=(process.env.NO_LONG_DOWN_ENABLE||"true").toLowerCase()==="true";
-            const LONG_DOWN_RSI_CUTOFF=Number(process.env.LONG_DOWN_RSI_CUTOFF||"40");
-            const LONG_MR_DIVERGENCE_REQ=(process.env.LONG_MR_DIVERGENCE_REQ||"true").toLowerCase()==="true";
-
-            // Long policy
-            const LONG_MAX_COST_BPS=Number(process.env.LONG_MAX_COST_BPS||"12");
-            const LONG_EDGE_MULT_MIN=Number(process.env.LONG_EDGE_MULT_MIN||"4");
-            const LONG_BOUNCE_SL_ATR=Number(process.env.LONG_BOUNCE_SL_ATR||"0.50");
-            const LONG_BOUNCE_TP_ATR=Number(process.env.LONG_BOUNCE_TP_ATR||"0.90");
-            const LONG_BOUNCE_HOLD_MIN_SEC=Number(process.env.LONG_BOUNCE_HOLD_MIN_SEC||"900");
-            const LONG_BOUNCE_HOLD_MAX_SEC=Number(process.env.LONG_BOUNCE_HOLD_MAX_SEC||"2400");
-            const LONG_ENTRY_BOUNCE_OFFSET=Number(process.env.LONG_ENTRY_BOUNCE_OFFSET||"0.0015");
-            const LONG_SIMILARITY_RHO=Number(process.env.LONG_SIMILARITY_RHO||"0.84");
-            const LONG_KILL_MIN_TRADES=Number(process.env.LONG_KILL_MIN_TRADES||"20");
-            const LONG_KILL_WINRATE=Number(process.env.LONG_KILL_WINRATE||"0.20");
-            const LONG_KILL_SIZE_MULT=Number(process.env.LONG_KILL_SIZE_MULT||"0.5");
-            const LONG_NAUGHTY_BASES=new Set(String(process.env.LONG_NAUGHTY_BASES||"EDU,THE,HEMI,COOKIE,MNT,ASTER").split(",").map(s=>s.trim().toUpperCase()).filter(Boolean));
+            // New toggle: if no viable ideas, should we push top-K ranked (mp_fill)?
+            const NO_VIABLE_RANK_FILL = (process.env.NO_VIABLE_RANK_FILL || "true").toLowerCase() === "true";
 
             // ---------- Worker endpoints ----------
             const PUSH_URL=process.env.WORKER_PUSH_URL||"";
@@ -483,8 +371,8 @@ jobs:
             const HEALTH_URL=(()=>{ try{ const u=new URL(PUSH_URL); return `${u.origin}${u.pathname.replace(/\/signals\/push(\?.*)?$/,"/health")}`;}catch{return PUSH_URL.replace(/\/signals\/push(\?.*)?$/,"/health");}})();
 
             // Health ping
-            console.log("[gha] health GET", HEALTH_URL);
-            try{ const r=await fetchWithTimeout(HEALTH_URL,{ headers:{ "Authorization":`Bearer ${PUSH_TOKEN}`, "User-Agent":UA }},5000); let t=""; try{ t=await r.text(); }catch{} console.log("[gha] health status", r?.status||"ERR", (t||"").slice(0,160)); }catch(e){ console.log("[gha] health error", e?.message||e); }
+            log("health GET", HEALTH_URL);
+            try{ const r=await fetchWithTimeout(HEALTH_URL,{ headers:{ "Authorization":`Bearer ${PUSH_TOKEN}`, "User-Agent":UA }},5000); let t=""; try{ t=await r.text(); }catch{} log("health status", r?.status||"ERR", (t||"").slice(0,160)); }catch(e){ log("health error", e?.message||e); }
 
             // ---------- MEXC Adapter ----------
             async function pickMexcBase(){ for(const b of MEXC_BASES){ try{ const r=await fetchWithTimeout(`${b}/api/v3/time`,{},4000); if(r?.ok) return b; }catch{} } throw new Error("No healthy MEXC base"); }
@@ -497,70 +385,24 @@ jobs:
               if(Array.isArray(all) && all.length) return all;
               const exi=await getJSON(api("/api/v3/exchangeInfo"), 10000, 2);
               const syms=(exi?.symbols||[]).filter(s=>s.status==="TRADING").map(s=>s.symbol).slice(0,300);
-              const out=[]; for(let i=0;i<syms.length;i+=24){ const chunk=syms.slice(i,i+24); const got=await Promise.all(chunk.map(s=>getJSON(api("/api/v3/ticker/24hr",{symbol:s}),6000,1))); for(const x of got) if(x) out.push(x); await sleep(180); }
+              const out=[];
+              for(let i=0;i<syms.length;i+=24){
+                const chunk=syms.slice(i,i+24);
+                const got=await Promise.all(chunk.map(s=>getJSON(api("/api/v3/ticker/24hr",{symbol:s}),6000,1)));
+                for(const x of got) if(x) out.push(x);
+                await sleep(180);
+              }
               return out;
             }
-            async function fetchBookTicker(symbol){
-              return await getJSON(api("/api/v3/ticker/bookTicker",{symbol}), 8000, 1);
-            }
-
-            // ---------- Run/config provenance ----------
-            async function getMexcTime(){ const j=await getJSON(api("/api/v3/time"), 8000, 2); const st=+j?.serverTime||Date.now(); return { mexc_server_time_ms: st, mexc_time_offset_ms: st - Date.now() }; }
-            function buildConfigHash(){
-              const cfg = {
-                EXCHANGE, MIN_QV_ENV, TOP_N, MAX_SPREAD_BPS, EXP_LCB_MIN_BPS_BASE,
-                FEES_BPS:COST_BPS, NOTIONAL, DEPTH_LIMIT, OBI_TOPN, ACTIVE_UTC_START:S_H, ACTIVE_UTC_END:E_H, MEXC_BASE:BASE,
-                FORCE_SIZE_BPS: Number(process.env.FORCE_SIZE_BPS||"0"), NO_VIABLE_RANK_FILL, ALWAYS3_ENABLE, ALWAYS3_SIZE_FACTOR, MP_TOP_POOL,
-                DIRECTION,
-                MR_SLOPE_MAX_ATR50, MR_BREAKOUT_DC_N, MR_BREAKOUT_RET15_ATR, MR_LOCKOUT_SEC, MR_SPREAD_MAX_BPS, MAX_COST_BPS_HARD,
-                MIN_VOL_1H_USD, DEPTH_1P_MIN_USD, MOMENTUM_SIZE_FACTOR,
-                NO_LONG_DOWN_ENABLE, LONG_DOWN_RSI_CUTOFF, LONG_MR_DIVERGENCE_REQ,
-                LONG_MAX_COST_BPS, LONG_EDGE_MULT_MIN, LONG_BOUNCE_SL_ATR, LONG_BOUNCE_TP_ATR, LONG_BOUNCE_HOLD_MIN_SEC, LONG_BOUNCE_HOLD_MAX_SEC, LONG_ENTRY_BOUNCE_OFFSET,
-                LONG_SIMILARITY_RHO, LONG_KILL_MIN_TRADES, LONG_KILL_WINRATE, LONG_KILL_SIZE_MULT,
-                T_VA_DF: Number(process.env.T_VA_DF||"6"), T_SIM_DF: Number(process.env.T_SIM_DF||"5"), BOOT_BLOCK: Number(process.env.BOOT_BLOCK||"3"),
-                CALIB_MIN_PLATT: Number(process.env.CALIB_MIN_PLATT||"30"), CALIB_MIN_ISO: Number(process.env.CALIB_MIN_ISO||"120"),
-                EMA_FAST, EMA_SLOW, ADX_P, ATR_P, VWAP_5M_WIN, WILSON_Z, TTL_MIN, TTL_MAX, TARGET_PORT_RISK_BPS
-              };
-              return "sha256:"+sha256Hex(stableStringify(cfg));
-            }
-            const pusher_version="mexc-ultimate-6.2-prime";
-            const code_commit_sha=process.env.GITHUB_SHA||"";
-            const run_id=new Date().toISOString()+"#6.2";
-            const mexcTime=await getMexcTime();
-            const config_hash=buildConfigHash();
-            let run_prov={ run_id, code_commit_sha, pusher_version, config_hash, exchange_base:BASE, ...mexcTime, p_model:{ gp_hash:null, calib_type:"mixed", calib_n:0 } };
 
             // ---------- State (Gist) ----------
             async function loadState(){
               const token=process.env.GIST_TOKEN, id=process.env.GIST_ID;
-              const init={ v:"mexc-ultimate-6.2-prime",
-                schema_version:"1.2.0", append_only:true, run: run_prov,
-                cooldown:{}, cooldown_side:{},
-                pending:[], equity:[], closed:[],
-                gp_data_clf:[],
-                calibration:{ platt:{}, isotonic:{}, last_fit_ts:0 },
-                metrics:{ global:{ ttl_n:0, closed_n:0, ttl_pct:0 }, by_key:{} },
-                drift:{}, sym_stats:{}, mr_lockout:{},
-                push_log:[],
-                bandit:{ arms:[ {exp_lcb_min:10, mr_adx_max:18, tries:0, wins:0}, {exp_lcb_min:12, mr_adx_max:20, tries:0, wins:0}, {exp_lcb_min:15, mr_adx_max:22, tries:0, wins:0} ], last_choice:1 }
-              };
+              const init={ v:"mexc-ultimate-4.0-stoch", cooldown:{}, cooldown_side:{}, pending:[], equity:[], gp_data:[] };
               if(!token||!id) return { state:init, persist:null };
               try{
                 const r=await fetchWithTimeout(`https://api.github.com/gists/${id}`,{ headers:{Authorization:`Bearer ${token}`,"Accept":"application/vnd.github+json","User-Agent":UA}}); if(!r.ok) return { state:init, persist:null };
-                const g=await r.json(); const c=g.files?.["state.json"]?.content; const s=c?JSON.parse(c):init;
-                if(!s.mr_lockout) s.mr_lockout={};
-                if(!Array.isArray(s.closed)) s.closed=[];
-                if(!Array.isArray(s.push_log)) s.push_log=[];
-                if(!s.calibration) s.calibration={ platt:{}, isotonic:{}, last_fit_ts:0 };
-                if(!s.metrics) s.metrics={ global:{ ttl_n:0, closed_n:0, ttl_pct:0 }, by_key:{} };
-                if(!s.drift) s.drift={};
-                if(!s.sym_stats) s.sym_stats={};
-                if(!s.gp_data_clf) s.gp_data_clf=[];
-                if(!s.bandit) s.bandit={ arms:[{exp_lcb_min:12,mr_adx_max:20,tries:0,wins:0}], last_choice:0 };
-                if(!s.schema_version) s.schema_version="1.2.0";
-                if(s.append_only!==true) s.append_only=true;
-                s.run = { ...(s.run||{}), ...run_prov };
-                return { state:s, persist:{id,token} };
+                const g=await r.json(); const c=g.files?.["state.json"]?.content; return { state: c?JSON.parse(c):init, persist:{id,token} };
               }catch{ return { state:init, persist:null }; }
             }
             async function saveState(persist,state){
@@ -574,486 +416,444 @@ jobs:
               }catch{}
             }
 
-            // ---------- Pending eval / labels → CLOSED with provenance ----------
+            // Evaluate pending fills; add GP labels from realized outcomes
             async function evalPending(state){
               const now=Date.now(); const keep=[];
               for(const p of state.pending||[]){
-                const entry_ts_ms = p.entry_ts_ms || p.ts_ms;
-                const ttl_ts_ms   = p.ttl_ts_ms   || (p.ts_ms + (p.hold_sec||0)*1000);
-                if(now < ttl_ts_ms + 5000){ keep.push(p); continue; }
-
-                const k = await fetchK(p.symbolFull,"1m",K1M, entry_ts_ms-60*1000, ttl_ts_ms+60*1000);
+                if(now < p.ts_ms + p.hold_sec*1000 + 5000){ keep.push(p); continue; }
+                const k = await fetchK(p.symbolFull,"1m",K1M, p.ts_ms-60*1000, p.ts_ms+p.hold_sec*1000+60*1000);
                 if(!k){ keep.push(p); continue; }
                 const ts=k.map(x=>+x[0]), highs=k.map(x=>+x[2]), lows=k.map(x=>+x[3]), closes=k.map(x=>+x[4]);
                 const long=p.side==="long";
-                const entry = Number.isFinite(p.entry_limit) ? p.entry_limit : (Number.isFinite(p.entry_price)?p.entry_price:closes[0]);
-
+                const entry = Number.isFinite(p.entry_limit) ? p.entry_limit : p.entry_price;
                 const tpB=(p.tp_bps||0)/10000, slB=(p.sl_bps||0)/10000;
-                const tp_abs = Number.isFinite(p.tp_abs) ? p.tp_abs : (long ? entry*(1+tpB) : entry*(1-tpB));
-                const sl_abs = Number.isFinite(p.sl_abs) ? p.sl_abs : (long ? entry*(1-slB) : entry*(1+slB));
+                const limitAtSL = p.entry_policy==="limit_at_old_sl";
 
-                let filled=false, iFill=-1, exit_reason=null, exit_source=null, price_source="sim", bar_ref=null, exit_px=null, exit_ts_ms=null, hit_ambiguous=false;
-
-                // Fill detection (limit policies)
-                {
-                  const t0=entry_ts_ms, tEnd=ttl_ts_ms;
+                let exitPx=closes.at(-1), filled=false;
+                if(limitAtSL){
+                  const t0=p.ts_ms, tEnd=t0 + p.hold_sec*1000;
+                  let iFill=-1;
                   for(let i=0;i<k.length;i++){
                     const t=ts[i]; if(t < t0-1000) continue; if(t > tEnd) break;
-                    if(long ? (lows[i] <= entry) : (highs[i] >= entry)){ iFill=i; filled=true; break; }
+                    if(long ? (lows[i] <= entry) : (highs[i] >= entry)){ iFill=i; break; }
                   }
-                  if(!filled){ keep.push(p); continue; }
-                }
-
-                // TTL bar index
-                const ttlBarOpen = Math.floor(ttl_ts_ms/60000)*60000;
-                let iTTL = ts.findIndex(t=>t===ttlBarOpen);
-                if(iTTL<0) iTTL = ts.length-1;
-
-                // Scan for TP/SL
-                let iExit=null;
-                for(let i=iFill;i<k.length;i++){
-                  if(i>iTTL) break;
-                  const hi=highs[i], lo=lows[i];
-                  const tp_hit = long ? (hi>=tp_abs) : (lo<=tp_abs);
-                  const sl_hit = long ? (lo<=sl_abs) : (hi>=sl_abs);
-                  if(tp_hit || sl_hit){
-                    hit_ambiguous = tp_hit && sl_hit;
-                    if(hit_ambiguous){
-                      exit_reason="sl"; exit_source="sl_scan"; price_source="mexc_1m_high/low"; exit_px=sl_abs;
-                    }else if(tp_hit){
-                      exit_reason="tp"; exit_source="tp_scan"; price_source="mexc_1m_high/low"; exit_px=tp_abs;
-                    }else{
-                      exit_reason="sl"; exit_source="sl_scan"; price_source="mexc_1m_high/low"; exit_px=sl_abs;
-                    }
-                    iExit=i;
-                    const open_ms=ts[i], close_ms=open_ms+60000-1;
-                    bar_ref={ interval:"1m", open_ms, close_ms };
-                    exit_ts_ms=close_ms;
-                    (p.events ||= []).push({ ts_ms: close_ms, type: (exit_reason==="tp"?"tp_scan":"sl_scan"), bar_ref });
-                    break;
+                  if(iFill===-1){ keep.push(p); continue; }
+                  const tpPx = Number.isFinite(p.tp_abs) ? p.tp_abs : (long ? entry*(1+tpB) : entry*(1-tpB));
+                  const slPx = Number.isFinite(p.sl_abs) ? p.sl_abs : (long ? entry*(1-slB) : entry*(1+slB));
+                  for(let i=iFill;i<k.length;i++){
+                    const t=ts[i]; if(t > tEnd) break;
+                    const hi=highs[i], lo=lows[i];
+                    if(long){ if(hi>=tpPx){ exitPx=tpPx; break; } if(lo<=slPx){ exitPx=slPx; break; } }
+                    else    { if(lo<=tpPx){ exitPx=tpPx; break; } if(hi>=slPx){ exitPx=slPx; break; } }
+                  }
+                  filled=true;
+                }else{
+                  filled=true;
+                  for(let i=0;i<k.length;i++){
+                    const hi=highs[i], lo=lows[i];
+                    if(long){ if(hi>=entry*(1+tpB)){ exitPx=entry*(1+tpB); break; } if(lo<=entry*(1-slB)){ exitPx=entry*(1-slB); break; } }
+                    else    { if(lo<=entry*(1-tpB)){ exitPx=entry*(1-tpB); break; } if(hi>=entry*(1+slB)){ exitPx=entry*(1+slB); break; } }
                   }
                 }
-
-                // TTL exit fallback
-                let exit_delay_ms=0;
-                if(iExit==null){
-                  exit_reason="ttl"; exit_source="ttl_scan"; price_source="mexc_1m_close";
-                  const open_ms=ts[iTTL], close_ms=open_ms+60000-1;
-                  bar_ref={ interval:"1m", open_ms, close_ms };
-                  exit_px=closes[iTTL];
-                  exit_ts_ms=Math.min(close_ms, ttl_ts_ms);
-                  exit_delay_ms=Math.max(0, exit_ts_ms - ttl_ts_ms);
-                  (p.events ||= []).push({ ts_ms: close_ms, type:"ttl", bar_ref });
-                }
-
-                // Entered event (if missing)
-                if(!p.events?.some(e=>e.type==="entered")){
-                  const open_ms=ts[iFill], close_ms=open_ms+60000-1;
-                  (p.events ||= []).push({ ts_ms: close_ms, type:"entered", price: entry, book: p.entry_book||undefined });
-                }
-
-                // Exit microstructure
-                let book_exit=null, spread_bps_exit=null, slip_bps_exit=null, depth1p_exit_usd=null, obi_exit=null;
-                try{
-                  const bt=await fetchBookTicker(p.symbolFull);
-                  if(bt?.bidPrice && bt?.askPrice){
-                    book_exit={ bid:+bt.bidPrice, ask:+bt.askPrice };
-                    const mid=(book_exit.bid+book_exit.ask)/2;
-                    spread_bps_exit=Math.round(((book_exit.ask - book_exit.bid)/mid)*10000);
-                    const depth=await fetchDepth(p.symbolFull);
-                    const { slip_bps }=slipFromDepth(depth, mid, (p.side==="long"?"short":"long"), p.notional_usd||NOTIONAL);
-                    slip_bps_exit = slip_bps;
-                    const d1=depthWithinPctUSD(depth, mid, 0.01);
-                    depth1p_exit_usd = (p.side==="long") ? d1.bidsUSD : d1.asksUSD;
-                    obi_exit = computeOBI(depth, OBI_TOPN);
-                  }
-                }catch{}
-
-                // PnL
-                const ret = long? (exit_px/entry - 1) : (entry/exit_px - 1);
-                const pnl_bps_gross = Math.round(ret*10000);
-                const cost_bps = p.cost_bps||0;
-                const pnl_bps = pnl_bps_gross - cost_bps;
-
-                // Legacy learning artifacts
-                state.equity.push({ ts_ms: entry_ts_ms, pnl_bps, tier:p.tier, mp_fill:!!p.mp_fill, always3:!!p.always3 });
-                if(state.equity.length>6000) state.equity=state.equity.slice(-6000);
+                if(!filled){ keep.push(p); continue; }
+                const ret = long? (exitPx/entry - 1) : (entry/exitPx - 1);
+                const pnl_bps = Math.round(ret*10000) - (p.cost_bps||0);
+                state.equity.push({ ts_ms:p.ts_ms, pnl_bps });
                 if(Array.isArray(p.gp_feat) && p.gp_feat.length){
-                  state.gp_data_clf.push({ x:p.gp_feat, y: pnl_bps>0?1:0, side:p.side, regime:p.regime, ts_ms:entry_ts_ms });
-                  if(state.gp_data_clf.length>1200) state.gp_data_clf=state.gp_data_clf.slice(-1200);
+                  state.gp_data.push({ x:p.gp_feat, y: pnl_bps>0 ? 1:0 });
+                  if(state.gp_data.length>600) state.gp_data=state.gp_data.slice(-600);
                 }
-                const sb=state.sym_stats?.[p.base]||{ n:0,wins:0,pnl_sum:0 }; sb.n++; if(pnl_bps>0) sb.wins++; sb.pnl_sum+=pnl_bps; state.sym_stats[p.base]=sb;
-                if(state.bandit?.arms){ const idx=state.bandit.last_choice??-1; if(idx>=0){ const arm=state.bandit.arms[idx]; arm.tries=(arm.tries||0)+1; if(pnl_bps>0) arm.wins=(arm.wins||0)+1; } }
-
-                // Closed record (append-only)
-                const closedRec={
-                  schema_version:"1.2.0",
-                  trade_id: p.trade_id || `${p.symbolFull}:${entry_ts_ms}`,
-                  symbolFull:p.symbolFull, base:p.base, quote:p.quote,
-                  side:p.side, tier:p.tier,
-                  entry_ts_ms, ttl_ts_ms, exit_ts_ms,
-                  exit_reason, exit_source, price_source, bar_ref,
-                  entry_price: entry, exit_price: exit_px,
-                  pnl_bps_gross, cost_bps, pnl_bps,
-                  spread_bps_entry: p.spread_bps_entry, spread_bps_exit,
-                  slip_bps_entry: p.slip_bps_entry, slip_bps_exit,
-                  size_bps: p.size_bps, notional_usd: p.notional_usd,
-                  exit_delay_ms, hit_ambiguous,
-                  p_raw: p.p_raw, p_pred: p.p_lcb, calib_key: p.calib_key, calib_type: p.calib_type||"raw", calib_n: p.calib_n||0,
-                  gp_feat: p.gp_feat||[],
-                  regime: p.regime, style: p.style_final||p.style,
-                  book_entry: p.entry_book||null, book_exit: book_exit||null,
-                  depth1p_entry_usd: p.depth1p_entry_usd||null, depth1p_exit_usd: depth1p_exit_usd||null,
-                  run_id: (state.run?.run_id)||run_id, code_commit_sha: (state.run?.code_commit_sha)||code_commit_sha,
-                  config_hash: (state.run?.config_hash)||config_hash,
-                  exchange_base: (state.run?.exchange_base)||BASE,
-                  mexc_server_time_ms: state.run?.mexc_server_time_ms||null,
-                  mexc_time_offset_ms: state.run?.mexc_time_offset_ms||null,
-                  events: p.events||[]
-                };
-                (state.closed ||= []).push(closedRec);
-                if(state.closed.length>5000) state.closed=state.closed.slice(-5000);
-
-                // TTL metrics
-                try{
-                  const m = state.metrics ||= { global:{ ttl_n:0, closed_n:0, ttl_pct:0 }, by_key:{} };
-                  m.global.closed_n = (m.global.closed_n||0) + 1;
-                  if(exit_reason==="ttl") m.global.ttl_n = (m.global.ttl_n||0) + 1;
-                  m.global.ttl_pct = m.global.closed_n>0 ? +(100*m.global.ttl_n/m.global.closed_n).toFixed(2) : 0;
-                  const key = closedRec.calib_key || "na";
-                  m.by_key[key] ||= { ttl_n:0, closed_n:0, ttl_pct:0 };
-                  m.by_key[key].closed_n += 1;
-                  if(exit_reason==="ttl") m.by_key[key].ttl_n += 1;
-                  m.by_key[key].ttl_pct = m.by_key[key].closed_n>0 ? +(100*m.by_key[key].ttl_n/m.by_key[key].closed_n).toFixed(2) : 0;
-                }catch{}
               }
               state.pending = keep;
+              if(state.equity.length>6000) state.equity = state.equity.slice(-6000);
             }
-
-            function updateMetricsAndDrift(state){
-              const cl=state.closed||[]; const lastN=cl.slice(-400);
-              const y=lastN.map(x=> (x.pnl_bps||0)>0?1:0), p=lastN.map(x=> typeof x.p_pred==="number"? x.p_pred : 0.5);
-              if(y.length){ const bs=brier(y,p), ll=logloss(y,p), AUC=auc(y,p); state.metrics.global={ ...(state.metrics.global||{}), brier:+bs.toFixed(4), logloss:+ll.toFixed(4), auc:+(isNaN(AUC)?0:AUC).toFixed(3), n:lastN.length }; }
-              const byKey={}; for(const r of lastN){ const k=r.calib_key || `${r.side}_${String(r.regime).includes("mean")?"mr":"trend"}`; (byKey[k]??=( {y:[],p:[] } )).y.push((r.pnl_bps||0)>0?1:0); byKey[k].p.push(typeof r.p_pred==="number"?r.p_pred:0.5); }
-              const out={}; for(const [k,v] of Object.entries(byKey)){ const b=brier(v.y,v.p), l=logloss(v.y,v.p), A=auc(v.y,v.p); out[k]={ ...(state.metrics.by_key?.[k]||{}), brier:+b.toFixed(4), logloss:+l.toFixed(4), auc:+(isNaN(A)?0:A).toFixed(3), n:v.y.length };
-                const ph = state.drift?.[k] || pageHinkleyInit(); const drift=pageHinkleyUpdate(ph, l, 0.0015, 0.02); (state.drift ||= {}); state.drift[k]=ph; if(drift){ delete state.calibration.platt[k]; delete state.calibration.isotonic[k]; } }
-              state.metrics.by_key=out;
-            }
-            function fitCalibrators(state){
-              const cl=state.closed||[]; const byKey={};
-              for(const r of cl.slice(-800)){ const k=r.calib_key || `${r.side}_${String(r.regime).includes("mean")?"mr":"trend"}`; if(typeof r.p_raw!=="number") continue; (byKey[k]??=( {p:[],y:[]} )).p.push(clamp(r.p_raw,1e-6,1-1e-6)); byKey[k].y.push((r.pnl_bps||0)>0?1:0); }
-              for(const [k,ds] of Object.entries(byKey)){ if(ds.p.length>=Number(process.env.CALIB_MIN_ISO||"120")){ state.calibration.isotonic[k]=fitIsotonic(ds.p,ds.y); } else if(ds.p.length>=Number(process.env.CALIB_MIN_PLATT||"30")){ state.calibration.platt[k]=fitPlatt(ds.p,ds.y); } }
-              state.calibration.last_fit_ts=Date.now();
-            }
-            function calibrateP(state,side,regime,pRaw){
-              const k=`${side}_${String(regime).includes("mean")?"mr":"trend"}`;
-              const iso=state.calibration.isotonic[k]; if(iso?.n>=Number(process.env.CALIB_MIN_ISO||"120")) return (applyIsotonic([pRaw],iso))[0];
-              const pl=state.calibration.platt[k]; if(pl?.n>=Number(process.env.CALIB_MIN_PLATT||"30")) return (applyPlatt([pRaw],pl))[0];
-              return pRaw;
-            }
-            function calibratorInfo(state, side, regime){
-              const k=`${side}_${String(regime).includes("mean")?"mr":"trend"}`;
-              const iso=state.calibration.isotonic[k]; if(iso?.n>=Number(process.env.CALIB_MIN_ISO||"120")) return { type:"iso", n: iso.n };
-              const pl=state.calibration.platt[k]; if(pl?.n>=Number(process.env.CALIB_MIN_PLATT||"30")) return { type:"platt", n: pl.n };
-              return { type:"raw", n: 0 };
-            }
+            const equityStats=(eq)=>{ const day=Date.now()-24*3600*1000; let pnl24=0,cum=0,peak=0,dd=0;
+              for(const e of eq){ if(e.ts_ms>=day) pnl24+=e.pnl_bps; cum+=e.pnl_bps; if(cum>peak) peak=cum; dd=Math.min(dd,cum-peak); }
+              return { pnl24_bps:Math.round(pnl24), peak_dd_bps:Math.round(dd) };
+            };
 
             // ---------- Main ----------
-            let reason="ok", selectionTier="strict";
+            let reason="ok", selectionTier="none";
             try{
               const ALL24 = await fetchAll24hr();
               const booksRaw=await getJSON(api("/api/v3/ticker/bookTicker"),10000,2) || [];
               const bookMap=new Map(booksRaw.map(b=>[b.symbol,{ bid:+b.bidPrice, ask:+b.askPrice }]));
 
-              if(!todOK) reason="tod_gate";
+              if(!todOK){ reason="tod_gate"; }
 
               // Universe
               const QUOTES=["USDT","USDC","USD"];
-              const split=(sym)=>{ for(const q of QUOTES) if(sym.endsWith(q)) return { base:sym.slice(0,-q.length), quote:q }; return null; };
-              const all=[]; for(const t of ALL24||[]){ const sym=t.symbol||t.s; if(!sym) continue; const sq=split(sym); if(!sq) continue; if(STABLES.has(sq.base)) continue; const qv=+(t.quoteVolume||t.q||0); if(!isFinite(qv)||qv<=0) continue; all.push({ symbol:sym, base:sq.base, quote:sq.quote, qv }); }
+              const split=(sym)=>{ for(const q of QUOTES){ if(sym.endsWith(q)) return { base: sym.slice(0,-q.length), quote:q }; } return null; };
+              const all=[];
+              for(const t of ALL24||[]){
+                const sym=t.symbol||t.s; if(!sym) continue;
+                const sq=split(sym); if(!sq) continue;
+                if(STABLES.has(sq.base)) continue;
+                const qv=+(t.quoteVolume||t.q||0);
+                if(!isFinite(qv)||qv<=0) continue;
+                all.push({ symbol:sym, base:sq.base, quote:sq.quote, qv });
+              }
               all.sort((a,b)=>b.qv-a.qv);
-              let dynMinQV=Math.max(MIN_QV_ENV||0, DYN_QV_MIN), filt=all.filter(x=>x.qv>=dynMinQV);
-              while(filt.length<UNIV_TARGET_MIN && dynMinQV>1_000_000){ dynMinQV=Math.max(1_000_000, dynMinQV-DYN_QV_STEP); filt=all.filter(x=>x.qv>=dynMinQV); }
+
+              // Dynamic min-QV to ~100–120
+              let dynMinQV=Math.max(MIN_QV_ENV||0, DYN_QV_MIN);
+              let filt=all.filter(x=>x.qv>=dynMinQV);
+              while(filt.length<UNIV_TARGET_MIN && dynMinQV>DYN_QV_MIN){
+                dynMinQV = Math.max(DYN_QV_MIN, dynMinQV - DYN_QV_STEP);
+                filt = all.filter(x=>x.qv>=dynMinQV);
+              }
               const universe=filt.slice(0,UNIV_TARGET_MAX);
-              console.log("[gha] universe", universe.length, "dyn_min_qv", dynMinQV);
+              console.log("[gha] universe size", universe.length, "dyn_min_qv", dynMinQV);
               snapCounts({ universe: universe.length });
+              if(!universe.length){ reason = (reason!=="ok"?reason:"no_universe"); }
 
               // Benchmarks
               const BTC="BTCUSDT", ETH="ETHUSDT", SOL="SOLUSDT";
-              const kBTC15=await fetchK(BTC,"15m",K15M), kETH15=await fetchK(ETH,"15m",K15M), kSOL15=await fetchK(SOL,"15m",K15M);
+              const kBTC15=await fetchK(BTC,"15m",K15M);
+              const kETH15=await fetchK(ETH,"15m",K15M);
+              const kSOL15=await fetchK(SOL,"15m",K15M);
               const kBTC1H=await fetchK(BTC,"1h",K1H);
-              const uptrendTF=(k,fast=EMA_FAST,slow=EMA_SLOW)=>{ if(!k?.length) return {up:false,last:null}; const c=k.map(x=>+x[4]); const emF=ema(c,fast), emS=ema(c,slow); const last=c.at(-1); return { up:(last>=emF && last>=emS), last }; };
-              const btc15=uptrendTF(kBTC15), btc1h=uptrendTF(kBTC1H);
-              let btcRoc15=0; try{ const c=kBTC15?.map(x=>+x[4])||[]; const prev3=c.at(-4)||c.at(-2)||c.at(-1)||0; const last=c.at(-1)||0; btcRoc15=prev3? (last/prev3 - 1) : 0; }catch{}
-              const btcGreen=(btc15.up && btc1h.up && btcRoc15>0.001);
+              const kETH1H=await fetchK(ETH,"1h",K1H);
 
-              // Regime weights (lightweight)
-              function regimeFeatures(k15){ if(!k15||k15.length<ADX_P+5) return []; const h=k15.map(x=>+x[2]), l=k15.map(x=>+x[3]), c=k15.map(x=>+x[4]); const {adx}=computeADX_ATR(h,l,c,ADX_P)||{adx:0}; const roc=(c.at(-1)/c.at(-5)-1); const winS=20, retW=[]; for(let i=c.length-winS;i<c.length;i++) retW.push((c[i]/c[i-1])-1); const bbWidth=std(retW)*Math.sqrt(winS); const atr=(computeADX_ATR(h,l,c,ADX_P)||{atr:1}).atr||1; const kelWidth=atr/c.at(-1); const squeeze=kelWidth>0? (bbWidth/kelWidth):1; return [roc, clamp((adx-10)/30,0,1), clamp((1.15-squeeze)/0.45,0,1)]; }
-              const seqFeat=[]; const rollSeq=(k)=>{ if(!k) return; for(let i=5;i<Math.min(k.length,80);i++){ const seg=k.slice(i-5,i+1); const f=regimeFeatures(seg); if(f.length) seqFeat.push(f); } };
+              // Regime HMM
+              function regimeFeatures(k15){
+                if(!k15||k15.length<ADX_P+5) return [];
+                const h=k15.map(x=>+x[2]), l=k15.map(x=>+x[3]), c=k15.map(x=>+x[4]);
+                const { adx }=computeADX_ATR(h,l,c,ADX_P)||{adx:0};
+                const roc=((c.at(-1)/c.at(-5)) - 1);
+                const winS=20; const retW=[]; for(let i=c.length-winS;i<c.length;i++){ retW.push((c[i]/c[i-1])-1); }
+                const bbWidth = std(retW)*Math.sqrt(winS);
+                const atr=(computeADX_ATR(h,l,c,ADX_P)||{atr:1}).atr||1;
+                const kelWidth = (atr/c.at(-1));
+                const squeeze = kelWidth>0 ? (bbWidth/kelWidth) : 1;
+                return [roc, clamp((adx-10)/30,0,1), clamp((1.15 - squeeze)/0.45, 0, 1)];
+              }
+              const seqFeat=[];
+              function rollSeq(k){ if(!k) return; const c=k.map(x=>+x[4]); for(let i=5;i<Math.min(k.length,80);i++){ const seg=k.slice(i-5,i+1); const f=regimeFeatures(seg); if(f.length) seqFeat.push(f); } }
               rollSeq(kBTC15); rollSeq(kETH15);
-              const weightsReg=(()=>{ if(seqFeat.length<10) return { wTrend:0.45,wMR:0.45,wBO:0.10 }; const last=seqFeat.slice(-12), roc=mean(last.map(x=>x[0]||0)), adxN=mean(last.map(x=>x[1]||0)), sq=mean(last.map(x=>x[2]||0)); const wTrend=clamp(0.4+0.3*adxN+0.2*roc,0.2,0.7), wMR=clamp(0.6-0.3*adxN+0.1*(1-sq),0.2,0.6); const wBO=clamp(1-(wTrend+wMR),0.05,0.25); return {wTrend,wMR,wBO}; })();
+              const hmm = seqFeat.length>=20 ? (function hmmTrainGaussian(obs,K=3,iters=6){
+                const T=obs.length, d=obs[0]?.length||0; if(T<d+5) return null;
+                let pi=Array(K).fill(1/K), A=Array.from({length:K},()=>Array(K).fill(1/K));
+                const mu=Array.from({length:K},(_,k)=> obs[Math.floor((k+1)*T/(K+1))].slice());
+                const Sig=Array.from({length:K},()=>Array.from({length:d},(_,i)=>Array.from({length:d},(_,j)=> (i===j?0.1:0))));
+                const eps=1e-8;
+                for(let it=0; it<iters; it++){
+                  const B=Array.from({length:T},()=>Array(K).fill(0));
+                  for(let t=0;t<T;t++) for(let k=0;k<K;k++) B[t][k]=mvnPdf(obs[t],mu[k],Sig[k])+1e-18;
+                  const alpha=Array.from({length:T},()=>Array(K).fill(0)), c=Array(T).fill(0);
+                  for(let k=0;k<K;k++) alpha[0][k]=pi[k]*B[0][k]; c[0]=1/(sum(alpha[0])||1e-12); for(let k=0;k<K;k++) alpha[0][k]*=c[0];
+                  for(let t=1;t<T;t++){ for(let k=0;k<K;k++){ let s=0; for(let i=0;i<K;i++) s+=alpha[t-1][i]*A[i][k]; alpha[t][k]=s*B[t][k]; } c[t]=1/(sum(alpha[t])||1e-12); for(let k=0;k<K;k++) alpha[t][k]*=c[t]; }
+                  const beta=Array.from({length:T},()=>Array(K).fill(0)); for(let k=0;k<K;k++) beta[T-1][k]=c[T-1];
+                  for(let t=T-2;t>=0;t--){ for(let k=0;k<K;k++){ let s=0; for(let j=0;j<K;j++) s+=A[k][j]*B[t+1][j]*beta[t+1][j]; beta[t][k]=s*c[t]; } }
+                  const gamma=Array.from({length:T},()=>Array(K).fill(0));
+                  for(let t=0;t<T;t++){ const den=sum(alpha[t].map((a,kk)=>a*beta[t][kk]))||1e-12; for(let k=0;k<K;k++) gamma[t][k]=(alpha[t][k]*beta[t][k])/(den||1e-12); }
+                  const xi=Array.from({length:T-1},()=>Array.from({length:K},()=>Array(K).fill(0)));
+                  for(let t=0;t<T-1;t++){ let den=0; for(let i=0;i<K;i++) for(let j=0;j<K;j++) den+=alpha[t][i]*A[i][j]*B[t+1][j]*beta[t+1][j]; den=den||1e-12;
+                    for(let i=0;i<K;i++) for(let j=0;j<K;j++) xi[t][i][j]=(alpha[t][i]*A[i][j]*B[t+1][j]*beta[t+1][j])/den; }
+                  for(let k=0;k<K;k++){
+                    const gk=sum(gamma.map(g=>g[k]))||eps; pi[k]=gamma[0][k];
+                    for(let j=0;j<K;j++){ let s=0; for(let t=0;t<T-1;t++) s+=xi[t][k][j]; A[k][j]=s/(gk - gamma[T-1][k] + eps); A[k][j]=clamp(A[k][j],1e-6,1); }
+                    const mu_k=Array(mu[0].length).fill(0); for(let t=0;t<T;t++) for(let i=0;i<mu_k.length;i++) mu_k[i]+=gamma[t][k]*obs[t][i];
+                    for(let i=0;i<mu_k.length;i++) mu_k[i]/=(gk||1e-12); mu[k]=mu_k;
+                    const S=Array.from({length:mu_k.length},()=>Array(mu_k.length).fill(0));
+                    for(let t=0;t<T;t++){ const diff=obs[t].map((v,i)=>v-mu_k[i]); for(let i=0;i<mu_k.length;i++) for(let j=0;j<mu_k.length;j++) S[i][j]+=gamma[t][k]*diff[i]*diff[j]; }
+                    for(let i=0;i<mu_k.length;i++) S[i][i]=Math.max(S[i][i], 1e-4); Sig[k]=S;
+                  }
+                  for(let i=0;i<K;i++){ const s=sum(A[i])||1e-12; for(let j=0;j<K;j++) A[i][j]/=s; }
+                }
+                return { pi, A, mu, Sig };
+              })(seqFeat,3,6) : null;
+              const post = (function hmmPosterior(obs, model){
+                if(!model){ return [0.4,0.4,0.2]; }
+                const {pi,A,mu,Sig}=model; const T=obs.length, K=pi.length; if(T===0) return Array(K).fill(1/K);
+                const B=obs.map(o=> mu.map((m,ki)=>mvnPdf(o,m,Sig[ki])+1e-18));
+                const alpha=Array.from({length:T},()=>Array(K).fill(0)), c=Array(T).fill(0);
+                for(let k=0;k<K;k++) alpha[0][k]=pi[k]*B[0][k]; c[0]=1/(sum(alpha[0])||1e-12); for(let k=0;k<K;k++) alpha[0][k]*=c[0];
+                for(let t=1;t<T;t++){ for(let k=0;k<K;k++){ let s=0; for(let i=0;i<K;i++) s+=alpha[t-1][i]*A[i][k]; alpha[t][k]=s*B[t][k]; } c[t]=1/(sum(alpha[t])||1e-12); for(let k=0;k<K;k++) alpha[t][k]*=c[t]; }
+                return alpha[T-1];
+              })(seqFeat.slice(-15),hmm);
+              const weights = { wTrend:post[0]||0.4, wMR:post[1]||0.4, wBO:post[2]||0.2 };
+              log("regime posterior", weights);
+              console.log("[gha] cfg", { NO_VIABLE_RANK_FILL, TOP_N, MAX_SPREAD_BPS: Number(process.env.MAX_SPREAD_BPS||"12"), MIN_QV_USD: MIN_QV_ENV });
 
-              // Load state / eval / calibration
+              // State & DD gate
               const { state, persist } = await loadState();
-              // attach run provenance
-              state.run = { ...state.run, ...run_prov };
-
-              try{ await evalPending(state); }catch(e){ console.log("[gha] evalPending warn", e?.message||e); }
-              updateMetricsAndDrift(state);
-              if(Date.now() - (state.calibration.last_fit_ts||0) > 30*60*1000){ fitCalibrators(state); }
-
-              const equityStats=(eq)=>{ const day=Date.now()-24*3600*1000; let pnl24=0,cum=0,peak=0,dd=0; for(const e of eq||[]){ if(e.ts_ms>=day) pnl24+=e.pnl_bps; cum+=e.pnl_bps; if(cum>peak) peak=cum; dd=Math.min(dd,cum-peak); } return { pnl24_bps:Math.round(pnl24), peak_dd_bps:Math.round(dd) }; };
+              try{ await evalPending(state); }catch(e){ log("evalPending warn", e?.message||e); }
               const { pnl24_bps, peak_dd_bps } = equityStats(state.equity);
-              const throttle=(pnl24_bps<=DD_24H_LIMIT_BPS) || (peak_dd_bps<=DD_PEAK_LIMIT_BPS);
+              const throttle = (pnl24_bps<=DD_24H_LIMIT_BPS) || (peak_dd_bps<=DD_PEAK_LIMIT_BPS);
 
-              // Bandit choice
-              function banditChoose(state){ const arms=state.bandit?.arms||[]; if(!arms.length) return { exp_lcb_min:EXP_LCB_MIN_BPS_BASE, mr_adx_max:MR_ADX_MAX_DEFAULT, idx:-1 }; let best=-1, draw=-1; for(let i=0;i<arms.length;i++){ const a=1+(arms[i].wins||0), b=1+Math.max(0,(arms[i].tries||0)-(arms[i].wins||0)); const x1=Math.random()**(1/a), x2=Math.random()**(1/b); const d=x1/(x1+x2); if(d>draw){ draw=d; best=i; } } state.bandit.last_choice=best; return { exp_lcb_min:arms[best].exp_lcb_min, mr_adx_max:arms[best].mr_adx_max, idx:best }; }
-              const banditChoice=banditChoose(state);
-              const EXP_LCB_MIN_THIS=Math.max(EXP_LCB_MIN_BPS_BASE, banditChoice.exp_lcb_min);
-              const MR_ADX_MAX = banditChoice.mr_adx_max ?? MR_ADX_MAX_DEFAULT;
+              // GP model from realized outcomes
+              let gpModel=null;
+              try{
+                const X = state.gp_data?.map(d=>d.x)||[];
+                const Y = state.gp_data?.map(d=>d.y)||[];
+                if(X.length>=20) gpModel = buildGP(X.slice(-400), Y.slice(-400), 0.12);
+              }catch(e){ log("gp build warn", e?.message||e); }
 
-              // Liquidity ranks
-              const liqPct=new Map(); for(let i=0;i<universe.length;i++) liqPct.set(universe[i].symbol, (universe.length===1)?1: 1 - i/(universe.length-1));
+              // Liquidity pct rank
+              const liqPct=new Map(); for(let i=0;i<universe.length;i++){ liqPct.set(universe[i].symbol,(universe.length===1)?1:1 - i/(universe.length-1)); }
 
+              // Helpers
               const toRet5=(k)=>{ if(!k) return []; const c=k.map(x=>+x[4]); const r=[]; for(let i=1;i<c.length;i++) r.push(Math.log(c[i]/c[i-1])); return r.slice(-60); };
               const fBTC=toRet5(kBTC15), fETH=toRet5(kETH15), fSOL=toRet5(kSOL15);
 
-              // Prefilter
-              const picksRaw=[]; const pfStats={ total:0, dropped:{ cooldown:0, book:0, spread:0, k5:0, adxatr:0, atrRange:0 }, kept:0 };
+              // Prefilter (collect both gated and any) + visibility counters
+              const picksRaw=[], picksAny=[];
+              const pfStats = { total:0, dropped:{ cooldown:0, book:0, spread:0, k5:0, adxatr:0, atrRange:0 }, kept_any:0, kept_gated:0 };
               const B=10;
               for(let i=0;i<(universe||[]).length;i+=B){
                 const batch=await Promise.all(universe.slice(i,i+B).map(async c=>{
                   try{
                     pfStats.total++;
-                    const lastTs=state.cooldown?.[c.base]||0; if(lastTs && (Date.now()-lastTs)<COOLDOWN_MS){ pfStats.dropped.cooldown++; return null; }
+                    const now=Date.now(); const lastTs=state.cooldown?.[c.base]||0;
+                    if(lastTs && (now-lastTs) < COOLDOWN_MS){ pfStats.dropped.cooldown++; return null; }
+
                     const book=bookMap.get(c.symbol); if(!book?.bid||!book?.ask){ pfStats.dropped.book++; return null; }
                     const mid=(book.bid+book.ask)/2; if(!(mid>0)){ pfStats.dropped.book++; return null; }
-                    const spreadBps=Math.round(((book.ask-book.bid)/mid)*10000); if(spreadBps>MAX_SPREAD_BPS){ pfStats.dropped.spread++; return null; }
+                    const spreadBps=Math.round(((book.ask-book.bid)/mid)*10000);
+                    if(spreadBps>MAX_SPREAD_BPS){ pfStats.dropped.spread++; return null; }
 
-                    const k5=await fetchK(c.symbol,"5m",K5M); if(!k5||k5.length<Math.max(EMA_SLOW+200,ATR_P+50)){ pfStats.dropped.k5++; return null; }
-                    const k15=await fetchK(c.symbol,"15m",K15M); const k1h=await fetchK(c.symbol,"1h",K1H);
+                    const k5=await fetchK(c.symbol,"5m",K5M); if(!k5||k5.length<Math.max(EMA_SLOW+5,ATR_P+5)){ pfStats.dropped.k5++; return null; }
+                    const k15=await fetchK(c.symbol,"15m",K15M);
+                    const k1h=await fetchK(c.symbol,"1h",K1H);
 
-                    const c5_raw=k5.map(x=>+x[4]); const c5=kalman1D(c5_raw,{q:1e-4,r:5e-4,x0:c5_raw[0],p0:1e-2});
+                    const c5_raw=k5.map(x=>+x[4]);
+                    const c5 = kalman1D(c5_raw, { q: 1e-4, r: 5e-4, x0: c5_raw[0], p0: 1e-2 });
                     const h5=k5.map(x=>+x[2]), l5=k5.map(x=>+x[3]), v5=k5.map(x=>+x[5]);
-                    const em21=emaSeries(c5,EMA_FAST), em50s=emaSeries(c5,EMA_SLOW), em200s=emaSeries(c5,200);
-                    const em50=em50s?.at(-1), em200=em200s?.at(-1), em50Prev=em50s?.at(-51);
+
+                    const em21=ema(c5,EMA_FAST), em50=ema(c5,EMA_SLOW);
                     const { adx:adx5, atr:atr5 } = computeADX_ATR(h5,l5,c5,ADX_P)||{};
                     if(!(adx5&&atr5)){ pfStats.dropped.adxatr++; return null; }
-                    const last=c5.at(-1), atr_bps=Math.round((atr5/last)*10000); if(atr_bps<4||atr_bps>260){ pfStats.dropped.atrRange++; return null; }
+                    const last=c5.at(-1);
+                    const atr_bps=Math.round((atr5/last)*10000); if(atr_bps<4||atr_bps>260){ pfStats.dropped.atrRange++; return null; }
 
-                    const k15c=k15?.map(x=>+x[4])||[], k1hc=k1h?.map(x=>+x[4])||[];
-                    const em15f=k15c.length?ema(k15c,EMA_FAST):null, em15s=k15c.length?ema(k15c,EMA_SLOW):null;
-                    const em1hf=k1hc.length?ema(k1hc,EMA_FAST):null, em1hs=k1hc.length?ema(k1hc,EMA_SLOW):null;
+                    const c15=k15?.map(x=>+x[4])||[], c1h=k1h?.map(x=>+x[4])||[];
+                    const em15f=c15.length?ema(c15,EMA_FAST):null, em15s=c15.length?ema(c15,EMA_SLOW):null;
+                    const em1hf=c1h.length?ema(c1h,EMA_FAST):null, em1hs=c1h.length?ema(c1h,EMA_SLOW):null;
 
                     const vwap5=vwapAnchored(h5,l5,c5,v5,VWAP_5M_WIN);
-                    const prev=c5.at(-2), prev3=c5.at(-4), roc5=(last/prev)-1, roc15=(last/prev3)-1;
+                    const prev=c5.at(-2), prev3=c5.at(-4);
+                    const roc5=(last/prev)-1, roc15=(last/prev3)-1;
 
-                    const upF=last>=em21?.at(-1), upS=last>=em50, up15=(em15f&&em15s)? (last>=em15f && last>=em15s):true, up1h=(em1hf&&em1hs)? (last>=em1hf && last>=em1hs):true;
-                    const z_vwap=(last-vwap5)/(atr5||1); const rsi14=rsi(c5,14);
+                    const upF=last>=em21, upS=last>=em50;
+                    const up15=(em15f&&em15s)? (last>=em15f && last>=em15s) : true;
+                    const up1h=(em1hf&&em1hs)? (last>=em1hf && last>=em1hs) : true;
+                    const z_vwap=(last-vwap5)/(atr5||1);
+                    const rsi14=rsi(c5,14);
 
-                    const trendBias=(em50!=null && em200!=null)? (em50>em200?"long_only": em50<em200?"short_only":"both") : "both";
-                    const slope_atr50=(em50!=null && em50Prev!=null)? Math.abs(em50-em50Prev)/(50*(atr5||1)) : 0;
+                    let pHigh15=null,pLow15=null;
+                    if(k15 && k15.length>40){
+                      const highs=k15.map(x=>+x[2]), lows=k15.map(x=>+x[3]);
+                      const win=40; pHigh15=Math.max(...highs.slice(-win)); pLow15=Math.min(...lows.slice(-win));
+                    }
+                    const boUp = pHigh15 ? (last>pHigh15) : false;
+                    const boDn = pLow15  ? (last<pLow15 ) : false;
 
-                    // Donchian / breakout lockout
-                    const highs=h5, lows=l5; const win=MR_BREAKOUT_DC_N;
-                    const dcHi=Math.max(...highs.slice(-win)), dcLo=Math.min(...lows.slice(-win));
-                    const atrPct=(atr5/last), ret15abs=Math.abs((last/(c5.at(-4)||last))-1);
-                    const breakout=(last>dcHi) || (last<dcLo) || (ret15abs>=MR_BREAKOUT_RET15_ATR*atrPct);
-                    if(breakout) state.mr_lockout[c.symbol]=Date.now()+MR_LOCKOUT_SEC*1000;
-                    const mrLocked=(Date.now() < (state.mr_lockout?.[c.symbol]||0));
+                    const winS=20; const retW=[]; for(let i=c5.length-winS;i<c5.length;i++){ retW.push((c5[i]/c5[i-1])-1); }
+                    const bbWidth = std(retW)*Math.sqrt(winS);
+                    const kelWidth = (atr5/last);
+                    const squeezeRatio = kelWidth>0 ? (bbWidth/kelWidth) : 1;
+                    const squeezeScore = clamp((1.15 - squeezeRatio)/0.45, 0, 1);
 
-                    // Symmetric guards
-                    const em20s=emaSeries(c5,20), em20=em20s?.at(-1);
-                    const noShortUp=((em20!=null&&em50!=null)? (em20>em50 && last>em20):false) || ((rsi14||0)>60);
-                    const noLongDown= NO_LONG_DOWN_ENABLE && (((em20!=null&&em50!=null)? (em20<em50 && last<em20):false) || ((rsi14||100)<LONG_DOWN_RSI_CUTOFF));
+                    const adxF=clamp((adx5-16)/14,0,1);
+                    const s1=tanh(roc5/0.0030), s2=tanh(roc15/0.0065);
 
-                    // Divergence checks
-                    const bb=(function boll(cl,win=20,k=2){ const seg=cl.slice(-win); const ma=mean(seg), s=std(seg)||1e-6; return { up:ma+k*s, dn:ma-k*s, z:(cl.at(-1)-ma)/s }; })(c5,20,2);
-                    const rsiPrev3=rsi(c5.slice(0,-2),14), rsiPrev5=rsi(c5.slice(0,-4),14);
-                    const rsiLowerHigh=(rsiPrev5!=null && rsiPrev3!=null && rsi14!=null)? (rsiPrev3>rsiPrev5 && rsi14<rsiPrev3):false;
-                    const rsiHigherLow=(rsiPrev5!=null && rsiPrev3!=null && rsi14!=null)? (rsiPrev3<rsiPrev5 && rsi14>rsiPrev3):false;
-                    const obvNeg=(function obv(close,vol){ let obv=0; for(let i=1;i<close.length;i++){ const d=close[i]-close[i-1]; if(d>0) obv+=vol[i]; else if(d<0) obv-=vol[i]; } const prev=(()=>{ let o=0; for(let i=1;i<Math.max(2,close.length-10);i++){ const d=close[i]-close[i-1]; if(d>0) o+=vol[i]; else if(d<0) o-=vol[i]; } return o; })(); return (obv-prev)<0; })(c5,v5);
-                    const obvPos=!obvNeg;
-
-                    const fadeShortDivergenceOK=((bb.up!=null && last>bb.up) && rsiLowerHigh) || ((bb.z||0)>2 && obvNeg);
-                    const fadeLongDivergenceOK_raw=((bb.dn!=null && last<bb.dn) && rsiHigherLow) || ((bb.z||0)<-2 && obvPos);
-                    const fadeLongDivergenceOK = LONG_MR_DIVERGENCE_REQ ? fadeLongDivergenceOK_raw : true;
-
-                    // Experts
-                    const adxF=clamp((adx5-16)/14,0,1), s1=tanh(roc5/0.0030), s2=tanh(roc15/0.0065);
-                    const sideTrend=(0.6*roc5+0.4*roc15)>=0?"long":"short";
-                    const trendAlign=(sideTrend==="long" && upF&&upS&&up15&&up1h) || (sideTrend==="short" && !upF&&!upS&&(!up15||!up1h));
+                    const sideTrend= (0.6*roc5+0.4*roc15)>=0 ? "long":"short";
+                    const trendAlign = (sideTrend==="long" && upF&&upS&&up15&&up1h) || (sideTrend==="short" && !upF&&!upS&&(!up15||!up1h));
                     let pTrend = clamp(0.5 + 0.27*(0.6*s1+0.4*s2)*(trendAlign?1.0:0.7)*adxF, 0.32, 0.93);
 
-                    const sideMR=z_vwap>0?"short":"long";
+                    const sideMR = z_vwap>0 ? "short" : "long";
+                    const rsiEdge=(rsi14!=null)?(rsi14-50)/50:0;
                     const sMR=tanh(Math.abs(z_vwap))*Math.sign(-z_vwap);
-                    const rsiEdge=(rsi14!=null)? (rsi14-50)/50 : 0;
                     let pMR = clamp(0.5 + 0.23*(0.7*sMR + 0.3*(-rsiEdge))*(1-adxF), 0.35, 0.90);
 
-                    const boUp=(last>dcHi), boDn=(last<dcLo);
-                    let boBase=(boUp||boDn?1.0:0.35)*(0.6+0.4*adxF);
-                    { const winS=20, retW=[]; for(let i=c5.length-winS;i<c5.length;i++) retW.push((c5[i]/c5[i-1])-1); const bbWidth=std(retW)*Math.sqrt(winS); const kelWidth=(atr5/last); const sqRatio=kelWidth>0? (bbWidth/kelWidth):1; const sqScore=clamp((1.15-sqRatio)/0.45,0,1); boBase*=(1+0.4*sqScore); }
-                    const sideBO= boUp?"long": boDn?"short": ((0.6*roc5+0.4*roc15)>=0?"long":"short");
+                    const sideBO = boUp ? "long" : boDn ? "short" : (0.6*roc5+0.4*roc15)>=0?"long":"short";
+                    let boBase = (boUp||boDn ? 1.0 : 0.35) * (0.6+0.4*adxF);
+                    boBase *= (1 + 0.4*squeezeScore);
                     let pBO = clamp(0.5 + 0.29*(boBase*(sideBO==="long"?1:-1)), 0.35, 0.96);
 
-                    const wT=weightsReg.wTrend, wM=weightsReg.wMR, wB=weightsReg.wBO;
-                    const pLong0=clamp(wT*(sideTrend==="long"?pTrend:1-pTrend)+ wM*(sideMR==="long"?pMR:1-pMR)+ wB*(sideBO==="long"?pBO:1-pBO),0.30,0.97);
-                    const pShort0=clamp(wT*(sideTrend==="short"?pTrend:1-pTrend)+ wM*(sideMR==="short"?pMR:1-pMR)+ wB*(sideBO==="short"?pBO:1-pBO),0.30,0.97);
+                    const wT=weights.wTrend, wM=weights.wMR, wB=weights.wBO;
 
-                    const vol1h_est_usd=c.qv/24;
+                    const pLong0  = clamp(wT*(sideTrend==="long"?pTrend:1-pTrend) + wM*(sideMR==="long"?pMR:1-pMR) + wB*(sideBO==="long"?pBO:1-pBO), 0.30, 0.97);
+                    const pShort0 = clamp(wT*(sideTrend==="short"?pTrend:1-pTrend) + wM*(sideMR==="short"?pMR:1-pMR) + wB*(sideBO==="short"?pBO:1-pBO), 0.30, 0.97);
 
-                    return { c, k5, k15, c5, h5, l5, v5, adx5, atr_bps:atr_bps, spreadBps, pLong0, pShort0,
-                      upF, upS, up15, up1h, z_vwap, rsi14, trendAlign, em20, em50, em200, slope_atr50, dcHi, dcLo, breakout, mrLocked,
-                      noShortUp, noLongDown, fadeShortDivergenceOK, fadeLongDivergenceOK, vol1h_est_usd, trendBias };
+                    const lvl_gap_long_bps = (pLow15!=null && last>0) ? Math.max(0, ((last - pLow15)/last)*10000) : 0;
+                    const lvl_gap_short_bps= (pHigh15!=null && last>0)? Math.max(0, ((pHigh15 - last)/last)*10000) : 0;
+
+                    const gp_feat=[ clamp((adx5-16)/14,0,1), clamp(z_vwap,-3,3), (rsi14||50)/100, 0 ];
+
+                    const signalScore = clamp(Math.round(
+                      50 + 30*((Math.max(pLong0,pShort0)-0.5)*2)
+                      + 10*clamp((adx5-18)/14,0,1)
+                      + 5*(trendAlign?1:0)
+                      + 5*clamp(squeezeScore*1.2,0,1)
+                      - Math.min(10, Math.max(0,(spreadBps-6)/2))
+                    ), 0, 100);
+
+                    return {
+                      c, k5, c5, adx5, atr_bps:atr_bps, spreadBps, pLong0, pShort0,
+                      styleLong: trendAlign ? "trend" : (squeezeScore>0.25||boUp) ? "breakout" : "mr",
+                      styleShort: !trendAlign ? "trend" : (squeezeScore>0.25||boDn) ? "breakout" : "mr",
+                      upF, upS, up15, up1h, z_vwap, boUp, boDn, trendAlign, squeezeScore,
+                      lvl_gap_long_bps, lvl_gap_short_bps, signalScore, gp_feat_base:gp_feat
+                    };
                   }catch{ return null; }
                 }));
-                for(const x of batch) if(x){ picksRaw.push(x); pfStats.kept++; }
+                for(const x of batch){
+                  if(x){ picksAny.push(x); pfStats.kept_any++; }
+                  if(x && x.signalScore > 50){ picksRaw.push(x); pfStats.kept_gated++; }
+                }
               }
-              snapCounts({ pre: picksRaw.length });
-              console.log("[gha] pre done", { pre:picksRaw.length, pfStats });
-
-              // Train GP-Cls
-              function buildTrainSet(side){ const D=(state.gp_data_clf||[]).filter(r=>r.side===side).slice(-500); return { X:D.map(d=>d.x), y:D.map(d=>d.y) }; }
-              const trL=buildTrainSet("long"), trS=buildTrainSet("short");
-              const gpClfLong=(trL.X.length>=25)? trainGPClass(trL.X, trL.y, 0.12, 12) : null;
-              const gpClfShort=(trS.X.length>=25)? trainGPClass(trS.X, trS.y, 0.12, 12): null;
-              // set run model hash
-              run_prov.p_model = { gp_hash: "long="+(gpClfHash(gpClfLong)||"none")+"|short="+(gpClfHash(gpClfShort)||"none"), calib_type:"mixed", calib_n:(state.gp_data_clf?.length||0) };
-              state.run.p_model = run_prov.p_model;
+              snapCounts({ pre: picksRaw.length, pre_any: picksAny.length });
+              console.log("[gha] pre done", { pre: picksRaw.length, pre_any: picksAny.length, pfStats });
+              if(!picksRaw.length && !picksAny.length){ reason = (reason!=="ok"?reason:"no_candidates"); }
 
               // Refine
+              const byScoreSort = (arr)=>arr.sort((a,b)=> b.signalScore - a.signalScore);
+              byScoreSort(picksRaw);
+              byScoreSort(picksAny);
+
+              // If rank-fill enabled and no gated picks, refine from the broader pool
+              const REFINE_SRC = (picksRaw.length>0 || !NO_VIABLE_RANK_FILL) ? picksRaw : picksAny;
+
+              const REFINE_M = Math.min(UNIV_TARGET_MAX, REFINE_SRC.length);
               const refined=[];
-              for(let idx=0; idx<picksRaw.length; idx++){
+              function retLog(arr){ const r=[]; for(let i=1;i<arr.length;i++) r.push(Math.log(arr[i]/arr[i-1])); return r.slice(-36); }
+
+              for(let idx=0; idx<REFINE_M; idx++){
                 try{
-                  const p=picksRaw[idx], c=p.c;
+                  const p=REFINE_SRC[idx];
+                  const c=p.c;
                   const book=bookMap.get(c.symbol); if(!book?.bid||!book?.ask) continue;
                   const mid=(book.bid+book.ask)/2;
 
-                  // Depth / OBI / slippage
                   const depth=await fetchDepth(c.symbol);
-                  let obi=0, slipL=p.spreadBps/2, slipS=p.spreadBps/2, fillL=0, fillS=0, depth1pUSD=0;
+                  let obi=0, slipL=p.spreadBps/2, slipS=p.spreadBps/2, fillL=0, fillS=0;
                   if(depth?.asks?.length && depth?.bids?.length){
-                    obi = computeOBI(depth, OBI_TOPN);
-                    const buy=vwapFillLevels(depth.asks, Math.max(50,NOTIONAL)), sell=vwapFillLevels(depth.bids, Math.max(50,NOTIONAL));
-                    slipL= buy.px? Math.max(0, Math.round((buy.px-mid)/mid*10000)) : slipL;
-                    slipS= sell.px? Math.max(0, Math.round((mid-sell.px)/mid*10000)) : slipS;
-                    fillL=Math.min(1, buy.filledUSD/Math.max(1,NOTIONAL));
-                    fillS=Math.min(1, sell.filledUSD/Math.max(1,NOTIONAL));
-                    const d1=depthWithinPctUSD(depth, mid, 0.01);
-                    depth1pUSD = (d1.asksUSD||0)+(d1.bidsUSD||0);
+                    const w=(i)=>Math.exp(-i*0.18);
+                    let bidNot=0, askNot=0;
+                    for(let i=0;i<Math.min(OBI_TOPN, depth.bids.length); i++){ const p0=+depth.bids[i][0], q=+depth.bids[i][1]; if(p0>0&&q>0) bidNot += p0*q*w(i); }
+                    for(let i=0;i<Math.min(OBI_TOPN, depth.asks.length); i++){ const p0=+depth.asks[i][0], q=+depth.asks[i][1]; if(p0>0&&q>0) askNot += p0*q*w(i); }
+                    obi = (bidNot+askNot>0) ? (bidNot-askNot)/(bidNot+askNot) : 0;
+
+                    const vwapFill=(levels,targetUSD)=>{
+                      let remain=targetUSD,val=0,qty=0;
+                      for(const [ps,qs] of levels){ const p=+ps,q=+qs; if(!(p>0&&q>0)) continue; const can=p*q, take=Math.min(remain,can), tq=take/p;
+                        val+=p*tq; qty+=tq; remain-=take; if(remain<=1e-6) break; }
+                      return { px: qty>0? val/qty : null, filledUSD: (targetUSD-remain) };
+                    };
+                    const buy=vwapFill(depth.asks, Math.max(50,NOTIONAL));
+                    const sell=vwapFill(depth.bids, Math.max(50,NOTIONAL));
+                    slipL = buy.px? Math.max(0, Math.round((buy.px - mid)/mid*10000)) : slipL;
+                    slipS = sell.px? Math.max(0, Math.round((mid - sell.px)/mid*10000)) : slipS;
+                    fillL = Math.min(1, buy.filledUSD/Math.max(1,NOTIONAL));
+                    fillS = Math.min(1, sell.filledUSD/Math.max(1,NOTIONAL));
                   }
 
-                  // Allowed sides
-                  const envAllowed=(dir)=>ALLOWED.has(dir), biasAllows=(dir)=> (p.trendBias==="both")? true : (p.trendBias==="long_only"? dir==="long" : dir==="short");
-                  const shortAllowedByTrend=!p.noShortUp;
-                  const coinUpMultiTF=(p.up15 && p.up1h);
-                  const coinNotNaughty=!LONG_NAUGHTY_BASES.has(c.base.toUpperCase());
+                  const rsiVal = rsi(p.c5,14);
+                  const gp_feat_long  = [ clamp((p.adx5-16)/14,0,1), clamp(p.z_vwap,-3,3), (rsiVal||50)/100, Math.max(0,-obi) ];
+                  const gp_feat_short = [ clamp((p.adx5-16)/14,0,1), clamp(-p.z_vwap,-3,3), (100-(rsiVal||50))/100, Math.max(0,+obi) ];
+
+                  let pLong=p.pLong0, pShort=p.pShort0;
+                  const lastSide=state.cooldown_side?.[c.base];
+                  if(lastSide && lastSide.side && lastSide.ts_ms && Date.now()-lastSide.ts_ms<FLIP_GUARD_MS){
+                    if(lastSide.side==="long") pShort = Math.max(0.30, pShort-0.03);
+                    if(lastSide.side==="short") pLong  = Math.max(0.30, pLong -0.03);
+                  }
 
                   const costLong=COST_BPS + Math.max(Math.round(p.spreadBps/2), slipL);
                   const costShort=COST_BPS + Math.max(Math.round(p.spreadBps/2), slipS);
-                  if(Math.max(costLong,costShort)>MAX_COST_BPS_HARD) continue;
-                  if(p.vol1h_est_usd < MIN_VOL_1H_USD) continue;
-                  if(depth1pUSD < DEPTH_1P_MIN_USD) continue;
 
-                  const allowedShort = envAllowed("short") && biasAllows("short") && shortAllowedByTrend;
-                  let allowedLong = envAllowed("long") && biasAllows("long") && coinUpMultiTF && btcGreen && coinNotNaughty && (costLong <= LONG_MAX_COST_BPS) && !p.noLongDown;
+                  const y=[]; for(let i=1;i<p.c5.length;i++) y.push(Math.log(p.c5[i]/p.c5[i-1]));
+                  const mu5=mean(y)||0, sig5=std(y)||1e-4;
 
-                  // GP features
-                  const featL=[ clamp((p.adx5-16)/14,0,1), clamp(p.z_vwap,-3,3), (p.rsi14||50)/100, Math.max(0,-obi), clamp(p.slope_atr50,0,1) ];
-                  const featS=[ clamp((p.adx5-16)/14,0,1), clamp(-p.z_vwap,-3,3), (100-(p.rsi14||50))/100, Math.max(0,+obi), clamp(p.slope_atr50,0,1) ];
-                  let pLong=p.pLong0, pShort=p.pShort0, pLong_raw=pLong, pShort_raw=pShort;
-                  if(gpClfLong) pLong_raw=predictGPClass(gpClfLong, featL).p;
-                  if(gpClfShort) pShort_raw=predictGPClass(gpClfShort, featS).p;
+                  const entryMid = mid;
+                  const adxF=clamp((p.adx5-16)/14,0,1);
+                  const hold_sec = clamp(Math.round((weights.wTrend>weights.wMR ? 720 : 560) + 240*adxF + 120*(p.squeezeScore||0)), TTL_MIN, TTL_MAX);
 
-                  const strongTrend=(p.adx5>Math.max(22,MR_ADX_MAX)) || (p.slope_atr50>MR_SLOPE_MAX_ATR50);
-                  const regime = p.mrLocked ? "trend" : (strongTrend? "trend":"meanrevert");
+                  const rrrDynLong  = optimizeRRR_MC({ atr_bps:p.atr_bps, cost_bps:costLong  , spread_bps:p.spreadBps, entry:entryMid, side:"long" , mu:mu5, sigma:sig5, ttl_sec:hold_sec });
+                  const rrrDynShort = optimizeRRR_MC({ atr_bps:p.atr_bps, cost_bps:costShort , spread_bps:p.spreadBps, entry:entryMid, side:"short", mu:mu5, sigma:sig5, ttl_sec:hold_sec });
 
-                  pLong=calibrateP(state,"long",regime,pLong_raw);
-                  pShort=calibrateP(state,"short",regime,pShort_raw);
+                  // GP adjust
+                  const gpL = gpModel? gpPredict(gpModel, gp_feat_long)  : {mu:pLong, sigma:0.20};
+                  const gpS = gpModel? gpPredict(gpModel, gp_feat_short) : {mu:pShort, sigma:0.20};
+                  const dataN=(state.gp_data?.length||0);
+                  const wGP = clamp(dataN/200, 0.15, 0.65);
+                  const pLong_adj  = clamp((1-wGP)*pLong  + wGP*gpL.mu,  0.30, 0.97);
+                  const pShort_adj = clamp((1-wGP)*pShort + wGP*gpS.mu,  0.30, 0.97);
+                  const pLong_lcb  = clamp(pLong_adj  - WILSON_Z*(gpL.sigma||0.20), 0.10, 0.98);
+                  const pShort_lcb = clamp(pShort_adj - WILSON_Z*(gpS.sigma||0.20), 0.10, 0.98);
 
-                  // Flip guard
-                  const lastSide=state.cooldown_side?.[c.base];
-                  if(lastSide && lastSide.side && lastSide.ts_ms && Date.now()-lastSide.ts_ms<FLIP_GUARD_MS){
-                    if(lastSide.side==="long") pShort=Math.max(0.30, pShort-0.03);
-                    if(lastSide.side==="short") pLong =Math.max(0.30, pLong -0.03);
+                  const steps=Math.max(1,Math.round(hold_sec/300));
+                  const evL = rrrDynLong  ? gbmSimEV({ entry:entryMid, tp_bps:rrrDynLong.tp_bps, sl_bps:rrrDynLong.sl_bps, side:"long",  mu:mu5, sigma:sig5, dt:1, steps, N:192, cost_bps:costLong  }) : { ev_lcb_bps:-1e9, p_lcb:0.0, ev_bps:-1e9 };
+                  const evS = rrrDynShort ? gbmSimEV({ entry:entryMid, tp_bps:rrrDynShort.tp_bps, sl_bps:rrrDynShort.sl_bps, side:"short", mu:mu5, sigma:sig5, dt:1, steps, N:192, cost_bps:costShort }) : { ev_lcb_bps:-1e9, p_lcb:0.0, ev_bps:-1e9 };
+
+                  const evLongLCB  = rrrDynLong  ? Math.round(pLong_lcb  * rrrDynLong.tp_bps  - (1-pLong_lcb )*rrrDynLong.sl_bps - costLong)  : -1e9;
+                  const evShortLCB = rrrDynShort ? Math.round(pShort_lcb * rrrDynShort.tp_bps - (1-pShort_lcb)*rrrDynShort.sl_bps - costShort) : -1e9;
+
+                  // Safe choice: handle nulls
+                  let chosen=null;
+                  if (rrrDynLong && rrrDynShort){
+                    chosen = (evLongLCB>=evShortLCB)
+                      ? {side:"long",  tp_bps:rrrDynLong.tp_bps,  sl_bps:rrrDynLong.sl_bps,  p_lcb:pLong_lcb,  cost_bps:costLong , exp_lcb_bps:evLongLCB , exp_bps:evL.ev_bps }
+                      : {side:"short", tp_bps:rrrDynShort.tp_bps, sl_bps:rrrDynShort.sl_bps, p_lcb:pShort_lcb, cost_bps:costShort, exp_lcb_bps:evShortLCB, exp_bps:evS.ev_bps };
+                  }else if(rrrDynLong){
+                    chosen = {side:"long",  tp_bps:rrrDynLong.tp_bps,  sl_bps:rrrDynLong.sl_bps,  p_lcb:pLong_lcb,  cost_bps:costLong , exp_lcb_bps:evLongLCB , exp_bps:evL.ev_bps };
+                  }else if(rrrDynShort){
+                    chosen = {side:"short", tp_bps:rrrDynShort.tp_bps, sl_bps:rrrDynShort.sl_bps, p_lcb:pShort_lcb, cost_bps:costShort, exp_lcb_bps:evShortLCB, exp_bps:evS.ev_bps };
+                  }else{
+                    // No viable TP/SL for either side; skip this candidate
+                    continue;
                   }
 
-                  const pLong_lcb=wilsonLCB(pLong,80,WILSON_Z), pShort_lcb=wilsonLCB(pShort,80,WILSON_Z);
-                  const yR=[]; for(let i=1;i<p.c5.length;i++) yR.push(Math.log(p.c5[i]/p.c5[i-1]));
-                  const mu5=mean(yR)||0, sig5=Math.max(1e-4,std(yR));
-                  const entryMid=mid; const hold_base=clamp(Math.round((weightsReg.wTrend>weightsReg.wMR? 720:560)+240*clamp((p.adx5-16)/14,0,1)), TTL_MIN, TTL_MAX); const stepsBase=Math.max(1,Math.round(hold_base/300));
+                  // Factor regression
+                  const yR = y.slice(-61), X1=fBTC.slice(-yR.length), X2=fETH.slice(-yR.length), X3=fSOL.slice(-yR.length);
+                  const {R2} = (function ols(y,f1,f2,f3){
+                    const n=Math.min(y.length,f1.length,f2.length,f3.length); if(n<20) return {R2:0};
+                    const Y=y.slice(-n), X1=f1.slice(-n), X2=f2.slice(-n), X3=f3.slice(-n);
+                    const ym=mean(Y); let sYY=0,sRes=0;
+                    const k=4; const XtX=Array.from({length:k},()=>Array(k).fill(0)), XtY=Array(k).fill(0);
+                    for(let i=0;i<n;i++){ const row=[1, X1[i]||0, X2[i]||0, X3[i]||0], yi=Y[i]; for(let a=0;a<k;a++){ XtY[a]+=row[a]*yi; for(let b=0;b<k;b++) XtX[a][b]+=row[a]*row[b]; } }
+                    for(let i=0;i<k;i++) XtX[i][i]+=1e-6;
+                    const M=XtX.map((row,i)=>row.concat([XtY[i]]));
+                    for(let i=0;i<k;i++){ let p=i; for(let r=i+1;r<k;r++) if(Math.abs(M[r][i])>Math.abs(M[p][i])) p=r;
+                      if(Math.abs(M[p][i])<1e-12) return {R2:0}; if(p!==i) [M[i],M[p]]=[M[p],M[i]];
+                      const piv=M[i][i]; for(let j=i;j<=k;j++) M[i][j]/=piv;
+                      for(let r=0;r<k;r++){ if(r===i) continue; const f=M[r][i]; for(let j=i;j<=k;j++) M[r][j]-=f*M[i][j]; } }
+                    const beta=M.map(row=>row[k]);
+                    for(let i=0;i<n;i++){ const row=[1, X1[i]||0, X2[i]||0, X3[i]||0]; let yhat=0; for(let j=0;j<k;j++) yhat+=row[j]*beta[j]; const e=Y[i]-yhat; sRes+=e*e; sYY+=(Y[i]-ym)**2; }
+                    return {R2: clamp(sYY>0? (1-sRes/sYY):0,0,1)};
+                  })(yR,X1,X2,X3);
 
-                  const allowMR=(side)=>{
-                    if(side==="long" && !allowedLong) return false;
-                    if(side==="short" && !allowedShort) return false;
-                    if(!(p.spreadBps<=MR_SPREAD_MAX_BPS)) return false;
-                    if(p.mrLocked) return false;
-                    if(!(p.adx5<=MR_ADX_MAX && p.slope_atr50<=MR_SLOPE_MAX_ATR50)) return false;
-                    return true;
-                  };
-
-                  // Long candidate
-                  let candLong=null;
-                  if(allowedLong){
-                    const mrOk = allowMR("long") && (LONG_MR_DIVERGENCE_REQ ? p.fadeLongDivergenceOK : true);
-                    const styleL = mrOk ? "mr" : (strongTrend ? "momentum":"trend");
-                    let holdL = mrOk ? clamp(Math.round(Math.max(1800, hold_base)), 1200, 3600)
-                                     : clamp(Math.round(Math.max(LONG_BOUNCE_HOLD_MIN_SEC, Math.min(hold_base, LONG_BOUNCE_HOLD_MAX_SEC))), LONG_BOUNCE_HOLD_MIN_SEC, LONG_BOUNCE_HOLD_MAX_SEC);
-                    let slL, tpL;
-                    if(styleL==="mr"){ slL=Math.round(LONG_BOUNCE_SL_ATR*p.atr_bps); tpL=Math.round(LONG_BOUNCE_TP_ATR*p.atr_bps); }
-                    else { slL=Math.round(clamp(p.atr_bps*0.50, Math.round(0.35*p.atr_bps), Math.round(0.65*p.atr_bps)));
-                           tpL=Math.round(clamp(p.atr_bps*0.95, Math.round(0.60*p.atr_bps), Math.round(1.20*p.atr_bps))); }
-                    const simL=pathEVHeavy({entry:entryMid,tp_bps:tpL,sl_bps:slL,side:"long",retSeries:yR,mu:mu5,sigma:sig5,steps:stepsBase,N:192,cost_bps:costLong,t_df:Number(process.env.T_SIM_DF||"5"),boot_block:Number(process.env.BOOT_BLOCK||"3")});
-                    const evLongLCB=Math.round(pLong_lcb*tpL - (1-pLong_lcb)*slL - costLong);
-                    if(tpL>=LONG_EDGE_MULT_MIN*costLong){ candLong={ side:"long", p_lcb:pLong_lcb, p_raw:pLong_raw, cost_bps:costLong, tp_bps:tpL, sl_bps:slL, exp_lcb_bps:evLongLCB, exp_bps:simL.ev_bps, hold_sec:holdL, style:styleL, regime }; }
-                  }
-
-                  // Short candidate
-                  let candShort=null;
-                  if(allowedShort){
-                    const mrOk = allowMR("short") && p.fadeShortDivergenceOK;
-                    const styleS = mrOk ? "mr" : (strongTrend ? "momentum":"trend");
-                    const holdS = mrOk ? clamp(Math.round(Math.max(1800, hold_base)), 1200, 3600) : hold_base;
-                    let slS, tpS;
-                    if(styleS==="mr"){ const sl=Math.round(clamp(0.5,0.4,0.6)*p.atr_bps), tp=Math.round(clamp(1.0,0.8,1.2)*p.atr_bps); slS=sl; tpS=tp; }
-                    else { slS=Math.round(clamp(p.atr_bps*0.55, Math.round(0.35*p.atr_bps), Math.round(0.75*p.atr_bps)));
-                           tpS=Math.round(clamp(p.atr_bps*1.00, Math.round(0.70*p.atr_bps), Math.round(1.40*p.atr_bps))); }
-                    const simS=pathEVHeavy({entry:entryMid,tp_bps:tpS,sl_bps:slS,side:"short",retSeries:yR,mu:mu5,sigma:sig5,steps:stepsBase,N:192,cost_bps:costShort,t_df:Number(process.env.T_SIM_DF||"5"),boot_block:Number(process.env.BOOT_BLOCK||"3")});
-                    const evShortLCB=Math.round(pShort_lcb*tpS - (1-pShort_lcb)*slS - costShort);
-                    if(tpS>=Math.max(3,Number(process.env.EDGE_COST_MULT_MIN||"3"))*costShort){ candShort={ side:"short", p_lcb:pShort_lcb, p_raw:pShort_raw, cost_bps:costShort, tp_bps:tpS, sl_bps:slS, exp_lcb_bps:evShortLCB, exp_bps:simS.ev_bps, hold_sec:holdS, style:styleS, regime }; }
-                  }
-
-                  let chosen=candLong&&candShort? (candLong.exp_lcb_bps>=candShort.exp_lcb_bps? candLong : candShort) : (candLong||candShort||null);
-                  if(!chosen) continue;
-
-                  const liq=liqPct.get(c.symbol)||0.5;
-                  const score=clamp(Math.round(60 + 30*(chosen.p_lcb-0.5)*2 + 12*clamp((p.adx5-16)/14,0,1) + 7*((liq-0.5)*2) - Math.min(12, Math.max(0,(p.spreadBps-5)/2))), 1, 99);
+                  const liq = liqPct.get(c.symbol)||0.5;
+                  const score = clamp(Math.round(60 + 30*(chosen.p_lcb-0.5)*2 + 12*clamp((p.adx5-16)/14,0,1) + 7*((liq-0.5)*2)
+                                      - Math.min(12, Math.max(0,(p.spreadBps-5)/2)) - Math.round(9*clamp(R2,0,1))), 1, 99);
 
                   refined.push({
                     symbol:c.symbol, base:c.base, quote:c.quote, qv:c.qv,
-                    side:chosen.side, p_lcb:+chosen.p_lcb.toFixed(3), p_raw:+chosen.p_raw.toFixed(3),
-                    p_win:+(Math.max(p.pLong0,p.pShort0)).toFixed(3),
-                    exp_bps:chosen.exp_bps, exp_lcb_bps:chosen.exp_lcb_bps,
-                    tp_bps:chosen.tp_bps, sl_bps:chosen.sl_bps, rrr:+(chosen.tp_bps/Math.max(1,chosen.sl_bps)).toFixed(2),
-                    spread_bps:p.spreadBps, cost_bps:chosen.cost_bps,
-                    adx:+(p.adx5||0).toFixed(1), atr_bps:p.atr_bps, regime:chosen.regime, style:chosen.style,
-                    score, n_conf:Math.round(60+40*clamp((p.adx5-16)/14,0,1)), obi:+obi.toFixed(3),
-                    hold_sec:chosen.hold_sec, liq_pct:+liq.toFixed(3),
-                    ret5:(()=>{ const r=[]; for(let i=1;i<p.c5.length;i++) r.push(Math.log(p.c5[i]/p.c5[i-1])); return r.slice(-36); })(),
-                    fill_prob: (chosen.side==="long"? +fillL.toFixed(2): +fillS.toFixed(2)),
-                    dyn_floor: Math.max(EXP_LCB_MIN_THIS, 8 + Math.max(0,12-(p.spreadBps||0))/2),
-                    rsi14:p.rsi14, z_vwap:p.z_vwap,
-                    vol1h_est_usd:p.vol1h_est_usd, depth1p_usd:depth1pUSD,
-                    direction_env: DIRECTION, side_bias:p.trendBias,
-                    swing_lo_px: (function swingLo(){ const lows=p.k15?.map(x=>+x[3])||[]; if(lows.length<40) return null; return Math.min(...lows.slice(-40)); })(),
-                    // micro snapshots for pending
-                    entry_book: { bid: book.bid, ask: book.ask },
-                    slip_bps_long: slipL, slip_bps_short: slipS,
-                    spread_bps_entry: p.spreadBps
+                    side:chosen.side, p_lcb:+chosen.p_lcb.toFixed(3),
+                    p_win: +(Math.max(p.pLong0,p.pShort0)).toFixed(3),
+                    exp_bps: chosen.exp_bps, exp_lcb_bps: chosen.exp_lcb_bps,
+                    tp_bps: chosen.tp_bps, sl_bps: chosen.sl_bps, rrr: +(chosen.tp_bps/Math.max(1,chosen.sl_bps)).toFixed(2),
+                    spread_bps: p.spreadBps, cost_bps: chosen.cost_bps,
+                    adx:+(p.adx5||0).toFixed(1), atr_bps:p.atr_bps,
+                    regime: (weights.wTrend>weights.wMR? "trend":"meanrevert"), style: (chosen.side==="long"? p.styleLong: p.styleShort),
+                    score, beta_r2:+R2.toFixed(2), n_conf:Math.round(60+40*clamp((p.adx5-16)/14,0,1)),
+                    obi:+obi.toFixed(3), hold_sec, liq_pct:+liq.toFixed(3),
+                    ret5:retLog(p.c5), fill_prob:+((chosen.side==="long"?fillL:fillS)||0).toFixed(2),
+                    dyn_floor: Math.max(EXP_LCB_MIN_BPS, 6 + Math.max(0,12-p.spreadBps)/2),
+                    lvl_gap_long_bps:p.lvl_gap_long_bps, lvl_gap_short_bps:p.lvl_gap_short_bps,
+                    trend_align_long:(p.upF&&p.upS&&p.up15&&p.up1h),
+                    trend_align_short:(!p.upF&&!p.upS&&(!p.up15||!p.up1h)),
+                    rsi14: rsiVal,
+                    z_vwap: p.z_vwap
                   });
-                }catch(e){ console.log("[gha] refine warn", (picksRaw[idx]?.c?.symbol)||"unknown", e?.message||e); }
+                }catch(err){
+                  log("refine warn", (REFINE_SRC[idx]?.c?.symbol)||"unknown", err?.message||err);
+                }
               }
               snapCounts({ refined: refined.length });
+              console.log("[gha] refine done", { refined: refined.length });
 
               // Rank refined
               refined.sort((a,b)=> b.exp_lcb_bps!==a.exp_lcb_bps ? b.exp_lcb_bps-a.exp_lcb_bps
@@ -1061,301 +861,204 @@ jobs:
                                 : b.score!==a.score ? b.score-a.score
                                 : b.qv-a.qv);
 
-              // Strict picks
-              const strictOk=(cand)=>{
-                const common = cand.p_lcb>=0.60 && cand.exp_lcb_bps>=Math.max(cand.dyn_floor+3, EXP_LCB_MIN_THIS+3) && (cand.fill_prob||0)>=0.65 && cand.spread_bps<=MAX_SPREAD_BPS;
-                if(!common) return false;
-                if(cand.side==="long"){ if(cand.cost_bps>LONG_MAX_COST_BPS) return false; if(cand.tp_bps < LONG_EDGE_MULT_MIN*cand.cost_bps) return false; }
-                else { if(cand.cost_bps>Math.max(COST_BPS+8,18)) return false; }
-                return true;
-              };
-              const TARGET_K=Math.min(3, TOP_N||3);
-              let selected=[];
+              // Strict picks (MC-LCB EV)
+              const CORE_CORR_MAX=0.84;
+              const rho=(a,b)=>corr(a.ret5||[],b.ret5||[]);
+              const strictOk=(cand)=> cand.p_lcb>=0.60 && cand.exp_lcb_bps>=Math.max(cand.dyn_floor+3, EXP_LCB_MIN_BPS+3)
+                && (cand.fill_prob||0)>=0.70 && cand.cost_bps<=Math.max(COST_BPS+8, 18)
+                && cand.spread_bps<=MAX_SPREAD_BPS && cand.beta_r2<=0.75;
+
+              const TARGET_K = Math.min(3, TOP_N || 3);
+
+              const strictPicks=[];
               for(const cand of refined){
-                if(selected.length>=TARGET_K) break; if(!strictOk(cand)) continue;
-                let ok=true; for(const s of selected){ const r=corr(cand.ret5||[],s.ret5||[]); if(cand.side==="long" && s.side==="long" && r>LONG_SIMILARITY_RHO) { ok=false; break; } if(r>0.90){ ok=false; break; } }
-                if(ok) selected.push(cand);
+                if(strictPicks.length>=TARGET_K) break;
+                if(!strictOk(cand)) continue;
+                let ok=true; for(const s of strictPicks){ if(rho(cand,s)>CORE_CORR_MAX){ ok=false; break; } }
+                if(ok) strictPicks.push(cand);
               }
 
-              // Updated selection policy with fallback
-              const strictCount = selected.length;
-              const fallbackTarget = Math.min(TARGET_K, universe.length);
+              // Selection with fallback and top-up
+              let selected=[];
+              if(strictPicks.length>0){
+                selected=strictPicks.slice(0, TARGET_K);
+                selectionTier="strict";
+                reason=(reason!=="ok"?reason:"strict");
+              }else{
+                // strict=0 → viable-first; optionally rank-fill and top-up if enabled
+                const viable = refined.filter(c => (c.exp_lcb_bps ?? -1e9) > 0);
 
-              if (strictCount === 0) {
-                let fallback = [];
-                const have = new Set();
-                const tryAdd = (candList) => {
-                  for (const cand of candList) {
-                    if (fallback.length >= fallbackTarget) break;
-                    if (have.has(cand.symbol)) continue;
-                    let ok = true;
-                    for (const s of fallback) {
-                      const r = corr(cand.ret5 || [], s.ret5 || []);
-                      if (cand.side === "long" && s.side === "long" && r > LONG_SIMILARITY_RHO) { ok = false; break; }
-                      if (r > 0.90) { ok = false; break; }
-                    }
-                    if (!ok) continue;
-                    fallback.push({ ...cand, mp_fill: true, always3: true });
-                    have.add(cand.symbol);
+                if (viable.length >= TARGET_K){
+                  selected = viable.slice(0, TARGET_K);
+                  selectionTier="mp_force3_viable3";
+                } else if (viable.length > 0){
+                  selected = viable.slice(0, viable.length);
+                  selectionTier="mp_force3_viable12";
+                } else {
+                  if (NO_VIABLE_RANK_FILL) {
+                    selected = refined.slice(0, TARGET_K).map(c=>({ ...c, mp_fill:true }));
+                    selectionTier="mp_force3_rank";
+                  } else {
+                    selected = [];
+                    selectionTier="mp_force3_none";
                   }
-                };
-                if (refined.length > 0) {
-                  tryAdd(refined);
                 }
-                if (fallback.length < fallbackTarget) {
-                  const fbCands = [];
-                  for (const p of picksRaw) {
-                    try {
-                      const book = bookMap.get(p.c.symbol);
-                      if (!book?.bid || !book?.ask) continue;
-                      const mid = (book.bid + book.ask) / 2;
-                      const yR = []; for (let i = 1; i < p.c5.length; i++) yR.push(Math.log(p.c5[i] / p.c5[i-1]));
-                      const mu5 = mean(yR) || 0, sig5 = Math.max(1e-4, std(yR));
-                      const hold_base = clamp(Math.round((weightsReg.wTrend > weightsReg.wMR ? 720 : 560) + 240 * clamp((p.adx5 - 16)/14, 0, 1)), TTL_MIN, TTL_MAX);
-                      const stepsBase = Math.max(1, Math.round(hold_base/300));
-                      const slipL = Math.max(Math.round(p.spreadBps/2), 0);
-                      const slipS = Math.max(Math.round(p.spreadBps/2), 0);
-                      const costLong = COST_BPS + slipL;
-                      const costShort = COST_BPS + slipS;
-                      if (Math.max(costLong, costShort) > MAX_COST_BPS_HARD) continue;
-
-                      const featL = [ clamp((p.adx5 - 16)/14,0,1), clamp(p.z_vwap,-3,3), (p.rsi14||50)/100, 0.0, clamp(p.slope_atr50,0,1) ];
-                      const featS = [ clamp((p.adx5 - 16)/14,0,1), clamp(-p.z_vwap,-3,3),(100-(p.rsi14||50))/100, 0.0, clamp(p.slope_atr50,0,1) ];
-                      let pLong_raw = p.pLong0, pShort_raw = p.pShort0;
-                      if (gpClfLong) pLong_raw = predictGPClass(gpClfLong, featL).p;
-                      if (gpClfShort) pShort_raw = predictGPClass(gpClfShort, featS).p;
-
-                      const strongTrend = (p.adx5 > Math.max(22, MR_ADX_MAX)) || (p.slope_atr50 > MR_SLOPE_MAX_ATR50);
-                      const regime = p.mrLocked ? "trend" : (strongTrend ? "trend" : "meanrevert");
-
-                      const pLong = calibrateP(state,"long",regime,pLong_raw);
-                      const pShort = calibrateP(state,"short",regime,pShort_raw);
-
-                      const pLong_lcb = wilsonLCB(pLong, 80, WILSON_Z);
-                      const pShort_lcb = wilsonLCB(pShort, 80, WILSON_Z);
-
-                      let candLong = null;
-                      { const slL=Math.round(clamp(p.atr_bps * 0.50, Math.round(0.35 * p.atr_bps), Math.round(0.65 * p.atr_bps)));
-                        const tpL=Math.round(clamp(p.atr_bps * 0.95, Math.round(0.60 * p.atr_bps), Math.round(1.20 * p.atr_bps)));
-                        const simL = pathEVHeavy({ entry:mid, tp_bps:tpL, sl_bps:slL, side:"long", retSeries:yR, mu:mu5, sigma:sig5, steps:stepsBase, N:192, cost_bps:costLong, t_df:Number(process.env.T_SIM_DF||"5"), boot_block:Number(process.env.BOOT_BLOCK||"3") });
-                        const evLongLCB = Math.round(pLong_lcb*tpL - (1-pLong_lcb)*slL - costLong);
-                        candLong = { side:"long", p_lcb:+pLong_lcb.toFixed(3), p_raw:+pLong.toFixed(3), cost_bps:costLong, tp_bps:tpL, sl_bps:slL, exp_lcb_bps:evLongLCB, exp_bps:simL.ev_bps, hold_sec:hold_base, style:"trend", regime };
-                      }
-
-                      let candShort = null;
-                      { const slS=Math.round(clamp(p.atr_bps * 0.55, Math.round(0.35 * p.atr_bps), Math.round(0.75 * p.atr_bps)));
-                        const tpS=Math.round(clamp(p.atr_bps * 1.00, Math.round(0.70 * p.atr_bps), Math.round(1.40 * p.atr_bps)));
-                        const simS = pathEVHeavy({ entry:mid, tp_bps:tpS, sl_bps:slS, side:"short", retSeries:yR, mu:mu5, sigma:sig5, steps:stepsBase, N:192, cost_bps:costShort, t_df:Number(process.env.T_SIM_DF||"5"), boot_block:Number(process.env.BOOT_BLOCK||"3") });
-                        const evShortLCB = Math.round(pShort_lcb*tpS - (1-pShort_lcb)*slS - costShort);
-                        candShort = { side:"short", p_lcb:+pShort_lcb.toFixed(3), p_raw:+pShort.toFixed(3), cost_bps:costShort, tp_bps:tpS, sl_bps:slS, exp_lcb_bps:evShortLCB, exp_bps:simS.ev_bps, hold_sec:hold_base, style:"trend", regime };
-                      }
-
-                      let chosen = candLong && candShort ? (candLong.exp_lcb_bps >= candShort.exp_lcb_bps ? candLong : candShort) : (candLong || candShort || null);
-                      if (!chosen) continue;
-
-                      const liq = liqPct.get(p.c.symbol) || 0.5;
-                      const score = clamp(Math.round(60 + 30*(chosen.p_lcb-0.5)*2 + 12*clamp((p.adx5-16)/14,0,1) + 7*((liq-0.5)*2) - Math.min(12, Math.max(0,(p.spreadBps-5)/2))), 1, 99);
-
-                      fbCands.push({
-                        symbol:p.c.symbol, base:p.c.base, quote:p.c.quote, qv:p.c.qv,
-                        side:chosen.side, p_lcb:+chosen.p_lcb, p_raw:+chosen.p_raw, p_win:+(Math.max(p.pLong0,p.pShort0)).toFixed(3),
-                        exp_bps:chosen.exp_bps, exp_lcb_bps:chosen.exp_lcb_bps,
-                        tp_bps:chosen.tp_bps, sl_bps:chosen.sl_bps, rrr:+(chosen.tp_bps/Math.max(1,chosen.sl_bps)).toFixed(2),
-                        spread_bps:p.spreadBps, cost_bps:chosen.cost_bps,
-                        adx:+(p.adx5||0).toFixed(1), atr_bps:p.atr_bps, regime:chosen.regime, style:chosen.style,
-                        score, n_conf:Math.round(60+40*clamp((p.adx5-16)/14,0,1)), obi:0,
-                        hold_sec:chosen.hold_sec, liq_pct:+(liq).toFixed(3),
-                        ret5:(()=>{ const r=[]; for(let i=1;i<p.c5.length;i++) r.push(Math.log(p.c5[i]/p.c5[i-1])); return r.slice(-36); })(),
-                        fill_prob:0.7, dyn_floor:EXP_LCB_MIN_THIS,
-                        rsi14:p.rsi14, z_vwap:p.z_vwap,
-                        vol1h_est_usd:p.vol1h_est_usd, depth1p_usd:0,
-                        direction_env:DIRECTION, side_bias:p.trendBias,
-                        swing_lo_px:(function swingLo(){ const lows=p.k15?.map(x=>+x[3])||[]; if(lows.length<40) return null; return Math.min(...lows.slice(-40)); })(),
-                        entry_book: { bid: book.bid, ask: book.ask },
-                        slip_bps_long: Math.max(Math.round(p.spreadBps/2),0), slip_bps_short: Math.max(Math.round(p.spreadBps/2),0),
-                        spread_bps_entry: p.spreadBps
-                      });
-                    } catch {}
-                  }
-                  fbCands.sort((a,b)=> b.exp_lcb_bps!==a.exp_lcb_bps ? b.exp_lcb_bps-a.exp_lcb_bps
-                                         : b.exp_bps!==a.exp_bps ? b.exp_bps-a.exp_bps
-                                         : b.score!==a.score ? b.score-a.score
-                                         : (b.qv||0)-(a.qv||0));
-                  tryAdd(fbCands);
-                }
-                selected = fallback.slice(0, fallbackTarget);
-                selectionTier = (refined.length > 0) ? "refined_top3" : "forced_fallback_top3";
-              } else {
-                selected = selected.slice(0, fallbackTarget);
-                selectionTier = "strict";
+                reason=(reason!=="ok"?reason:"strict0_force3_spec");
               }
 
-              snapCounts({ selected: selected.length });
-
-              // Build picks with enriched pending fields
-              const wEv=softmax(selected.slice(0,fallbackTarget).map(x=>x.exp_lcb_bps),20);
-              let picks = selected.slice(0,fallbackTarget).map((x,i)=>{
-                const bk=bookMap.get(x.symbol); const mid=(bk?.bid && bk?.ask)? ((+bk.bid + +bk.ask)/2) : null;
-                const slF=x.sl_bps/10000, tpF=x.tp_bps/10000;
-                let entry_limit=null, tp_abs=null, sl_abs=null, entry_policy="limit_at_old_sl";
-                if(mid!=null){
-                  if(x.side==="long"){
-                    const refLow = x.swing_lo_px || null;
-                    const baseline = mid*(1 - Math.max(0.001, slF*0.5));
-                    const refBased = refLow? refLow*(1 + LONG_ENTRY_BOUNCE_OFFSET): baseline;
-                    entry_limit = Math.max(refBased, baseline);
-                    tp_abs = entry_limit*(1 + tpF);
-                    sl_abs = entry_limit*(1 - slF);
-                    entry_policy="smart_swing_limit";
-                  }else{
-                    entry_limit = mid*(1 + slF);
-                    tp_abs = entry_limit*(1 - tpF);
-                    sl_abs = entry_limit*(1 + slF);
-                  }
+              // Top-up to K when rank-fill enabled and we have remaining refined
+              if (NO_VIABLE_RANK_FILL && selected.length < TARGET_K && refined.length > 0){
+                const have = new Set(selected.map(s=>s.symbol));
+                const add=[];
+                for (const c of refined){
+                  if (add.length + selected.length >= TARGET_K) break;
+                  if (have.has(c.symbol)) continue;
+                  add.push({ ...c, mp_fill:true });
                 }
-                const ttl=clamp(Math.round((x.hold_sec||720)+i*12), TTL_MIN, TTL_MAX);
-
-                let size_bps=0;
-                if(Number(process.env.FORCE_SIZE_BPS||"0")>0) size_bps=Math.round(Number(process.env.FORCE_SIZE_BPS));
-                else{
-                  const base = x.sl_bps>0? Math.min(220, Math.round((wEv[i]*TARGET_PORT_RISK_BPS/x.sl_bps)*100)) : 0;
-                  size_bps = Math.round(base * ((x.style==="momentum")? clamp(MOMENTUM_SIZE_FACTOR,0.25,0.6):1.0));
+                if (add.length){
+                  selected = selected.concat(add);
+                  if (selectionTier === "strict") selectionTier = "strict_topup";
+                  else if (selectionTier === "mp_force3_viable12") selectionTier = "mp_force3_viable12_topup";
                 }
-                if(x.mp_fill) size_bps = Math.max(8, Math.round(size_bps * (x.always3? ALWAYS3_SIZE_FACTOR : 0.55)));
+              }
 
-                try{
-                  const last200=(state.closed||[]).slice(-200);
-                  const longs=last200.filter(r=>r.side==="long"); const n=longs.length, wins=longs.filter(r=>(r.pnl_bps||0)>0).length, pnlSum=sum(longs.map(r=>r.pnl_bps||0));
-                  const wr = n>0? wins/n : 1; const killActive=(n>=LONG_KILL_MIN_TRADES)&&((wr<LONG_KILL_WINRATE)|| (pnlSum<0));
-                  if(killActive && x.side==="long") size_bps=Math.max(4, Math.round(size_bps*LONG_KILL_SIZE_MULT));
-                }catch{}
+              snapCounts({ selected: (selected?.length||0) });
+              console.log("[gha] selection", { tier: selectionTier, selected: (selected||[]).length, viable: refined.filter(c => (c.exp_lcb_bps ?? -1e9) > 0).length });
 
-                const exec_policy = { exec:"maker_or_strict_limit", max_slip_bps:3, prefer_post_only: (x.spread_bps||99)<=6 && (x.depth1p_usd||0)>=DEPTH_1P_MIN_USD };
+              // Build picks (limit_at_old_sl) + micro-size forced negatives
+              const wEv=softmax(selected.map(x=> (x.exp_lcb_bps)), 20);
+              let picks = selected.map((x,i)=>{
+                const sideUsed = x.side, tpUsed = x.tp_bps, slUsed = x.sl_bps;
+                const bk = bookMap.get(x.symbol);
+                const mid = (bk?.bid && bk?.ask) ? ((+bk.bid + +bk.ask)/2) : null;
 
-                const r = x.rsi14 ?? 50, z = x.z_vwap ?? 0;
-                const gp_feat=[ clamp((x.adx-16)/14,0,1), clamp(x.side==="long"? z : -z, -3,3), x.side==="long"? (r/100) : ((100-r)/100), 0.0, 0.0 ];
-                const calib_key=`${x.side}_${String(x.regime).includes("mean")?"mr":"trend"}`;
-                const calInfo = calibratorInfo(state, x.side, x.regime);
+                const slF = slUsed/10000, tpF = tpUsed/10000;
+                const entry_limit = mid==null ? null : (sideUsed==="long" ? mid*(1 - slF) : mid*(1 + slF));
+                const tp_abs = entry_limit==null ? null : (sideUsed==="long" ? entry_limit*(1 + tpF) : entry_limit*(1 - tpF));
+                const sl_abs = entry_limit==null ? null : (sideUsed==="long" ? entry_limit*(1 - slF) : entry_limit*(1 + slF));
 
-                const entry_book = x.entry_book || { bid: bk?.bid||null, ask: bk?.ask||null };
-                const spread_bps_entry = x.spread_bps_entry ?? (bk?.bid&&bk?.ask ? Math.round(((bk.ask-bk.bid)/((bk.ask+bk.bid)/2))*10000) : null);
-                const slip_bps_entry = x.side==="long" ? (x.slip_bps_long??null) : (x.slip_bps_short??null);
-                const depth1p_entry_usd = x.depth1p_usd ?? null;
+                const ttl = clamp(Math.round((x.hold_sec||720) + i*12), TTL_MIN, TTL_MAX);
 
-                const entry_ts_ms = Date.now();
-                const ttl_ts_ms = entry_ts_ms + ttl*1000;
-                const trade_id = `${x.symbol}:${entry_ts_ms}`;
+                let size_bps = 0;
+                if(Number(process.env.FORCE_SIZE_BPS||"0")>0){
+                  size_bps = Math.round(Number(process.env.FORCE_SIZE_BPS));
+                } else {
+                  size_bps = slUsed>0 ? Math.min(220, Math.round((wEv[i]*TARGET_PORT_RISK_BPS/slUsed)*100)) : 0;
+                }
+                if (x.mp_fill) size_bps = Math.max(8, Math.round(size_bps * 0.4));
 
-                return { symbol:x.base, symbol_full:x.symbol, quote:x.quote,
-                  side:x.side, rank:i+1, ttl_sec:ttl, p_win:x.p_win, p_lcb:x.p_lcb, p_raw:x.p_raw, calib_key,
-                  tp_bps:x.tp_bps, sl_bps:x.sl_bps, rrr:+(x.tp_bps/Math.max(1,x.sl_bps)).toFixed(2),
-                  exp_lcb_bps:x.exp_lcb_bps, ev_bps:x.exp_bps,
-                  spread_bps:x.spread_bps, cost_bps:x.cost_bps, adx:x.adx, atr_bps:x.atr_bps, n_conf:x.n_conf, obi:x.obi||0,
-                  regime:x.regime, style:x.style, liq_pct:x.liq_pct, fill_prob:x.fill_prob||0.5,
-                  entry_policy, entry_type:"limit", activation:"on_fill", entry_mid:mid, entry_limit, tp_abs, sl_abs,
-                  size_bps, tier:selectionTier, mp_fill:!!x.mp_fill, always3:!!x.always3,
-                  gp_feat, ret5:x.ret5, direction_env:x.direction_env, side_bias:x.side_bias,
-                  vol1h_est_usd:x.vol1h_est_usd, depth1p_usd:x.depth1p_usd||0, exec:exec_policy,
-                  mgmt:{ be_at_r:0.6, partial_take_at_r:0.7, partial_take_pct:0.4, trail_atr_mult:0.5 },
-                  // enriched pending/provenance
-                  trade_id, entry_ts_ms, ttl_ts_ms,
-                  entry_book, spread_bps_entry, slip_bps_entry, depth1p_entry_usd, obi_entry:x.obi||0,
-                  notional_usd: NOTIONAL, size_bps,
-                  run_id: run_prov.run_id, code_commit_sha: run_prov.code_commit_sha, pusher_version,
-                  config_hash, exchange_base: BASE, mexc_server_time_ms: mexcTime.mexc_server_time_ms, mexc_time_offset_ms: mexcTime.mexc_time_offset_ms,
-                  p_model: run_prov.p_model, calib_type: calInfo.type, calib_n: calInfo.n,
-                  events: [{ ts_ms: entry_ts_ms, type:"selected", meta:{ tier: selectionTier, score: x.score } }]
+                // GP training features: side-consistent and matching inference orientation
+                const r = x.rsi14 ?? 50;
+                const z = x.z_vwap ?? 0;
+                const gp_feat = [
+                  clamp((x.adx - 16) / 14, 0, 1),
+                  clamp(sideUsed === "long" ? z : -z, -3, 3),
+                  sideUsed === "long" ? (r/100) : ((100 - r)/100),
+                  Math.max(0, sideUsed === "long" ? -x.obi : +x.obi)
+                ];
+
+                return {
+                  symbol: x.base, symbol_full: x.symbol, quote: x.quote,
+                  side: sideUsed, rank:i+1, ttl_sec: ttl,
+                  p_win:x.p_win, p_lcb: x.p_lcb,
+                  tp_bps: tpUsed, sl_bps: slUsed, rrr: +(tpUsed/Math.max(1,slUsed)).toFixed(2),
+                  exp_lcb_bps: x.exp_lcb_bps,
+                  ev_bps: x.exp_bps,
+                  spread_bps:x.spread_bps, cost_bps:x.cost_bps,
+                  adx:x.adx, atr_bps:x.atr_bps, n_conf:x.n_conf, obi:x.obi,
+                  regime:x.regime, style:x.style,
+                  liq_pct:x.liq_pct, fill_prob:x.fill_prob,
+                  entry_policy:"limit_at_old_sl", entry_type:"limit", activation:"on_fill",
+                  entry_mid: mid, entry_limit, tp_abs, sl_abs,
+                  size_bps, tier: selectionTier,
+                  mp_fill: !!x.mp_fill,
+                  gp_feat,
+                  ret5: x.ret5
                 };
               });
 
-              // t‑copula VaR/ES throttle
+              // Portfolio VaR/ES gate: scale sizes if tail risk too high
               try{
-                const varStats=portfolioVaR_ES_tCopula(picks, Number(process.env.T_VA_DF||"6"));
-                const ES_LIMIT=-220;
+                const varStats = portfolioVaR_ES(picks);
+                const ES_LIMIT = -220;
                 if(varStats.ES95_bps < ES_LIMIT){
-                  const scale=clamp(ES_LIMIT/Math.min(-1e-6, varStats.ES95_bps), 0.35,1);
-                  picks=picks.map(p=>({...p, size_bps: Math.round(p.size_bps*scale)}));
-                  console.log("[gha] VaR/ES throttle (t-copula)", varStats, "scale", scale);
-                } else console.log("[gha] VaR/ES ok", varStats);
-              }catch(e){ console.log("[gha] VaR/ES warn", e?.message||e); }
+                  const scale = clamp(ES_LIMIT/Math.min(-1e-6, varStats.ES95_bps), 0.35, 1);
+                  picks = picks.map(p=> ({ ...p, size_bps: Math.round(p.size_bps*scale) }));
+                  log("VaR/ES throttle", varStats, "scale", scale);
+                }else{ log("VaR/ES ok", varStats); }
+              }catch(e){ log("VaR/ES warn", e?.message||e); }
 
-              // Save cooldown + pending + push log
+              // Save cooldown + pending
               try{
                 const nowMs=Date.now(); const ideasTs=new Date(nowMs).toISOString();
                 for(const p of picks){
                   const bk=bookMap.get(p.symbol_full); const mid=bk? (bk.bid+bk.ask)/2 : 0;
-                  const entry_mid=p.entry_mid ?? mid;
-                  const entry_new=p.entry_limit ?? (p.side==="long" ? entry_mid*(1 - p.sl_bps/10000) : entry_mid*(1 + p.sl_bps/10000));
-                  const tp_abs=p.tp_abs ?? (p.side==="long" ? entry_new*(1 + p.tp_bps/10000) : entry_new*(1 - p.tp_bps/10000));
-                  const sl_abs=p.sl_abs ?? (p.side==="long" ? entry_new*(1 - p.sl_bps/10000) : entry_new*(1 + p.sl_bps/10000));
-                  state.cooldown[p.symbol]=nowMs; state.cooldown_side[p.symbol]={ side:p.side, ts_ms:nowMs };
+                  const entry_mid = p.entry_mid ?? mid;
+                  const entry_new = p.entry_limit ?? (p.side==="long" ? entry_mid*(1 - p.sl_bps/10000) : entry_mid*(1 + p.sl_bps/10000));
+                  const tp_abs = p.tp_abs ?? (p.side==="long" ? entry_new*(1 + p.tp_bps/10000) : entry_new*(1 - p.tp_bps/10000));
+                  const sl_abs = p.sl_abs ?? (p.side==="long" ? entry_new*(1 - p.sl_bps/10000) : entry_new*(1 + p.sl_bps/10000));
+                  state.cooldown[p.symbol]=nowMs;
+                  state.cooldown_side[p.symbol]={ side:p.side, ts_ms:nowMs };
                   state.pending.push({
                     ts:ideasTs, ts_ms:nowMs, symbolFull:p.symbol_full, base:p.symbol, quote:p.quote, side:p.side,
-                    entry_policy:p.entry_policy, entry_mid, entry_price:entry_new, entry_limit:entry_new, tp_abs, sl_abs, hold_sec:p.ttl_sec,
-                    tp_bps:p.tp_bps, sl_bps:p.sl_bps, regime:p.regime, cost_bps:p.cost_bps, gp_feat:p.gp_feat, tier:p.tier, mp_fill:!!p.mp_fill, always3:!!p.always3,
-                    p_lcb:p.p_lcb, p_raw:p.p_raw, p_win0:p.p_win, exp_lcb_bps:p.exp_lcb_bps, style_final:p.style, direction_env:p.direction_env, calib_key:p.calib_key,
-                    // enriched
-                    trade_id: p.trade_id, entry_ts_ms: p.entry_ts_ms, ttl_ts_ms: p.ttl_ts_ms,
-                    entry_book: p.entry_book, spread_bps_entry: p.spread_bps_entry, slip_bps_entry: p.slip_bps_entry,
-                    depth1p_entry_usd: p.depth1p_entry_usd, obi_entry: p.obi_entry,
-                    notional_usd: p.notional_usd, size_bps: p.size_bps,
-                    run_id: p.run_id, code_commit_sha: p.code_commit_sha, pusher_version: p.pusher_version,
-                    config_hash: p.config_hash, exchange_base: p.exchange_base,
-                    mexc_server_time_ms: p.mexc_server_time_ms, mexc_time_offset_ms: p.mexc_time_offset_ms,
-                    p_model: p.p_model, calib_type: p.calib_type, calib_n: p.calib_n,
-                    events: p.events
+                    entry_policy:"limit_at_old_sl", entry_mid, entry_price:entry_new, entry_limit:entry_new,
+                    tp_abs, sl_abs, hold_sec:p.ttl_sec, tp_bps:p.tp_bps, sl_bps:p.sl_bps, regime:p.regime, cost_bps:p.cost_bps,
+                    gp_feat: p.gp_feat
                   });
                 }
                 if(state.pending.length>550) state.pending=state.pending.slice(-550);
-                try{
-                  state.push_log=Array.isArray(state.push_log)? state.push_log : [];
-                  state.push_log.push({ ts:new Date().toISOString(), tier:selectionTier, direction_env:DIRECTION, top_n:picks.length,
-                    counts:{ strict:picks.filter(p=>!p.mp_fill).length, always3:picks.filter(p=>p.always3).length },
-                    regime_post:weightsReg, bandit_choice:banditChoice, force_top_n: (selectionTier!=="strict"),
-                    symbols:picks.map(p=>({ symbol:p.symbol_full, side:p.side, style:p.style, tier:p.tier, always3:!!p.always3 })) });
-                  if(state.push_log.length>300) state.push_log=state.push_log.slice(-300);
-                }catch(e){ console.log("[gha] push_log warn", e?.message||e); }
-                fitCalibrators(state); updateMetricsAndDrift(state);
                 state.last_ts=new Date().toISOString();
                 await saveState(persist,state);
-              }catch(e){ console.log("[gha] state save warn", e?.message||e); }
+              }catch(e){ log("state save warn", e?.message||e); }
 
               // POST
               const meta={
                 exchange:"mexc", exchange_base:BASE,
-                counts:{ universe:universe.length, refined:refined.length, selected:picks.length },
+                counts:{ universe:universe.length, pre:picksRaw.length, pre_any:picksAny.length, refined:refined.length, selected:picks.length },
                 filters:{
                   dyn_min_qv:dynMinQV, univ_target_min:UNIV_TARGET_MIN, univ_target_max:UNIV_TARGET_MAX,
+                  score_cutoff:50, refine_topk:UNIV_TARGET_MAX,
                   max_spread_bps:MAX_SPREAD_BPS, ema_fast:EMA_FAST, ema_slow:EMA_SLOW, adx_p:ADX_P, atr_p:ATR_P, vwap_5m_win:VWAP_5M_WIN,
                   depth_limit:DEPTH_LIMIT, obi_topn:OBI_TOPN,
-                  cooldown_min:COOLDOWN_MS/60000, flip_guard_min:FLIP_GUARD_MS/60000,
+                  cooldown_min: COOLDOWN_MS/60000, flip_guard_min: FLIP_GUARD_MS/60000,
                   fees_bps:COST_BPS, notional_usd:NOTIONAL,
-                  exp_lcb_min_bps:EXP_LCB_MIN_THIS, wilson_z:WILSON_Z,
-                  calibrated:true, gp_cls:true, isotonic:true, platt:true,
-                  heavy_tail_sim:true, t_copula_var_es:true,
-                  mp_top_pool:MP_TOP_POOL, always3:ALWAYS3_ENABLE, rank_fill: (selectionTier!=="strict")
+                  exp_lcb_min_bps:EXP_LCB_MIN_BPS, wilson_z:WILSON_Z,
+                  entry_policy: "limit_at_old_sl",
+                  stochastic: { hmm:true, gp:true, sde_mc:true, var_es:true, kalman:true },
+                  strict0_force3_spec: true,
+                  strict0_rank_fill_when_no_viable: NO_VIABLE_RANK_FILL
                 },
-                dd_gate:(()=>{ const s=state.equity||[]; const day=Date.now()-24*3600*1000; let pnl24=0,cum=0,peak=0,dd=0; for(const e of s){ if(e.ts_ms>=day) pnl24+=e.pnl_bps; cum+=e.pnl_bps; if(cum>peak) peak=cum; dd=Math.min(dd,cum-peak); } return { pnl24_bps:Math.round(pnl24), peak_dd_bps:Math.round(dd), throttle }; })(),
-                tod:{ active:S_H!=null&&E_H!=null, start:S_H, end:E_H },
-                tier:selectionTier, regime_post:weightsReg, direction_env:DIRECTION, bandit_choice:banditChoice, metrics:state.metrics||{},
-                schema_version:"1.2.0", run: run_prov
+                dd_gate: (function(){ const s=state.equity||[]; const day=Date.now()-24*3600*1000; let pnl24=0,cum=0,peak=0,dd=0; for(const e of s){ if(e.ts_ms>=day) pnl24+=e.pnl_bps; cum+=e.pnl_bps; if(cum>peak) peak=cum; dd=Math.min(dd,cum-peak); } return { pnl24_bps:Math.round(pnl24), peak_dd_bps:Math.round(dd), throttle }; })(),
+                tod: { active: S_H!=null && E_H!=null, start:S_H, end:E_H },
+                tier: selectionTier,
+                regime_post: weights
               };
               const payload={ ts:new Date().toISOString(), mode:"normal", source:"external_pusher", meta:{ origin:"github_actions", reason, ...meta }, top_n:picks.length||0, ideas:picks||[] };
+
               console.log(`[gha] pushing ${picks.length} ideas (${selectionTier}) to ${PUSH_URL}`);
               try{
                 const r=await fetchWithTimeout(PUSH_URL,{ method:"POST", headers:{ "Content-Type":"application/json","Authorization":`Bearer ${PUSH_TOKEN}` }, body: JSON.stringify(payload) },15000);
-                let txt=""; try{ txt=await r.text(); }catch{} console.log("[gha] push status", r?.status||"ERR", (txt||"").slice(0,400));
-              }catch(e){ console.log("[gha] push failed", e?.message||e); }
+                let txt=""; try{ txt=await r.text(); }catch{}
+                console.log(`[gha] push status ${r?.status||"ERR"} ${(txt||"").slice(0,400)}`);
+              }catch(e){
+                console.log(`[gha] push failed ${e?.message||e}`);
+              }
 
             }catch(e){
-              reason=reason!=="ok"?reason:"data_error";
-              const countsSnap=(()=>{ try{ return JSON.parse(require('fs').readFileSync('/tmp/pusher_counts.json','utf8')||'{}'); }catch{return {}} })();
-              const payload={ ts:new Date().toISOString(), mode:"normal", source:"external_pusher", meta:{ origin:"github_actions", reason, error:(e?.message||String(e)).slice(0,220), counts:countsSnap }, top_n:0, ideas:[] };
-              console.log("[gha] pushing 0 ideas to", process.env.WORKER_PUSH_URL||"");
+              reason = reason!=="ok"?reason:"data_error";
+              const countsSnap = (()=>{ try{ return JSON.parse(require('fs').readFileSync('/tmp/pusher_counts.json','utf8')||'{}'); }catch{return {}} })();
+              console.error("[gha] fatal error", e?.stack || e);
+              console.log("[gha] counts at error", countsSnap);
+              const payload={ ts:new Date().toISOString(), mode:"normal", source:"external_pusher",
+                meta:{ origin:"github_actions", reason, error:(e?.message||String(e)).slice(0,220), counts: countsSnap }, top_n:0, ideas:[] };
+              console.log(`[gha] pushing 0 ideas to ${PUSH_URL}`);
               try{
-                const r=await fetchWithTimeout(process.env.WORKER_PUSH_URL,{ method:"POST", headers:{ "Content-Type":"application/json","Authorization":`Bearer ${process.env.PUSH_TOKEN||""}` }, body: JSON.stringify(payload) },15000);
-                let txt=""; try{ txt=await r.text(); }catch{} console.log("[gha] push status", r?.status||"ERR", (txt||"").slice(0,200));
-              }catch(e2){ console.log("[gha] push failed", e2?.message||e2); }
+                const r=await fetchWithTimeout(PUSH_URL,{ method:"POST", headers:{ "Content-Type":"application/json","Authorization":`Bearer ${PUSH_TOKEN}` }, body: JSON.stringify(payload) },15000);
+                let txt=""; try{ txt=await r.text(); }catch{}
+                console.log(`[gha] push status ${r?.status||"ERR"} ${(txt||"").slice(0,200)}`);
+              }catch(e2){
+                console.log(`[gha] push failed ${e2?.message||e2}`);
+              }
             }
           })();
           NODE
