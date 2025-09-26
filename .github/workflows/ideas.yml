@@ -3,7 +3,7 @@ name: Ideas Pusher (MEXC ULTIMATE EV@Pusher+, PRIME v6.2 Calibrated HeavyTail MP
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/25 * * * *"
+    - cron: "*/30 * * * *"
 
 permissions:
   contents: read
@@ -410,7 +410,7 @@ jobs:
             const DYN_QV_STEP=5_000_000;
 
             // Core knobs
-            const TOP_N = Number(process.env.TOP_N ?? "3");
+            const TOP_N = Number(process.env.TOP_N||"3");
             const MAX_SPREAD_BPS = Number(process.env.MAX_SPREAD_BPS||"12");
             const EXP_LCB_MIN_BPS_BASE = Number(process.env.EXP_LCB_MIN_BPS||"12");
 
@@ -590,7 +590,7 @@ jobs:
 
                 const tpB=(p.tp_bps||0)/10000, slB=(p.sl_bps||0)/10000;
                 const tp_abs = Number.isFinite(p.tp_abs) ? p.tp_abs : (long ? entry*(1+tpB) : entry*(1-tpB));
-                const sl_abs = Number.isFinite(p.sl_abs) ? p.sl_abs : (long ? entry*(1-slB) : (entry*(1+slB)));
+                const sl_abs = Number.isFinite(p.sl_abs) ? p.sl_abs : (long ? entry*(1-slB) : entry*(1+slB));
 
                 let filled=false, iFill=-1, exit_reason=null, exit_source=null, price_source="sim", bar_ref=null, exit_px=null, exit_ts_ms=null, hit_ambiguous=false;
 
@@ -833,7 +833,7 @@ jobs:
                     const k5=await fetchK(c.symbol,"5m",K5M); if(!k5||k5.length<Math.max(EMA_SLOW+200,ATR_P+50)){ pfStats.dropped.k5++; return null; }
                     const k15=await fetchK(c.symbol,"15m",K15M); const k1h=await fetchK(c.symbol,"1h",K1H);
 
-                    const c5_raw=k5.map(x=>+x[4]); const c5=kalman1D(c5_raw,{ q: 1e-4, r: 5e-4, x0: c5_raw[0], p0: 1e-2 });
+                    const c5_raw=k5.map(x=>+x[4]); const c5=kalman1D(c5_raw,{q:1e-4,r:5e-4,x0:c5_raw[0],p0:1e-2});
                     const h5=k5.map(x=>+x[2]), l5=k5.map(x=>+x[3]), v5=k5.map(x=>+x[5]);
                     const em21=emaSeries(c5,EMA_FAST), em50s=emaSeries(c5,EMA_SLOW), em200s=emaSeries(c5,200);
                     const em50=em50s?.at(-1), em200=em200s?.at(-1), em50Prev=em50s?.at(-51);
@@ -1069,7 +1069,7 @@ jobs:
                 else { if(cand.cost_bps>Math.max(COST_BPS+8,18)) return false; }
                 return true;
               };
-              const TARGET_K = Math.min(3, Math.max(0, TOP_N));
+              const TARGET_K=Math.min(3, TOP_N||3);
               let selected=[];
               for(const cand of refined){
                 if(selected.length>=TARGET_K) break; if(!strictOk(cand)) continue;
@@ -1077,120 +1077,114 @@ jobs:
                 if(ok) selected.push(cand);
               }
 
-              // Updated selection policy with fallback (gated by ALWAYS3_ENABLE or NO_VIABLE_RANK_FILL)
+              // Updated selection policy with fallback
               const strictCount = selected.length;
               const fallbackTarget = Math.min(TARGET_K, universe.length);
-              const FALLBACK_ALLOWED = ALWAYS3_ENABLE || NO_VIABLE_RANK_FILL;
 
               if (strictCount === 0) {
-                if (!FALLBACK_ALLOWED) {
-                  selected = [];
-                  selectionTier = "strict_none";
-                } else {
-                  let fallback = [];
-                  const have = new Set();
-                  const tryAdd = (candList) => {
-                    for (const cand of candList) {
-                      if (fallback.length >= fallbackTarget) break;
-                      if (have.has(cand.symbol)) continue;
-                      let ok = true;
-                      for (const s of fallback) {
-                        const r = corr(cand.ret5 || [], s.ret5 || []);
-                        if (cand.side === "long" && s.side === "long" && r > LONG_SIMILARITY_RHO) { ok = false; break; }
-                        if (r > 0.90) { ok = false; break; }
-                      }
-                      if (!ok) continue;
-                      fallback.push({ ...cand, mp_fill: true, always3: ALWAYS3_ENABLE });
-                      have.add(cand.symbol);
+                let fallback = [];
+                const have = new Set();
+                const tryAdd = (candList) => {
+                  for (const cand of candList) {
+                    if (fallback.length >= fallbackTarget) break;
+                    if (have.has(cand.symbol)) continue;
+                    let ok = true;
+                    for (const s of fallback) {
+                      const r = corr(cand.ret5 || [], s.ret5 || []);
+                      if (cand.side === "long" && s.side === "long" && r > LONG_SIMILARITY_RHO) { ok = false; break; }
+                      if (r > 0.90) { ok = false; break; }
                     }
-                  };
-                  if (refined.length > 0) {
-                    tryAdd(refined);
+                    if (!ok) continue;
+                    fallback.push({ ...cand, mp_fill: true, always3: true });
+                    have.add(cand.symbol);
                   }
-                  if (fallback.length < fallbackTarget) {
-                    const fbCands = [];
-                    for (const p of picksRaw) {
-                      try {
-                        const book = bookMap.get(p.c.symbol);
-                        if (!book?.bid || !book?.ask) continue;
-                        const mid = (book.bid + book.ask) / 2;
-                        const yR = []; for (let i = 1; i < p.c5.length; i++) yR.push(Math.log(p.c5[i] / p.c5[i-1]));
-                        const mu5 = mean(yR) || 0, sig5 = Math.max(1e-4, std(yR));
-                        const hold_base = clamp(Math.round((weightsReg.wTrend > weightsReg.wMR ? 720 : 560) + 240 * clamp((p.adx5 - 16)/14, 0, 1)), TTL_MIN, TTL_MAX);
-                        const stepsBase = Math.max(1, Math.round(hold_base/300));
-                        const slipL = Math.max(Math.round(p.spreadBps/2), 0);
-                        const slipS = Math.max(Math.round(p.spreadBps/2), 0);
-                        const costLong = COST_BPS + slipL;
-                        const costShort = COST_BPS + slipS;
-                        if (Math.max(costLong, costShort) > MAX_COST_BPS_HARD) continue;
-
-                        const featL = [ clamp((p.adx5 - 16)/14,0,1), clamp(p.z_vwap,-3,3), (p.rsi14||50)/100, 0.0, clamp(p.slope_atr50,0,1) ];
-                        const featS = [ clamp((p.adx5 - 16)/14,0,1), clamp(-p.z_vwap,-3,3),(100-(p.rsi14||50))/100, 0.0, clamp(p.slope_atr50,0,1) ];
-                        let pLong_raw = p.pLong0, pShort_raw = p.pShort0;
-                        if (gpClfLong) pLong_raw = predictGPClass(gpClfLong, featL).p;
-                        if (gpClfShort) pShort_raw = predictGPClass(gpClfShort, featS).p;
-
-                        const strongTrend = (p.adx5 > Math.max(22, MR_ADX_MAX)) || (p.slope_atr50 > MR_SLOPE_MAX_ATR50);
-                        const regime = p.mrLocked ? "trend" : (strongTrend ? "trend" : "meanrevert");
-
-                        const pLong = calibrateP(state,"long",regime,pLong_raw);
-                        const pShort = calibrateP(state,"short",regime,pShort_raw);
-
-                        const pLong_lcb = wilsonLCB(pLong, 80, WILSON_Z);
-                        const pShort_lcb = wilsonLCB(pShort, 80, WILSON_Z);
-
-                        let candLong = null;
-                        { const slL=Math.round(clamp(p.atr_bps * 0.50, Math.round(0.35 * p.atr_bps), Math.round(0.65 * p.atr_bps)));
-                          const tpL=Math.round(clamp(p.atr_bps * 0.95, Math.round(0.60 * p.atr_bps), Math.round(1.20 * p.atr_bps)));
-                          const simL = pathEVHeavy({ entry:mid, tp_bps:tpL, sl_bps:slL, side:"long", retSeries:yR, mu:mu5, sigma:sig5, steps:stepsBase, N:192, cost_bps:costLong, t_df:Number(process.env.T_SIM_DF||"5"), boot_block:Number(process.env.BOOT_BLOCK||"3") });
-                          const evLongLCB = Math.round(pLong_lcb*tpL - (1-pLong_lcb)*slL - costLong);
-                          candLong = { side:"long", p_lcb:+pLong_lcb.toFixed(3), p_raw:+pLong.toFixed(3), cost_bps:costLong, tp_bps:tpL, sl_bps:slL, exp_lcb_bps:evLongLCB, exp_bps:simL.ev_bps, hold_sec:hold_base, style:"trend", regime };
-                        }
-
-                        let candShort = null;
-                        { const slS=Math.round(clamp(p.atr_bps * 0.55, Math.round(0.35 * p.atr_bps), Math.round(0.75 * p.atr_bps)));
-                          const tpS=Math.round(clamp(p.atr_bps * 1.00, Math.round(0.70 * p.atr_bps), Math.round(1.40 * p.atr_bps)));
-                          const simS = pathEVHeavy({ entry:mid, tp_bps:tpS, sl_bps:slS, side:"short", retSeries:yR, mu:mu5, sigma:sig5, steps:stepsBase, N:192, cost_bps:costShort, t_df:Number(process.env.T_SIM_DF||"5"), boot_block:Number(process.env.BOOT_BLOCK||"3") });
-                          const evShortLCB = Math.round(pShort_lcb*tpS - (1-pShort_lcb)*slS - costShort);
-                          candShort = { side:"short", p_lcb:+pShort_lcb.toFixed(3), p_raw:+pShort.toFixed(3), cost_bps:costShort, tp_bps:tpS, sl_bps:slS, exp_lcb_bps:evShortLCB, exp_bps:simS.ev_bps, hold_sec:hold_base, style:"trend", regime };
-                        }
-
-                        let chosen = candLong && candShort ? (candLong.exp_lcb_bps >= candShort.exp_lcb_bps ? candLong : candShort) : (candLong || candShort || null);
-                        if (!chosen) continue;
-
-                        const liq = liqPct.get(p.c.symbol) || 0.5;
-                        const score = clamp(Math.round(60 + 30*(chosen.p_lcb-0.5)*2 + 12*clamp((p.adx5-16)/14,0,1) + 7*((liq-0.5)*2) - Math.min(12, Math.max(0,(p.spreadBps-5)/2))), 1, 99);
-
-                        fbCands.push({
-                          symbol:p.c.symbol, base:p.c.base, quote:p.c.quote, qv:p.c.qv,
-                          side:chosen.side, p_lcb:+chosen.p_lcb, p_raw:+chosen.p_raw, p_win:+(Math.max(p.pLong0,p.pShort0)).toFixed(3),
-                          exp_bps:chosen.exp_bps, exp_lcb_bps:chosen.exp_lcb_bps,
-                          tp_bps:chosen.tp_bps, sl_bps:chosen.sl_bps, rrr:+(chosen.tp_bps/Math.max(1,chosen.sl_bps)).toFixed(2),
-                          spread_bps:p.spreadBps, cost_bps:chosen.cost_bps,
-                          adx:+(p.adx5||0).toFixed(1), atr_bps:p.atr_bps, regime:chosen.regime, style:chosen.style,
-                          score, n_conf:Math.round(60+40*clamp((p.adx5-16)/14,0,1)), obi:0,
-                          hold_sec:chosen.hold_sec, liq_pct:+(liq).toFixed(3),
-                          ret5:(()=>{ const r=[]; for(let i=1;i<p.c5.length;i++) r.push(Math.log(p.c5[i]/p.c5[i-1])); return r.slice(-36); })(),
-                          fill_prob:0.7, dyn_floor:EXP_LCB_MIN_THIS,
-                          rsi14:p.rsi14, z_vwap:p.z_vwap,
-                          vol1h_est_usd:p.vol1h_est_usd, depth1p_usd:0,
-                          direction_env:DIRECTION, side_bias:p.trendBias,
-                          swing_lo_px:(function swingLo(){ const lows=p.k15?.map(x=>+x[3])||[]; if(lows.length<40) return null; return Math.min(...lows.slice(-40)); })(),
-                          entry_book: { bid: book.bid, ask: book.ask },
-                          slip_bps_long: Math.max(Math.round(p.spreadBps/2),0), slip_bps_short: Math.max(Math.round(p.spreadBps/2),0),
-                          spread_bps_entry: p.spreadBps
-                        });
-                      } catch {}
-                    }
-                    fbCands.sort((a,b)=> b.exp_lcb_bps!==a.exp_lcb_bps ? b.exp_lcb_bps-a.exp_lcb_bps
-                                           : b.exp_bps!==a.exp_bps ? b.exp_bps-a.exp_bps
-                                           : b.score!==a.score ? b.score-a.score
-                                           : (b.qv||0)-(a.qv||0));
-                    tryAdd(fbCands);
-                  }
-                  selected = fallback.slice(0, fallbackTarget);
-                  selectionTier = (refined.length > 0) ? "refined_top3" : "forced_fallback_top3";
+                };
+                if (refined.length > 0) {
+                  tryAdd(refined);
                 }
+                if (fallback.length < fallbackTarget) {
+                  const fbCands = [];
+                  for (const p of picksRaw) {
+                    try {
+                      const book = bookMap.get(p.c.symbol);
+                      if (!book?.bid || !book?.ask) continue;
+                      const mid = (book.bid + book.ask) / 2;
+                      const yR = []; for (let i = 1; i < p.c5.length; i++) yR.push(Math.log(p.c5[i] / p.c5[i-1]));
+                      const mu5 = mean(yR) || 0, sig5 = Math.max(1e-4, std(yR));
+                      const hold_base = clamp(Math.round((weightsReg.wTrend > weightsReg.wMR ? 720 : 560) + 240 * clamp((p.adx5 - 16)/14, 0, 1)), TTL_MIN, TTL_MAX);
+                      const stepsBase = Math.max(1, Math.round(hold_base/300));
+                      const slipL = Math.max(Math.round(p.spreadBps/2), 0);
+                      const slipS = Math.max(Math.round(p.spreadBps/2), 0);
+                      const costLong = COST_BPS + slipL;
+                      const costShort = COST_BPS + slipS;
+                      if (Math.max(costLong, costShort) > MAX_COST_BPS_HARD) continue;
+
+                      const featL = [ clamp((p.adx5 - 16)/14,0,1), clamp(p.z_vwap,-3,3), (p.rsi14||50)/100, 0.0, clamp(p.slope_atr50,0,1) ];
+                      const featS = [ clamp((p.adx5 - 16)/14,0,1), clamp(-p.z_vwap,-3,3),(100-(p.rsi14||50))/100, 0.0, clamp(p.slope_atr50,0,1) ];
+                      let pLong_raw = p.pLong0, pShort_raw = p.pShort0;
+                      if (gpClfLong) pLong_raw = predictGPClass(gpClfLong, featL).p;
+                      if (gpClfShort) pShort_raw = predictGPClass(gpClfShort, featS).p;
+
+                      const strongTrend = (p.adx5 > Math.max(22, MR_ADX_MAX)) || (p.slope_atr50 > MR_SLOPE_MAX_ATR50);
+                      const regime = p.mrLocked ? "trend" : (strongTrend ? "trend" : "meanrevert");
+
+                      const pLong = calibrateP(state,"long",regime,pLong_raw);
+                      const pShort = calibrateP(state,"short",regime,pShort_raw);
+
+                      const pLong_lcb = wilsonLCB(pLong, 80, WILSON_Z);
+                      const pShort_lcb = wilsonLCB(pShort, 80, WILSON_Z);
+
+                      let candLong = null;
+                      { const slL=Math.round(clamp(p.atr_bps * 0.50, Math.round(0.35 * p.atr_bps), Math.round(0.65 * p.atr_bps)));
+                        const tpL=Math.round(clamp(p.atr_bps * 0.95, Math.round(0.60 * p.atr_bps), Math.round(1.20 * p.atr_bps)));
+                        const simL = pathEVHeavy({ entry:mid, tp_bps:tpL, sl_bps:slL, side:"long", retSeries:yR, mu:mu5, sigma:sig5, steps:stepsBase, N:192, cost_bps:costLong, t_df:Number(process.env.T_SIM_DF||"5"), boot_block:Number(process.env.BOOT_BLOCK||"3") });
+                        const evLongLCB = Math.round(pLong_lcb*tpL - (1-pLong_lcb)*slL - costLong);
+                        candLong = { side:"long", p_lcb:+pLong_lcb.toFixed(3), p_raw:+pLong.toFixed(3), cost_bps:costLong, tp_bps:tpL, sl_bps:slL, exp_lcb_bps:evLongLCB, exp_bps:simL.ev_bps, hold_sec:hold_base, style:"trend", regime };
+                      }
+
+                      let candShort = null;
+                      { const slS=Math.round(clamp(p.atr_bps * 0.55, Math.round(0.35 * p.atr_bps), Math.round(0.75 * p.atr_bps)));
+                        const tpS=Math.round(clamp(p.atr_bps * 1.00, Math.round(0.70 * p.atr_bps), Math.round(1.40 * p.atr_bps)));
+                        const simS = pathEVHeavy({ entry:mid, tp_bps:tpS, sl_bps:slS, side:"short", retSeries:yR, mu:mu5, sigma:sig5, steps:stepsBase, N:192, cost_bps:costShort, t_df:Number(process.env.T_SIM_DF||"5"), boot_block:Number(process.env.BOOT_BLOCK||"3") });
+                        const evShortLCB = Math.round(pShort_lcb*tpS - (1-pShort_lcb)*slS - costShort);
+                        candShort = { side:"short", p_lcb:+pShort_lcb.toFixed(3), p_raw:+pShort.toFixed(3), cost_bps:costShort, tp_bps:tpS, sl_bps:slS, exp_lcb_bps:evShortLCB, exp_bps:simS.ev_bps, hold_sec:hold_base, style:"trend", regime };
+                      }
+
+                      let chosen = candLong && candShort ? (candLong.exp_lcb_bps >= candShort.exp_lcb_bps ? candLong : candShort) : (candLong || candShort || null);
+                      if (!chosen) continue;
+
+                      const liq = liqPct.get(p.c.symbol) || 0.5;
+                      const score = clamp(Math.round(60 + 30*(chosen.p_lcb-0.5)*2 + 12*clamp((p.adx5-16)/14,0,1) + 7*((liq-0.5)*2) - Math.min(12, Math.max(0,(p.spreadBps-5)/2))), 1, 99);
+
+                      fbCands.push({
+                        symbol:p.c.symbol, base:p.c.base, quote:p.c.quote, qv:p.c.qv,
+                        side:chosen.side, p_lcb:+chosen.p_lcb, p_raw:+chosen.p_raw, p_win:+(Math.max(p.pLong0,p.pShort0)).toFixed(3),
+                        exp_bps:chosen.exp_bps, exp_lcb_bps:chosen.exp_lcb_bps,
+                        tp_bps:chosen.tp_bps, sl_bps:chosen.sl_bps, rrr:+(chosen.tp_bps/Math.max(1,chosen.sl_bps)).toFixed(2),
+                        spread_bps:p.spreadBps, cost_bps:chosen.cost_bps,
+                        adx:+(p.adx5||0).toFixed(1), atr_bps:p.atr_bps, regime:chosen.regime, style:chosen.style,
+                        score, n_conf:Math.round(60+40*clamp((p.adx5-16)/14,0,1)), obi:0,
+                        hold_sec:chosen.hold_sec, liq_pct:+(liq).toFixed(3),
+                        ret5:(()=>{ const r=[]; for(let i=1;i<p.c5.length;i++) r.push(Math.log(p.c5[i]/p.c5[i-1])); return r.slice(-36); })(),
+                        fill_prob:0.7, dyn_floor:EXP_LCB_MIN_THIS,
+                        rsi14:p.rsi14, z_vwap:p.z_vwap,
+                        vol1h_est_usd:p.vol1h_est_usd, depth1p_usd:0,
+                        direction_env:DIRECTION, side_bias:p.trendBias,
+                        swing_lo_px:(function swingLo(){ const lows=p.k15?.map(x=>+x[3])||[]; if(lows.length<40) return null; return Math.min(...lows.slice(-40)); })(),
+                        entry_book: { bid: book.bid, ask: book.ask },
+                        slip_bps_long: Math.max(Math.round(p.spreadBps/2),0), slip_bps_short: Math.max(Math.round(p.spreadBps/2),0),
+                        spread_bps_entry: p.spreadBps
+                      });
+                    } catch {}
+                  }
+                  fbCands.sort((a,b)=> b.exp_lcb_bps!==a.exp_lcb_bps ? b.exp_lcb_bps-a.exp_lcb_bps
+                                         : b.exp_bps!==a.exp_bps ? b.exp_bps-a.exp_bps
+                                         : b.score!==a.score ? b.score-a.score
+                                         : (b.qv||0)-(a.qv||0));
+                  tryAdd(fbCands);
+                }
+                selected = fallback.slice(0, fallbackTarget);
+                selectionTier = (refined.length > 0) ? "refined_top3" : "forced_fallback_top3";
               } else {
                 selected = selected.slice(0, fallbackTarget);
                 selectionTier = "strict";
