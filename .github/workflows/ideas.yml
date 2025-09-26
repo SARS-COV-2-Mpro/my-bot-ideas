@@ -7,6 +7,390 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ideas-mexc-ultimate
+  cancel-in-progress: true
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      # Required secrets
+      WORKER_PUSH_URL: ${{ secrets.WORKER_PUSH_URL }}
+      PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
+
+      # Optional: Gist state persistence
+      GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+      GIST_ID: ${{ secrets.GIST_ID }}
+
+      # Only these 3 come from repo/org Variables (everything else is coded inside)
+      DIRECTION: ${{ vars.DIRECTION }}         # "both" | "long" | "short"
+      ALWAYS3_ENABLE: ${{ vars.ALWAYS3_ENABLE }}  # "true" or "false"
+      FORCE_SIZE_BPS: ${{ vars.FORCE_SIZE_BPS }}  # integer bps per idea (0 = risk-based sizing)
+
+    steps:
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Run pusher (v6.2 — GP-Cls + Heavy-tail sims + Bandit + Symmetric guards + Safe fallback top-up)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${WORKER_PUSH_URL:-}" || -z "${PUSH_TOKEN:-}" ]]; then
+            echo "[gha] Missing WORKER_PUSH_URL or PUSH_TOKEN"
+            exit 1
+          fi
+
+          set +e
+          node - <<'NODE'
+          (async ()=>{
+            'use strict';
+
+            // ---------------- Utils ----------------
+            const clamp=(x,a,b)=>Math.max(a,Math.min(b,x));
+            const tanh=(x)=>Math.tanh(x);
+            const sum=(a)=>a.reduce((x,y)=>x+y,0);
+            const mean=(a)=>a.length?sum(a)/a.length:0;
+            const std=(a)=>{const m=mean(a); let v=0; for(const x of a)v+=(x-m)*(x-m); return a.length>1?Math.sqrt(v/(a.length-1)):0;};
+            const ema=(arr,p)=>{ if(!arr||arr.length<p) return null; const k=2/(p+1); let e=arr.slice(0,p).reduce((a,b)=>a+b,0)/p; for(let i=p;i<arr.length;i++) e=arr[i]*k+e*(1-k); return e; };
+            const emaSeries=(arr,p)=>{ if(!arr||arr.length<p) return null; const k=2/(p+1); const out=Array(arr.length).fill(null); let e=arr.slice(0,p).reduce((a,b)=>a+b,0)/p; out[p-1]=e; for(let i=p;i<arr.length;i++){ e=arr[i]*k+e*(1-k); out[i]=e; } return out; };
+            const rsi=(cl,p=14)=>{ if(!cl||cl.length<=p) return null; let g=0,l=0; for(let i=1;i<=p;i++){ const d=cl[i]-cl[i-1]; g+=Math.max(0,d); l+=Math.max(0,-d); } let ag=g/p, al=l/p; for(let i=p+1;i<cl.length;i++){ const d=cl[i]-cl[i-1]; ag=(ag*(p-1)+Math.max(0,d))/p; al=(al*(p-1)+Math.max(0,-d))/p; } const rs=al===0?100:ag/al; return 100-100/(1+rs); };
+            const computeADX_ATR=(h,l,c,p=14)=>{ const n=c.length; if(n<p+2) return null; const TR=[],plusDM=[],minusDM=[];
+              for(let i=1;i<n;i++){ const up=h[i]-h[i-1], down=l[i-1]-l[i]; plusDM.push((up>down&&up>0)?up:0); minusDM.push((down>up&&down>0)?down:0);
+                TR.push(Math.max(h[i]-l[i], Math.abs(h[i]-c[i-1]), Math.abs(l[i]-c[i-1]))); }
+              let trN=0,pdmN=0,ndmN=0; for(let i=0;i<p;i++){ trN+=TR[i]; pdmN+=plusDM[i]; ndmN+=minusDM[i]; }
+              let pDI=100*(pdmN/(trN||1)), nDI=100*(ndmN/(trN||1)); let dx=100*Math.abs(pDI-nDI)/((pDI+nDI)||1), adx=dx;
+              for(let i=p;i<TR.length;i++){ trN=trN-(trN/p)+TR[i]; pdmN=pdmN-(pdmN/p)+plusDM[i]; ndmN=ndmN-(ndmN/p)+minusDM[i];
+                pDI=100*(pdmN/(trN||1)); nDI=100*(ndmN/(trN||1)); dx=100*Math.abs(pDI-nDI)/((pDI+nDI)||1); adx=((adx*(p-1))+dx)/p; }
+              const atr=trN/p; return { adx, atr, trLast: TR.at(-1) };
+            };
+            const vwapAnchored=(h,l,c,v,win)=>{ if(!c?.length) return null; const n=c.length,s=Math.max(0,n-win); let pv=0,vv=0; for(let i=s;i<n;i++){ const tp=(h[i]+l[i]+c[i])/3; const vol=+v[i]||0; pv+=tp*vol; vv+=vol; } return vv>0?pv/vv:c.at(-1); };
+            const corr=(a,b)=>{ const n=Math.min(a?.length||0,b?.length||0); if(n<5) return 0; const as=a.slice(-n), bs=b.slice(-n); const ma=mean(as), mb=mean(bs); let num=0,da=0,db=0; for(let i=0;i<n;i++){ const xa=as[i]-ma, xb=bs[i]-mb; num+=xa*xb; da+=xa*xa; db+=xb*xb; } const den=Math.sqrt(da*db)||1; return num/den; };
+            const wilsonLCB=(p,n,z=1.34)=>{ if(n<=0) return p; const z2=z*z; const a=p + z2/(2*n); const b=z*Math.sqrt((p*(1-p)+z2/(4*n))/n); const c=1+z2/n; return clamp((a-b)/c, 0, 1); };
+            const sleep=(ms)=>new Promise(r=>setTimeout(r,ms));
+            const jitter=(ms)=>ms + Math.floor(Math.random()*ms*0.25);
+            const softmax=(arr,t=20)=>{ const m=Math.max(...arr,0); const ex=arr.map(x=>Math.exp((x-m)/t)); const s=ex.reduce((a,b)=>a+b,0)||1; return ex.map(x=>x/s); };
+            const sigmoid=(z)=>1/(1+Math.exp(-z));
+
+            // RNG
+            let bmSpare=null;
+            const randn=()=>{ if(bmSpare!=null){ const v=bmSpare; bmSpare=null; return v; } let u=0,v=0; while(u===0) u=Math.random(); while(v===0) v=Math.random(); const r=Math.sqrt(-2*Math.log(u)); const th=2*Math.PI*v; bmSpare=r*Math.sin(th); return r*Math.cos(th); };
+            function randt(df){ if(df<=2) df=2.01; const z=randn(); let x2=0; for(let i=0;i<Math.floor(df);i++){ const z2=randn(); x2+=z2*z2; } const frac=df-Math.floor(df); if(frac>0){ const zf=randn(); x2+=frac*zf*zf; } const chi=x2||1e-6; return z / Math.sqrt(chi/df); }
+
+            // IO snapshot for counts
+            const fs = require('fs');
+            function snapCounts(partial){
+              try{
+                const prev = fs.existsSync('/tmp/pusher_counts.json')
+                  ? JSON.parse(fs.readFileSync('/tmp/pusher_counts.json','utf8')||'{}')
+                  : {};
+                const next = { ...prev, ...partial };
+                fs.writeFileSync('/tmp/pusher_counts.json', JSON.stringify(next));
+              }catch{}
+            }
+
+            // Kalman (1D RW)
+            function kalman1D(obs,{q=1e-5,r=1e-3,x0=null,p0=1e-2}={}){
+              if(!obs?.length) return [];
+              let x=(x0==null?obs[0]:x0), p=p0;
+              const out=[];
+              for(const z of obs){
+                p+=q;
+                const K=p/(p+r);
+                x=x + K*(z-x);
+                p=(1-K)*p;
+                out.push(x);
+              }
+              return out;
+            }
+
+            // ---- Crypto + stable stringify for hashes ----
+            const crypto = require('crypto');
+            const stableStringify=(obj)=>{
+              const seen=new WeakSet();
+              const sort=(v)=>{
+                if(v===null||typeof v!=='object') return v;
+                if(seen.has(v)) return null;
+                seen.add(v);
+                if(Array.isArray(v)) return v.map(sort);
+                const keys=Object.keys(v).sort();
+                const o={}; for(const k of keys) o[k]=sort(v[k]); return o;
+              };
+              return JSON.stringify(sort(obj));
+            };
+            const sha256Hex=(s)=>crypto.createHash('sha256').update(String(s)).digest('hex');
+
+            // ------------- GP Classification (Laplace) -------------
+            function pairwiseD2(X, Y){
+              const n=X.length, m=Y.length, d=X[0]?.length||0;
+              const M=Array.from({length:n},()=>Array(m).fill(0));
+              for(let i=0;i<n;i++) for(let j=0;j<m;j++){ let s=0; for(let k=0;k<d;k++){ const dv=X[i][k]-Y[j][k]; s+=dv*dv; } M[i][j]=s; }
+              return M;
+            }
+            function medianPairwiseDist(X){
+              const n=X.length; if(n<2) return 1;
+              const idx=[]; for(let i=0;i<n;i+=Math.max(1,Math.floor(n/20))) idx.push(i);
+              const d=[]; for(let i=0;i<idx.length;i++) for(let j=i+1;j<idx.length;j++){ const a=X[idx[i]], b=X[idx[j]]; let s=0; for(let k=0;k<a.length;k++){ const dv=a[k]-b[k]; s+=dv*dv; } d.push(Math.sqrt(s)); }
+              d.sort((a,b)=>a-b); return d[Math.floor(d.length/2)]||1;
+            }
+            function rbfKernel(X, Y, ell){
+              const inv2l2 = 1/(2*Math.max(1e-9, ell*ell));
+              const D2=pairwiseD2(X,Y);
+              const K=Array.from({length:D2.length},()=>Array(D2[0].length).fill(0));
+              for(let i=0;i<D2.length;i++) for(let j=0;j<D2[0].length;j++) K[i][j]=Math.exp(-D2[i][j]*inv2l2);
+              return { K, inv2l2 };
+            }
+            function cholesky(A){
+              const n=A.length; const L=Array.from({length:n},()=>Array(n).fill(0));
+              for(let i=0;i<n;i++){
+                for(let j=0;j<=i;j++){
+                  let s=0; for(let k=0;k<j;k++) s+=L[i][k]*L[j][k];
+                  const v=A[i][j]-s;
+                  if(i===j){ if(v<=1e-12) return null; L[i][j]=Math.sqrt(Math.max(v,1e-12)); }
+                  else { L[i][j]=v/(L[j][j]||1e-12); }
+                }
+              }
+              return L;
+            }
+            function solveChol(L, b){
+              const n=L.length, y=Array(n).fill(0), x=Array(n).fill(0);
+              for(let i=0;i<n;i++){ let s=0; for(let k=0;k<i;k++) s+=L[i][k]*y[k]; y[i]=(b[i]-s)/(L[i][i]||1e-12); }
+              for(let i=n-1;i>=0;i--){ let s=0; for(let k=i+1;k<n;k++) s+=L[k][i]*x[k]; x[i]=(y[i]-s)/(L[i][i]||1e-12); }
+              return x;
+            }
+            function trainGPClass(X, y01, lam=0.10, iters=10){
+              const n=X.length; if(n===0) return null;
+              const ell = medianPairwiseDist(X) || 1;
+              const { K } = rbfKernel(X, X, ell);
+              for(let i=0;i<n;i++) K[i][i]+=lam;
+              let f=Array(n).fill(0);
+              for(let it=0; it<iters; it++){
+                const pi=f.map(sigmoid);
+                const W=pi.map(p=> p*(1-p)+1e-6), Winv=W.map(w=>1/(w||1e-6));
+                const A=Array.from({length:n},(_,i)=> K[i].map((v,j)=> v + (i===j?Winv[i]:0)));
+                const ypi=y01.map((yy,i)=> yy - pi[i]);
+                const b=Array(n).fill(0); for(let i=0;i<n;i++){ let s=0; for(let j=0;j<n;j++) s+=K[i][j]*ypi[j]; b[i]=s - f[i]; }
+                const L=cholesky(A); if(!L) break;
+                const h=solveChol(L,b); let maxStep=0; for(let i=0;i<n;i++){ f[i]+=h[i]; maxStep=Math.max(maxStep,Math.abs(h[i])); } if(maxStep<1e-4) break;
+              }
+              const pi=f.map(sigmoid), W=pi.map(p=> p*(1-p)+1e-6), Winv=W.map(w=>1/(w||1e-6));
+              const A=Array.from({length:n},(_,i)=> K[i].map((v,j)=> v + (i===j?Winv[i]:0)));
+              const L=cholesky(A); if(!L) return null;
+              return { X, y:y01, K, L, f, pi, ell };
+            }
+            function predictGPClass(model, x){
+              if(!model) return { p:0.5, s2:0.2 };
+              const { X, L, pi, y, ell } = model;
+              const inv2l2=1/(2*ell*ell);
+              let kstar=Array(X.length).fill(0);
+              for(let i=0;i<X.length;i++){ let d2=0; for(let k=0;k<X[i].length;k++){ const dv=X[i][k]-x[k]; d2+=dv*dv; } kstar[i]=Math.exp(-d2*inv2l2); }
+              let m=0; for(let i=0;i<X.length;i++) m+=kstar[i]*((y[i]||0)-(pi[i]||0));
+              const v=solveChol(L,kstar); let vtv=0; for(const vi of v) vtv+=vi*vi;
+              const s2=Math.max(1e-6,1-vtv); const scale=Math.sqrt(1+(Math.PI*s2/8)); const p=sigmoid(m/scale);
+              return { p:clamp(p,0.01,0.99), s2 };
+            }
+            const gpClfHash=(m)=>{
+              if(!m) return null;
+              const diag=(m.L||[]).map((r,i)=>r[i]).slice(0,16).map(x=>+x||0);
+              const meta={ ell:+(m.ell||0), nX:m.X?.length||0, L_diag:diag };
+              return "sha256:"+sha256Hex(stableStringify(meta));
+            };
+
+            // ------------- Calibration (Platt / Isotonic) -------------
+            const logit=(p)=>Math.log((p+1e-12)/(1-(p-1e-12)));
+            const sigmoidF=(a,b,z)=>1/(1+Math.exp(-(a*z+b)));
+            function fitPlatt(p,y){ const eps=1e-6, z=p.map(pp=> clamp(pp,eps,1-eps)).map(logit); let a=1,b=0; const lr=0.05,it=400,l2=0.01;
+              for(let t=0;t<it;t++){ let ga=0,gb=0; for(let i=0;i<y.length;i++){ const s=sigmoidF(a,b,z[i]), e=s-y[i]; ga+=e*z[i]; gb+=e; } ga+=l2*a; gb+=l2*b; a-=lr*ga/y.length; b-=lr*gb/y.length; }
+              return {a,b,n:y.length}; }
+            function applyPlatt(p,ab){ const {a,b}=ab||{a:1,b:0}; return p.map(pi=> sigmoidF(a,b, logit(clamp(pi,1e-6,1-1e-6)) )); }
+            function fitIsotonic(p,y){ const idx=[...p.keys()].sort((i,j)=>p[i]-p[j]); const xs=[],ys=[]; for(const i of idx){ xs.push(p[i]); ys.push(y[i]); }
+              const n=xs.length,g=ys.slice(),w=Array(n).fill(1); for(let i=0;i<n-1;i++){ if(g[i]>g[i+1]){ let j=i; while(j>=0 && g[j]>g[j+1]){ const ww=w[j]+w[j+1], gg=(w[j]*g[j]+w[j+1]*g[j+1])/ww; w[j]=ww; g[j]=gg; xs.splice(j,2,(xs[j])); ys.splice(j,2,(gg)); g.splice(j+1,1); w.splice(j+1,1); if(j>0) j--; } } } return { xs, ys:g, n }; }
+            function applyIsotonic(p,iso){ if(!iso?.xs?.length||!iso?.ys?.length) return p; const xs=iso.xs, ys=iso.ys; return p.map(val=>{ if(val<=xs[0]) return ys[0]; if(val>=xs[xs.length-1]) return ys[ys.length-1]; let lo=0,hi=xs.length-1; while(hi-lo>1){ const mid=((lo+hi)>>1); if(xs[mid]<=val) lo=mid; else hi=mid; } const t=(val-xs[lo])/Math.max(1e-9,(xs[hi]-xs[lo])); return ys[lo]+t*(ys[hi]-ys[lo]); }); }
+
+            // ------------- Heavy-tail Monte Carlo (t + bootstrap) -------------
+            function pathEVHeavy({entry,tp_bps,sl_bps,side,retSeries,mu,sigma,steps,N=192,cost_bps=10,t_df=5,boot_block=3}){
+              const up=(side==="long"), tpF=tp_bps/10000, slF=sl_bps/10000; let ev=0, wins=0; const rets=retSeries||[];
+              const boot1=()=>{ if(rets.length<8) return Array(steps).fill(0).map(()=> sigma*Math.sqrt(1/steps)*randn()); const out=[]; while(out.length<steps){ const start=Math.floor(Math.random()*(rets.length-boot_block)); for(let k=0;k<boot_block && out.length<steps;k++) out.push(rets[start+k]||0); } return out.slice(0,steps); };
+              for(let n=0;n<N;n++){
+                const mode=(n%2===0)?"t":"boot";
+                let S=entry, tp=up? entry*(1+tpF):entry*(1-tpF), sl=up? entry*(1-slF):entry*(1+slF);
+                let pnl_bps=0,win=0;
+                const rs=(mode==="t")? Array(steps).fill(0).map(()=> mu + sigma*randt(t_df)/Math.sqrt(steps)) : boot1();
+                for(let t=0;t<steps;t++){
+                  const r=rs[t];
+                  S=S*(1+r);
+                  if(up){ if(S>=tp){ pnl_bps=tp_bps-cost_bps; win=1; break;} if(S<=sl){ pnl_bps=-sl_bps-cost_bps; win=0; break;} }
+                  else { if(S<=tp){ pnl_bps=tp_bps-cost_bps; win=1; break;} if(S>=sl){ pnl_bps=-sl_bps-cost_bps; win=0; break;} }
+                  if(t===steps-1){ const ret=up? (S/entry-1):(entry/S-1); pnl_bps=Math.round(ret*10000)-cost_bps; win=pnl_bps>0?1:0; }
+                }
+                ev+=pnl_bps; wins+=win;
+              }
+              const p=wins/N, ev_mean=ev/N;
+              return { p, ev_bps:Math.round(ev_mean) };
+            }
+
+            // ------------- t-copula VaR/ES -------------
+            function choleskySafe(S){
+              const L=cholesky(S);
+              if(L) return L;
+              const n=S.length;
+              const Sc=S.map((r,i)=> r.map((v,j)=> v + (i===j?1e-6:0)));
+              return cholesky(Sc);
+            }
+            function sampleMultiT(muVec,Sigma,df=6,M=1000){
+              const n=muVec.length;
+              const L=choleskySafe(Sigma); if(!L) return [];
+              const out=[];
+              for(let m=0;m<M;m++){
+                const z=Array(n).fill(0).map(()=>randn());
+                const y=Array(n).fill(0);
+                for(let i=0;i<n;i++){ let s=0; for(let k=0;k<=i;k++) s+=L[i][k]*z[k]; y[i]=s; }
+                let chi=0; for(let i=0;i<df;i++){ const zc=randn(); chi+=zc*zc; }
+                const scale=Math.sqrt(df/Math.max(1e-9,chi));
+                out.push(y.map((yi,i)=> (muVec[i]||0) + yi*scale));
+              }
+              return out;
+            }
+            function portfolioVaR_ES_tCopula(picks, df=6){
+              if(!picks.length) return { VaR95_bps:0, ES95_bps:0 };
+              const n=picks.length, mu=Array(n).fill(0), sd=Array(n).fill(0);
+              for(let i=0;i<n;i++){
+                const r5=picks[i].ret5||[]; const rMean=mean(r5), rStd=std(r5)||1e-4;
+                const steps=Math.max(1, Math.round((picks[i].ttl_sec||600)/300));
+                mu[i]=rMean*steps*10000;
+                sd[i]=rStd*Math.sqrt(steps)*10000;
+              }
+              const R=Array.from({length:n},()=>Array(n).fill(0));
+              for(let i=0;i<n;i++){
+                for(let j=0;j<n;j++) R[i][j]=corr(picks[i].ret5||[], picks[j].ret5||[]);
+                R[i][i]=1;
+              }
+              const Sigma=Array.from({length:n},()=>Array(n).fill(0));
+              for(let i=0;i<n;i++) for(let j=0;j<n;j++) Sigma[i][j]=R[i][j]*sd[i]*sd[j];
+              const draws=sampleMultiT(mu,Sigma,df,1200);
+              if(!draws.length) return { VaR95_bps:0, ES95_bps:0 };
+              const w0=picks.map(p=> p.size_bps||0); const ws=sum(w0)||1; const w=w0.map(x=> x/ws);
+              const port=draws.map(d=> d.reduce((acc,di,ii)=> acc + w[ii]*di, 0));
+              port.sort((a,b)=>a-b);
+              const idx=Math.floor(0.05*port.length);
+              const VaR95=port[idx]||0;
+              const ES=mean(port.slice(0,idx+1));
+              return { VaR95_bps:Math.round(VaR95), ES95_bps:Math.round(ES) };
+            }
+
+            // ---------- Config (only 3 envs used; rest are coded here) ----------
+            const UA="gh-actions-ideas-mexc-ultimate/6.2-prime (+https://github.com/)";
+            async function fetchWithTimeout(url,opts={},ms=12000){ const ac=new AbortController(); const t=setTimeout(()=>ac.abort(),ms); try{ return await fetch(url,{...opts,signal:ac.signal,headers:{"User-Agent":UA,...(opts?.headers||{})}});} finally{ clearTimeout(t);} }
+            async function getJSON(url,ms=12000,tries=2){ for(let a=0;a<tries;a++){ try{ const r=await fetchWithTimeout(url,{},ms); if(r?.ok){ return await r.json(); } }catch{} await sleep(jitter(220)); } return null; }
+
+            // Only these read from env
+            const DIRECTION=(process.env.DIRECTION||"both").trim().toLowerCase();
+            const ALWAYS3_ENABLE_STR=(process.env.ALWAYS3_ENABLE||"false").toLowerCase();
+            const ALWAYS3_ENABLE=(ALWAYS3_ENABLE_STR==="true"||ALWAYS3_ENABLE_STR==="1");
+            const FORCE_SIZE_BPS=Number(process.env.FORCE_SIZE_BPS||"0")||0;
+
+            // Hardcoded operational defaults (safe, opinionated)
+            const EXCHANGE="mexc";
+            const MEXC_BASES=["https://api.mexc.com","https://www.mexc.com"];
+            const TOP_N=3;
+            const MAX_SPREAD_BPS=12;
+            const FEES_BPS=10;
+            const LONG_MAX_COST_BPS=16;
+            const MAX_COST_BPS_HARD=15;
+            const MR_SPREAD_MAX_BPS=8;
+            const EXP_LCB_MIN_BPS=18;
+            const EXP_LCB_MIN_BPS_FB=16;
+            const NOTIONAL=3000;
+            const MEXC_DEPTH_LIMIT=50;
+            const OBI_TOPN=12;
+            const MIN_VOL_1H_USD=5_000_000;
+            const DEPTH_1P_MIN_USD=200_000;
+            const EMA_FAST=21, EMA_SLOW=50, ADX_P=14, ATR_P=14;
+            const K1M=240, K5M=300, K15M=120, K1H=96;
+            const VWAP_5M_WIN=36;
+            const TARGET_PORT_RISK_BPS=52;
+            const TTL_MIN=540, TTL_MAX=1200;
+            const MOMENTUM_SIZE_FACTOR=0.5;
+            const NO_LONG_DOWN_ENABLE=true;
+            const LONG_DOWN_RSI_CUTOFF=40;
+            const LONG_MR_DIVERGENCE_REQ=true;
+            const LONG_EDGE_MULT_MIN=4;
+            const LONG_BOUNCE_SL_ATR=0.50;
+            const LONG_BOUNCE_TP_ATR=0.90;
+            const LONG_BOUNCE_HOLD_MIN_SEC=900;
+            const LONG_BOUNCE_HOLD_MAX_SEC=2400;
+            const LONG_ENTRY_BOUNCE_OFFSET=0.0015;
+            const LONG_SIMILARITY_RHO=0.84;
+            const LONG_KILL_MIN_TRADES=20;
+            const LONG_KILL_WINRATE=0.20;
+            const LONG_KILL_SIZE_MULT=0.5;
+
+            // Fallback knobs (coded)
+            const ALWAYS3_SIZE_FACTOR=0.15;
+            const ALWAYS3_REQUIRE_BTC_GREEN=false;
+            const FALLBACK_SHORT_ADX_MIN=16;
+            const FALLBACK_PLCB_LONG=0.58;
+            const FALLBACK_PLCB_SHORT=0.55;
+
+            // Regime/bandit (fixed simple arm)
+            const MR_ADX_MAX_DEFAULT=20;
+            const MR_SLOPE_MAX_ATR50=0.50;
+            const MR_BREAKOUT_DC_N=120;
+            const MR_BREAKOUT_RET15_ATR=1.5;
+            const MR_LOCKOUT_SEC=1800;
+
+            // Universe
+            const UNIV_TARGET_MIN=100, UNIV_TARGET_MAX=120;
+            const DYN_QV_MIN=6_000_000;
+            const DYN_QV_STEP=5_000_000;
+
+            // Hygiene
+            const STABLES=new Set(["USDT","USDC","USD","USDE","USDD","BUSD","FDUSD","TUSD","DAI","USDP","PAX","USTC","STBL"]);
+            const LONG_NAUGHTY_BASES=new Set(["EDU","THE","HEMI","COOKIE","MNT","ASTER","AVNT","VANA","ETHFI","SIGN","STBL"]);
+            const ALLOWED=new Set(DIRECTION==="both"? ["long","short"] : [DIRECTION]);
+
+            const PUSH_URL=process.env.WORKER_PUSH_URL||"";
+            const PUSH_TOKEN=process.env.PUSH_TOKEN||"";
+            const HEALTH_URL=(()=>{ try{ const u=new URL(PUSH_URL); return `${u.origin}${u.pathname.replace(/\/signals\/push(\?.*)?$/,"/health")}`;}catch{return PUSH_URL.replace(/\/signals\/push(\?.*)?$/,"/health");}})();
+
+            // Adapter
+            async function pickMexcBase(){ for(const b of MEXC_BASES){ try{ const r=await fetchWithTimeout(`${b}/api/v3/time`,{},4000); if(r?.ok) return b; }catch{} } throw new Error("No healthy MEXC base"); }
+            const BASE=await pickMexcBase();
+            const api=(path,params={})=>{ const u=new URL(path,BASE); for(const [k,v] of Object.entries(params)){ if(v!==undefined&&v!==null) u.searchParams.set(k,String(v)); } return u.toString(); };
+            async function fetchAll24hr(){
+              let all = await getJSON(api("/api/v3/ticker/24hr"), 10000, 2);
+              if(Array.isArray(all) && all.length) return all;
+              const exi=await getJSON(api("/api/v3/exchangeInfo"), 10000, 2);
+              const syms=(exi?.symbols||[]).filter(s=>s.status==="TRADING").map(s=>s.symbol).slice(0,300);
+              const out=[]; for(let i=0;i<syms.length;i+=24){ const chunk=syms.slice(i,i+24); const got=await Promise.all(chunk.map(s=>getJSON(api("/api/v3/ticker/24hr",{symbol:s}),6000,1))); for(const x of got) if(x) out.push(x); await sleep(180); }
+              return out;
+            }
+            async function fetchK(sym,interval,limit,startTime,endTime){ const u=api("/api/v3/klines",{symbol:sym,interval,limit,startTime,endTime}); const r=await getJSON(u,10000,2); return Array.isArray(r)?r:null; }
+            async function fetchBookTicker(symbol){ return await getJSON(api("/api/v3/ticker/bookTicker",{symbol}), 8000, 1); }
+            async function fetchDepth(symbol){ return await getJSON(api("/api/v3/depth",{symbol,limit:MEXC_DEPTH_LIMIT}), 10000, 2); }
+
+            // Provenance
+            async function getMexcTime(){ const j=await getJSON(api("/api/v3/time"), 8000, 2); const st=+j?.serverTime||Date.now(); return { mexc_server_time_ms: st, mexc_time_offset_ms: st - Date.now() }; }
+            const run_id=new Date().toISOString()+"#6.2";
+            const code_commit_sha=(process.env.GITHUB_SHA||"").slice(0,40);
+            const mexcTime=await getMexcTime();
+            function cfgHash(){ const cfg={ EXCHANGE, TOP_N, MAX_SPREAD_BPS, FEES_BPS, LONG_MAX_COST_BPS, MAX_COST_BPS_HARD, MR_SPREAD_MAX_BPS, EXP_LCB_MIN_BPS, EXP_LCB_MIN_BPS_FB, NOTIONAL, OBI_TOPN, MEXC_DEPTH_LIMIT, MIN_VOL_1H_USD, DEPTH_1P_MIN_USD, EMA_FAST, EMA_SLOW, ADX_P, ATR_P, VWAP_5M_WIN, TTL_MIN, TTL_MAX, TARGET_PORT_RISK_BPS, MOMENTUM_SIZE_FACTOR, NO_LONG_DOWN_ENABLE, LONG_DOWN_RSI_CUTOFF, LONG_MR_DIVERGENCE_REQ, LONG_EDGE_MULT_MIN, LONG_BOUNCE_SL_ATR, LONG_BOUNCE_TP_ATR, LONG_BOUNCE_HOLD_MIN_SEC, LONG_BOUNCE_HOLD_MAX_SEC, LONG_ENTRY_BOUNCE_OFFSET, LONG_SIMILARITY_RHO, LONG_KILL_MIN_TRADES, LONG_KILL_WINRATE, LONG_KILL_SIZE_MULT, ALWAYS3_ENABLE, ALWAYS3_SIZE_FACTOR, ALWAYS3_REQUIRE_BTC_GREEN, FALLBACK_SHORT_ADX_MIN, FALLBACK_PLCB_LONG, FALLBACK_PLCB_SHORT, MR_ADX_MAX_DEFAULT, MR_SLOPE_MAX_ATR50, MR_BREAKOUT_DC_N, MR_BREAKOUT_RET15_ATR, MR_LOCKOUT_SEC, DYN_QV_MIN, DYN_QV_STEP, STABLES:[...STABLES], LONG_NAUGHTY_BASES:[...LONG_NAUGHTY_BASES], DIRECTION }; return "sha256:"+sha256Hex(stableStringify(cfg));}
+            const config_hash=cfgHash();
+            const pusher_version="mexc-ultimate-6.2-prime";
+            console.log("[step] start selection", { run_id, base: BASE, direction: DIRECTION, always3: ALWAYS3_ENABLE, force_size_bps: FORCE_SIZE_BPS });
+            
+          })();
+          NODE
+          EXIT_CODE=$?
+          if [[ $EXIT_CODE -ne 0 ]]; then
+            echo "[gha] node exited early ($EXIT_CODE)"; exit 1
+          fi
+
       - name: Run pusher (selection/push) — Section 2/2
         shell: bash
         run: |
@@ -163,7 +547,8 @@ permissions:
             async function getJSON(url,ms=12000,tries=2){ for(let a=0;a<tries;a++){ try{ const r=await fetchWithTimeout(url,{},ms); if(r?.ok){ return await r.json(); } }catch{} await sleep(jitter(220)); } return null; }
 
             const DIRECTION=(process.env.DIRECTION||"both").trim().toLowerCase();
-            const ALWAYS3_ENABLE=((process.env.ALWAYS3_ENABLE||"false").toLowerCase()==="true");
+            const ALWAYS3_ENABLE_STR=(process.env.ALWAYS3_ENABLE||"false").toLowerCase();
+            const ALWAYS3_ENABLE=(ALWAYS3_ENABLE_STR==="true"||ALWAYS3_ENABLE_STR==="1");
             const FORCE_SIZE_BPS=Number(process.env.FORCE_SIZE_BPS||"0")||0;
 
             const EXCHANGE="mexc";
@@ -209,7 +594,6 @@ permissions:
             const FALLBACK_PLCB_SHORT=0.55;
 
             // Regime/bandit
-            const WILSON_Z=1.34;
             const MR_ADX_MAX_DEFAULT=20;
             const MR_SLOPE_MAX_ATR50=0.50;
             const MR_BREAKOUT_DC_N=120;
@@ -228,7 +612,6 @@ permissions:
 
             const PUSH_URL=process.env.WORKER_PUSH_URL||"";
             const PUSH_TOKEN=process.env.PUSH_TOKEN||"";
-            const HEALTH_URL=(()=>{ try{ const u=new URL(PUSH_URL); return `${u.origin}${u.pathname.replace(/\/signals\/push(\?.*)?$/,"/health")}`;}catch{return PUSH_URL.replace(/\/signals\/push(\?.*)?$/,"/health");}})();
 
             // Adapter
             async function pickMexcBase(){ for(const b of MEXC_BASES){ try{ const r=await fetchWithTimeout(`${b}/api/v3/time`,{},4000); if(r?.ok) return b; }catch{} } throw new Error("No healthy MEXC base"); }
@@ -332,7 +715,8 @@ permissions:
                   const k5=await fetchK(c.symbol,"5m",K5M); if(!k5||k5.length<Math.max(EMA_SLOW+200,ATR_P+50)){ pfStats.dropped.k5++; return null; }
                   const k15=await fetchK(c.symbol,"15m",K15M); const k1h=await fetchK(c.symbol,"1h",K1H);
 
-                  const c5_raw=k5.map(x=>+x[4]); const c5=(function kalman1D(obs,{q=1e-5,r=1e-3,x0=null,p0=1e-2}={}){ if(!obs?.length) return []; let x=(x0==null?obs[0]:x0), p=p0; const out=[]; for(const z of obs){ p+=q; const K=p/(p+r); x=x + K*(z-x); p=(1-K)*p; out.push(x);} return out; })(c5_raw,{q:1e-4,r:5e-4,x0:c5_raw[0],p0:1e-2});
+                  const c5_raw=k5.map(x=>+x[4]); 
+                  const c5=kalman1D(c5_raw, {q:1e-4,r:5e-4,x0:c5_raw[0],p0:1e-2});
                   const h5=k5.map(x=>+x[2]), l5=k5.map(x=>+x[3]), v5=k5.map(x=>+x[5]);
                   const em21=emaSeries(c5,EMA_FAST), em50s=emaSeries(c5,EMA_SLOW), em200s=emaSeries(c5,200);
                   const em50=em50s?.at(-1), em200=em200s?.at(-1), em50Prev=em50s?.at(-51);
@@ -418,6 +802,7 @@ permissions:
                 const depth=await fetchDepth(c.symbol);
                 let obi=0, slipL=p.spreadBps/2, slipS=p.spreadBps/2, fillL=0, fillS=0, depth1pUSD=0;
                 if(depth?.asks?.length && depth?.bids?.length){
+                  // OBI, slips and fills
                   const computeOBI=(depth, topN=12)=>{
                     const w=(i)=>Math.exp(-i*0.18); let bidNot=0, askNot=0;
                     for(let i=0;i<Math.min(topN, depth.bids.length); i++){ const p=+depth.bids[i][0], q=+depth.bids[i][1]; if(p>0&&q>0) bidNot += p*q*w(i); }
@@ -478,7 +863,8 @@ permissions:
                 if(allowedLong){
                   const mrOk = allowMR("long") && (LONG_MR_DIVERGENCE_REQ ? p.fadeLongDivergenceOK : true);
                   const styleL = mrOk ? "mr" : (strongTrend ? "momentum":"trend");
-                  let holdL = mrOk ? clamp(Math.round(Math.max(1800, hold_base)), 1200, 3600) : clamp(Math.round(Math.max(LONG_BOUNCE_HOLD_MIN_SEC, Math.min(hold_base, LONG_BOUNCE_HOLD_MAX_SEC))), LONG_BOUNCE_HOLD_MIN_SEC, LONG_BOUNCE_HOLD_MAX_SEC);
+                  let holdL = mrOk ? clamp(Math.round(Math.max(1800, hold_base)), 1200, 3600)
+                                   : clamp(Math.round(Math.max(LONG_BOUNCE_HOLD_MIN_SEC, Math.min(hold_base, LONG_BOUNCE_HOLD_MAX_SEC))), LONG_BOUNCE_HOLD_MIN_SEC, LONG_BOUNCE_HOLD_MAX_SEC);
                   let slL, tpL;
                   if(styleL==="mr"){ slL=Math.round(LONG_BOUNCE_SL_ATR*p.atr_bps); tpL=Math.round(LONG_BOUNCE_TP_ATR*p.atr_bps); }
                   else { slL=Math.round(clamp(p.atr_bps*0.50, Math.round(0.35*p.atr_bps), Math.round(0.65*p.atr_bps)));
@@ -648,9 +1034,23 @@ permissions:
               const r=await fetchWithTimeout(PUSH_URL,{ method:"POST", headers:{ "Content-Type":"application/json","Authorization":`Bearer ${PUSH_TOKEN}` }, body: JSON.stringify(payload) },15000);
               let txt=""; try{ txt=await r.text(); }catch{} console.log("[ok] push status", r?.status||"ERR", (txt||"").slice(0,300));
             }catch(e){ console.log("[warn] push failed", e?.message||e); }
+
           })();
           NODE
+
           EXIT_CODE=$?
           if [[ $EXIT_CODE -ne 0 ]]; then
-            echo "[gha] node failed ($EXIT_CODE)"; exit 0
+            echo "[gha] section-2 node failed ($EXIT_CODE); sending minimal payload"
+            if [[ -n "${WORKER_PUSH_URL:-}" ]]; then
+              if [[ -f /tmp/pusher_counts.json ]]; then counts=$(cat /tmp/pusher_counts.json); else counts='{}'; fi
+              now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+              payload='{"ts":"'"$now"'","mode":"normal","source":"external_pusher","meta":{"origin":"github_actions","reason":"section2_error","counts":'"$counts"'},"top_n":0,"ideas":[]}'
+              curl -sS -o /tmp/push_resp.txt -w "%{http_code}" -X POST \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer ${PUSH_TOKEN}" \
+                --data "${payload}" \
+                --max-time 12 \
+                "${WORKER_PUSH_URL}" || true
+            fi
+            exit 0
           fi
