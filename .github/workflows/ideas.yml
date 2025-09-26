@@ -106,7 +106,7 @@ jobs:
                 fs.writeFileSync('/tmp/pusher_counts.json', JSON.stringify(next));
               }catch{}
             }
-
+            
             // ---- Crypto + stable stringify for hashes ----
             const crypto = require('crypto');
             const stableStringify=(obj)=>{
@@ -122,93 +122,6 @@ jobs:
               return JSON.stringify(sort(obj));
             };
             const sha256Hex=(s)=>crypto.createHash('sha256').update(String(s)).digest('hex');
-
-            // ------------- GP Classification (Laplace) -------------
-            function pairwiseD2(X, Y){
-              const n=X.length, m=Y.length, d=X[0]?.length||0;
-              const M=Array.from({length:n},()=>Array(m).fill(0));
-              for(let i=0;i<n;i++) for(let j=0;j<m;j++){ let s=0; for(let k=0;k<d;k++){ const dv=X[i][k]-Y[j][k]; s+=dv*dv; } M[i][j]=s; }
-              return M;
-            }
-            function medianPairwiseDist(X){
-              const n=X.length; if(n<2) return 1;
-              const idx=[]; for(let i=0;i<n;i+=Math.max(1,Math.floor(n/20))) idx.push(i);
-              const d=[]; for(let i=0;i<idx.length;i++) for(let j=i+1;j<idx.length;j++){ const a=X[idx[i]], b=X[idx[j]]; let s=0; for(let k=0;k<a.length;k++){ const dv=a[k]-b[k]; s+=dv*dv; } d.push(Math.sqrt(s)); }
-              d.sort((a,b)=>a-b); return d[Math.floor(d.length/2)]||1;
-            }
-            function rbfKernel(X, Y, ell){
-              const inv2l2 = 1/(2*Math.max(1e-9, ell*ell));
-              const D2=pairwiseD2(X,Y);
-              const K=Array.from({length:D2.length},()=>Array(D2[0].length).fill(0));
-              for(let i=0;i<D2.length;i++) for(let j=0;j<D2[0].length;j++) K[i][j]=Math.exp(-D2[i][j]*inv2l2);
-              return { K, inv2l2 };
-            }
-            function cholesky(A){
-              const n=A.length; const L=Array.from({length:n},()=>Array(n).fill(0));
-              for(let i=0;i<n;i++){
-                for(let j=0;j<=i;j++){
-                  let s=0; for(let k=0;k<j;k++) s+=L[i][k]*L[j][k];
-                  const v=A[i][j]-s;
-                  if(i===j){ if(v<=1e-12) return null; L[i][j]=Math.sqrt(Math.max(v,1e-12)); }
-                  else { L[i][j]=v/(L[j][j]||1e-12); }
-                }
-              }
-              return L;
-            }
-            function solveChol(L, b){
-              const n=L.length, y=Array(n).fill(0), x=Array(n).fill(0);
-              for(let i=0;i<n;i++){ let s=0; for(let k=0;k<i;k++) s+=L[i][k]*y[k]; y[i]=(b[i]-s)/(L[i][i]||1e-12); }
-              for(let i=n-1;i>=0;i--){ let s=0; for(let k=i+1;k<n;k++) s+=L[k][i]*x[k]; x[i]=(y[i]-s)/(L[i][i]||1e-12); }
-              return x;
-            }
-            function trainGPClass(X, y01, lam=0.10, iters=10){
-              const n=X.length; if(n===0) return null;
-              const ell = medianPairwiseDist(X) || 1;
-              const { K } = rbfKernel(X, X, ell);
-              for(let i=0;i<n;i++) K[i][i]+=lam;
-              let f=Array(n).fill(0);
-              for(let it=0; it<iters; it++){
-                const pi=f.map(sigmoid);
-                const W=pi.map(p=> p*(1-p)+1e-6), Winv=W.map(w=>1/(w||1e-6));
-                const A=Array.from({length:n},(_,i)=> K[i].map((v,j)=> v + (i===j?Winv[i]:0)));
-                const ypi=y01.map((yy,i)=> yy - pi[i]);
-                const b=Array(n).fill(0); for(let i=0;i<n;i++){ let s=0; for(let j=0;j<n;j++) s+=K[i][j]*ypi[j]; b[i]=s - f[i]; }
-                const L=cholesky(A); if(!L) break;
-                const h=solveChol(L,b); let maxStep=0; for(let i=0;i<n;i++){ f[i]+=h[i]; maxStep=Math.max(maxStep,Math.abs(h[i])); } if(maxStep<1e-4) break;
-              }
-              const pi=f.map(sigmoid), W=pi.map(p=> p*(1-p)+1e-6), Winv=W.map(w=>1/(w||1e-6));
-              const A=Array.from({length:n},(_,i)=> K[i].map((v,j)=> v + (i===j?Winv[i]:0)));
-              const L=cholesky(A); if(!L) return null;
-              return { X, y:y01, K, L, f, pi, ell };
-            }
-            function predictGPClass(model, x){
-              if(!model) return { p:0.5, s2:0.2 };
-              const { X, L, pi, y, ell } = model;
-              const inv2l2=1/(2*ell*ell);
-              let kstar=Array(X.length).fill(0);
-              for(let i=0;i<X.length;i++){ let d2=0; for(let k=0;k<X[i].length;k++){ const dv=X[i][k]-x[k]; d2+=dv*dv; } kstar[i]=Math.exp(-d2*inv2l2); }
-              let m=0; for(let i=0;i<X.length;i++) m+=kstar[i]*((y[i]||0)-(pi[i]||0));
-              const v=solveChol(L,kstar); let vtv=0; for(const vi of v) vtv+=vi*vi;
-              const s2=Math.max(1e-6,1-vtv); const scale=Math.sqrt(1+(Math.PI*s2/8)); const p=sigmoid(m/scale);
-              return { p:clamp(p,0.01,0.99), s2 };
-            }
-            const gpClfHash=(m)=>{
-              if(!m) return null;
-              const diag=(m.L||[]).map((r,i)=>r[i]).slice(0,16).map(x=>+x||0);
-              const meta={ ell:+(m.ell||0), nX:m.X?.length||0, L_diag:diag };
-              return "sha256:"+sha256Hex(stableStringify(meta));
-            };
-
-            // ------------- Calibration (Platt / Isotonic) -------------
-            const logit=(p)=>Math.log((p+1e-12)/(1-(p-1e-12)));
-            const sigmoidF=(a,b,z)=>1/(1+Math.exp(-(a*z+b)));
-            function fitPlatt(p,y){ const eps=1e-6, z=p.map(pp=> clamp(pp,eps,1-eps)).map(logit); let a=1,b=0; const lr=0.05,it=400,l2=0.01;
-              for(let t=0;t<it;t++){ let ga=0,gb=0; for(let i=0;i<y.length;i++){ const s=sigmoidF(a,b,z[i]), e=s-y[i]; ga+=e*z[i]; gb+=e; } ga+=l2*a; gb+=l2*b; a-=lr*ga/y.length; b-=lr*gb/y.length; }
-              return {a,b,n:y.length}; }
-            function applyPlatt(p,ab){ const {a,b}=ab||{a:1,b:0}; return p.map(pi=> sigmoidF(a,b, logit(clamp(pi,1e-6,1-1e-6)) )); }
-            function fitIsotonic(p,y){ const idx=[...p.keys()].sort((i,j)=>p[i]-p[j]); const xs=[],ys=[]; for(const i of idx){ xs.push(p[i]); ys.push(y[i]); }
-              const n=xs.length,g=ys.slice(),w=Array(n).fill(1); for(let i=0;i<n-1;i++){ if(g[i]>g[i+1]){ let j=i; while(j>=0 && g[j]>g[j+1]){ const ww=w[j]+w[j+1], gg=(w[j]*g[j]+w[j+1]*g[j+1])/ww; w[j]=ww; g[j]=gg; xs.splice(j,2,(xs[j])); ys.splice(j,2,(gg)); g.splice(j+1,1); w.splice(j+1,1); if(j>0) j--; } } } return { xs, ys:g, n }; }
-            function applyIsotonic(p,iso){ if(!iso?.xs?.length||!iso?.ys?.length) return p; const xs=iso.xs, ys=iso.ys; return p.map(val=>{ if(val<=xs[0]) return ys[0]; if(val>=xs[xs.length-1]) return ys[ys.length-1]; let lo=0,hi=xs.length-1; while(hi-lo>1){ const mid=((lo+hi)>>1); if(xs[mid]<=val) lo=mid; else hi=mid; } const t=(val-xs[lo])/Math.max(1e-9,(xs[hi]-xs[lo])); return ys[lo]+t*(ys[hi]-ys[lo]); }); }
 
             // ------------- Heavy-tail Monte Carlo (t + bootstrap) -------------
             function pathEVHeavy({entry,tp_bps,sl_bps,side,retSeries,mu,sigma,steps,N=192,cost_bps=10,t_df=5,boot_block=3}){
@@ -233,6 +146,18 @@ jobs:
             }
 
             // ------------- t-copula VaR/ES -------------
+            function cholesky(A){
+              const n=A.length; const L=Array.from({length:n},()=>Array(n).fill(0));
+              for(let i=0;i<n;i++){
+                for(let j=0;j<=i;j++){
+                  let s=0; for(let k=0;k<j;k++) s+=L[i][k]*L[j][k];
+                  const v=A[i][j]-s;
+                  if(i===j){ if(v<=1e-12) return null; L[i][j]=Math.sqrt(Math.max(v,1e-12)); }
+                  else { L[i][j]=v/(L[j][j]||1e-12); }
+                }
+              }
+              return L;
+            }
             function choleskySafe(S){
               const L=cholesky(S);
               if(L) return L;
@@ -286,14 +211,12 @@ jobs:
             async function fetchWithTimeout(url,opts={},ms=12000){ const ac=new AbortController(); const t=setTimeout(()=>ac.abort(),ms); try{ return await fetch(url,{...opts,signal:ac.signal,headers:{"User-Agent":UA,...(opts?.headers||{})}});} finally{ clearTimeout(t);} }
             async function getJSON(url,ms=12000,tries=2){ for(let a=0;a<tries;a++){ try{ const r=await fetchWithTimeout(url,{},ms); if(r?.ok){ return await r.json(); } }catch{} await sleep(jitter(220)); } return null; }
 
-            // Only these read from env
             const DIRECTION=(process.env.DIRECTION||"both").trim().toLowerCase();
             const ALWAYS3_ENV_RAW = (process.env.ALWAYS3_ENABLE ?? "").toString();
             const ALWAYS3_ENABLE = /^(true|1|yes|y|on)$/i.test(ALWAYS3_ENV_RAW.trim());
             console.log("[env] ALWAYS3_ENABLE raw:", JSON.stringify(ALWAYS3_ENV_RAW.trim()));
             const FORCE_SIZE_BPS=Number(process.env.FORCE_SIZE_BPS||"0")||0;
 
-            // Hardcoded operational defaults (safe, opinionated)
             const EXCHANGE="mexc";
             const MEXC_BASES=["https://api.mexc.com","https://www.mexc.com"];
             const TOP_N=3;
@@ -329,10 +252,11 @@ jobs:
             const LONG_KILL_WINRATE=0.20;
             const LONG_KILL_SIZE_MULT=0.5;
             const ALWAYS3_SIZE_FACTOR=0.15;
-            const ALWAYS3_REQUIRE_BTC_GREEN=false;
+            const ALWAYS3_REQUIRE_BTC_GREEN=true;
             const FALLBACK_SHORT_ADX_MIN=16;
             const FALLBACK_PLCB_LONG=0.58;
             const FALLBACK_PLCB_SHORT=0.55;
+            const MAX_FALLBACK_SL_BPS = 60;
             const WILSON_Z=1.34;
             const MR_ADX_MAX_DEFAULT=20;
             const MR_SLOPE_MAX_ATR50=0.50;
@@ -348,13 +272,6 @@ jobs:
             const PUSH_URL=process.env.WORKER_PUSH_URL||"";
             const PUSH_TOKEN=process.env.PUSH_TOKEN||"";
             const HEALTH_URL=(()=>{ try{ const u=new URL(PUSH_URL); return `${u.origin}${u.pathname.replace(/\/signals\/push(\?.*)?$/,"/health")}`;}catch{return PUSH_URL.replace(/\/signals\/push(\?.*)?$/,"/health");}})();
-
-            console.log("[step] health-check:", HEALTH_URL);
-            try{
-              const r=await fetchWithTimeout(HEALTH_URL,{ headers:{ "Authorization":`Bearer ${PUSH_TOKEN}`, "User-Agent":UA }},5000);
-              let t=""; try{ t=await r.text(); }catch{}
-              console.log("[ok] health:", r?.status||"ERR", (t||"").slice(0,160));
-            }catch(e){ console.log("[warn] health error:", e?.message||e); }
 
             // ---------- MEXC Adapter ----------
             async function pickMexcBase(){ for(const b of MEXC_BASES){ try{ const r=await fetchWithTimeout(`${b}/api/v3/time`,{},4000); if(r?.ok) return b; }catch{} } throw new Error("No healthy MEXC base"); }
@@ -429,11 +346,11 @@ jobs:
               let x=(x0==null?obs[0]:x0), p=p0;
               const out=[];
               for(const z of obs){
-                p+=q;
-                const K=p/(p+r);
-                x=x + K*(z-x);
-                p=(1-K)*p;
-                out.push(x);
+              p+=q;
+              const K=p/(p+r);
+              x=x + K*(z-x);
+              p=(1-K)*p;
+              out.push(x);
               }
               return out;
             }
@@ -615,10 +532,11 @@ jobs:
             const LONG_KILL_WINRATE=0.20;
             const LONG_KILL_SIZE_MULT=0.5;
             const ALWAYS3_SIZE_FACTOR=0.15;
-            const ALWAYS3_REQUIRE_BTC_GREEN=false;
+            const ALWAYS3_REQUIRE_BTC_GREEN=true;
             const FALLBACK_SHORT_ADX_MIN=16;
             const FALLBACK_PLCB_LONG=0.58;
             const FALLBACK_PLCB_SHORT=0.55;
+            const MAX_FALLBACK_SL_BPS = 60;
             const WILSON_Z=1.34;
             const MR_ADX_MAX_DEFAULT=20;
             const MR_SLOPE_MAX_ATR50=0.50;
@@ -868,7 +786,7 @@ jobs:
                 const yR=[]; for(let i=1;i<p.c5.length;i++) yR.push(Math.log(p.c5[i]/p.c5[i-1]));
                 const mu5=mean(yR)||0, sig5=Math.max(1e-4,std(yR));
                 const entryMid=mid;
-                const hold_base=clamp(Math.round((0.45>0.45? 720:560)+240*clamp((p.adx5-16)/14,0,1)), TTL_MIN, TTL_MAX);
+                const hold_base=clamp(Math.round((weightsReg.wTrend > weightsReg.wMR ? 720:560)+240*clamp((p.adx5-16)/14,0,1)), TTL_MIN, TTL_MAX);
                 const stepsBase=Math.max(1,Math.round(hold_base/300));
 
                 const allowMR=(side)=>{
@@ -922,7 +840,7 @@ jobs:
                   tp_bps:chosen.tp_bps, sl_bps:chosen.sl_bps, rrr:+(chosen.tp_bps/Math.max(1,chosen.sl_bps)).toFixed(2),
                   spread_bps:p.spreadBps, cost_bps:chosen.cost_bps,
                   adx:+(p.adx5||0).toFixed(1), atr_bps:p.atr_bps, regime:chosen.regime, style:chosen.style,
-                  score, n_conf:Math.round(60+40*clamp((p.adx5-16)/14,0,1)), obi:0,
+                  score, n_conf:Math.round(60+40*clamp((p.adx5-16)/14,0,1)), obi:+obi.toFixed(3),
                   hold_sec:chosen.hold_sec, liq_pct:+liq.toFixed(3),
                   ret5:(()=>{ const r=[]; for(let i=1;i<p.c5.length;i++) r.push(Math.log(p.c5[i]/p.c5[i-1])); return r.slice(-36); })(),
                   fill_prob: chosen.fill_prob,
@@ -934,7 +852,7 @@ jobs:
                   slip_bps_long: slipL, slip_bps_short: slipS,
                   spread_bps_entry: p.spreadBps
                 });
-              }catch{}
+              }catch(e){ console.log("[warn] refine", e?.message||e); }
             }
             refined.sort((a,b)=> b.exp_lcb_bps - a.exp_lcb_bps || b.exp_bps - a.exp_bps || b.score - a.score || (b.qv||0)-(a.qv||0));
             snapCounts({ refined: refined.length });
@@ -942,7 +860,10 @@ jobs:
 
             // Strict selection
             const strictOk=(cand)=>{
-              const common = cand.p_lcb>=0.60 && cand.exp_lcb_bps>=Math.max(cand.dyn_floor+3, EXP_LCB_MIN_BPS+3) && (cand.fill_prob||0)>=0.65 && cand.spread_bps<=MAX_SPREAD_BPS;
+              const common = cand.p_lcb>=0.60
+                && cand.exp_lcb_bps>=Math.max(cand.dyn_floor, EXP_LCB_MIN_BPS)
+                && (cand.fill_prob||0)>=0.65
+                && cand.spread_bps<=MAX_SPREAD_BPS;
               if(!common) return false;
               if(cand.side==="long"){ if(cand.cost_bps>LONG_MAX_COST_BPS) return false; if(cand.tp_bps < LONG_EDGE_MULT_MIN*cand.cost_bps) return false; }
               else { if(cand.cost_bps>Math.max(FEES_BPS+8,18)) return false; }
@@ -961,17 +882,21 @@ jobs:
             // Fallback top-up (ALWAYS3_ENABLE=true)
             const fallbackAdded=[];
             const fbDrop={ tf:0, cost:0, plcblow:0, edge:0, naughty:0, spread:0, sim:0, shortADX:0 };
+            const fbConsidered = []; // candidates that passed fallback gates (pre-correlation)
             if(ALWAYS3_ENABLE && selected.length < TARGET_K){
               const have=new Set(selected.map(s=>s.symbol));
-              const tryAdd=(candList)=>{
+              const tryAdd= async (candList)=>{
                 for(const cand of candList){
                   if(selected.length>=TARGET_K) break;
                   if(have.has(cand.symbol)) continue;
-                  // refined-like gating for fallback (slightly looser floors)
+                  
+                  // Per-key kill switch (placeholder for future implementation)
+                  // const key = `${cand.side}_${cand.regime}`;
+                  // if(state.metrics?.by_key?.[key]?.n > 60 && state.metrics.by_key[key].auc < 0.5) continue;
+                  
                   if(cand.side==="long"){
                     const btcOK = ALWAYS3_REQUIRE_BTC_GREEN ? btcGreen : true;
-                    const tfOK = btcOK && (cand.fill_prob||0)>=0.55;
-                    if(!tfOK){ fbDrop.tf++; continue; }
+                    if(!btcOK || !(cand.fill_prob||0)>=0.55){ fbDrop.tf++; continue; }
                     if(LONG_NAUGHTY_BASES.has(cand.base.toUpperCase())){ fbDrop.naughty++; continue; }
                     if(cand.spread_bps>MAX_SPREAD_BPS){ fbDrop.spread++; continue; }
                     if(cand.cost_bps>LONG_MAX_COST_BPS){ fbDrop.cost++; continue; }
@@ -982,86 +907,97 @@ jobs:
                     if(!(cand.p_lcb>=FALLBACK_PLCB_SHORT)){ fbDrop.plcblow++; continue; }
                     if(!(cand.exp_lcb_bps>=EXP_LCB_MIN_BPS_FB)){ fbDrop.edge++; continue; }
                   }
-                  let ok=true; for(const s of selected){ const r=corr(cand.ret5||[],s.ret5||[]); if(cand.side==="long" && s.side==="long" && r>LONG_SIMILARITY_RHO){ ok=false; break; } if(r>0.90){ ok=false; break; } }
+                  
+                  fbConsidered.push({
+                    symbol: cand.symbol,
+                    side: cand.side,
+                    p_lcb: cand.p_lcb,
+                    ev: cand.exp_lcb_bps,
+                    score: cand.score ?? 0,
+                    adx: cand.adx,
+                    atr_bps: cand.atr_bps
+                  });
+
+                  let ok=true; for(const s of selected){ const r=corr(cand.ret5||[],s.ret5||[]); if((cand.side === "long" && s.side === "long" && r > LONG_SIMILARITY_RHO) || r > 0.90) { ok = false; break; } }
                   if(!ok){ fbDrop.sim++; continue; }
+
                   selected.push({ ...cand, mp_fill:true, tier:"fallback" });
                   fallbackAdded.push(cand.symbol);
                   have.add(cand.symbol);
                 }
               };
-              
-              const fbCands = [];
+
               if (refined.length === 0) {
+                let fbCands = [];
                 for (const p of picksRaw) {
                   try {
                     const book = bookMap.get(p.c.symbol);
                     if (!book?.bid || !book?.ask) continue;
-                    const mid = (book.bid + book.ask) / 2;
                     const costL = FEES_BPS + Math.max(0, Math.round(p.spreadBps/2));
                     const costS = FEES_BPS + Math.max(0, Math.round(p.spreadBps/2));
                     if (Math.max(costL, costS) > MAX_COST_BPS_HARD) continue;
-              
+                    
                     const pLong_lcb = wilsonLCB(p.pLong0, 80, WILSON_Z);
                     const pShort_lcb= wilsonLCB(p.pShort0,80, WILSON_Z);
-              
+                    
+                    const strongTrend = (p.adx5 > 22) || (p.slope_atr50 > MR_SLOPE_MAX_ATR50);
+                    const regime = p.mrLocked ? "trend" : (strongTrend ? "trend" : "meanrevert");
+                    const style = regime === "meanrevert" ? "mr" : (strongTrend ? "momentum" : "trend");
                     const atr = Math.max(4, Math.min(260, p.atr_bps||0));
+
                     if (ALLOWED.has("long")) {
+                      let slL = Math.min(Math.round(Math.max(0.5*atr, 0.35*atr)), MAX_FALLBACK_SL_BPS);
                       const tpL = Math.round(Math.max(0.9*atr, 0.6*atr));
-                      const slL = Math.round(Math.max(0.5*atr, 0.35*atr));
                       const evL = Math.round(pLong_lcb*tpL - (1-pLong_lcb)*slL - costL);
+                      
                       const btcOK = ALWAYS3_REQUIRE_BTC_GREEN ? (btcGreen===true) : true;
-                      const tfOK  = btcOK && (p.up15 && p.up1h);
-                      const naughty = LONG_NAUGHTY_BASES.has(p.c.base.toUpperCase());
-                      if (!naughty && p.spreadBps<=MAX_SPREAD_BPS && costL<=LONG_MAX_COST_BPS &&
-                          pLong_lcb>=FALLBACK_PLCB_LONG && evL>=EXP_LCB_MIN_BPS_FB && tfOK) {
+                      const allowedLong = btcOK && p.up15 && p.up1h && !p.noLongDown && !LONG_NAUGHTY_BASES.has(p.c.base.toUpperCase()) && p.vol1h_est_usd >= MIN_VOL_1H_USD && costL <= LONG_MAX_COST_BPS;
+                      const mrOk = !p.mrLocked && p.fadeLongDivergenceOK && p.adx5 <= MR_ADX_MAX_DEFAULT && p.slope_atr50 <= MR_SLOPE_MAX_ATR50 && p.spreadBps <= MR_SPREAD_MAX_BPS;
+                      
+                      if (allowedLong && (regime!=="meanrevert" || mrOk) && pLong_lcb>=FALLBACK_PLCB_LONG && evL>=EXP_LCB_MIN_BPS_FB) {
                         fbCands.push({
-                          symbol:p.c.symbol, base:p.c.base, quote:p.c.quote, qv:p.c.qv,
-                          side:"long", p_lcb:+pLong_lcb.toFixed(3), p_raw:+p.pLong0.toFixed(3),
+                          symbol:p.c.symbol, base:p.c.base, quote:p.c.quote, qv:p.c.qv, side:"long", p_lcb:+pLong_lcb.toFixed(3), p_raw:+p.pLong0.toFixed(3),
                           exp_bps:0, exp_lcb_bps:evL, tp_bps:tpL, sl_bps:slL, rrr:+(tpL/Math.max(1,slL)).toFixed(2),
-                          spread_bps:p.spreadBps, cost_bps:costL, adx:+(p.adx5||0).toFixed(1), atr_bps:atr,
-                          regime: (p.mrLocked || (p.adx5>22) ? "trend":"meanrevert"), style:"trend",
-                          score: 60, n_conf:60, obi:0, hold_sec:720, liq_pct:1.0,
-                          ret5:(()=>{ const r=[]; for(let i=1;i<p.c5.length;i++) r.push(Math.log(p.c5[i]/p.c5[i-1])); return r.slice(-36); })(),
-                          fill_prob:0.7, dyn_floor:EXP_LCB_MIN_BPS_FB,
+                          spread_bps:p.spreadBps, cost_bps:costL, adx:+(p.adx5||0).toFixed(1), atr_bps:atr, regime, style,
+                          score: 60, n_conf:60, obi: p.obi||0, hold_sec:720, liq_pct: p.liq_pct || 0,
+                          ret5:(()=>{ const r=[]; for(let i=1;i<p.c5.length;i++) r.push(Math.log(p.c5[i]/p.c5[i-1])); return r.slice(-36); })(), fill_prob:0.7, dyn_floor:EXP_LCB_MIN_BPS_FB,
                           rsi14:p.rsi14, z_vwap:p.z_vwap, vol1h_est_usd:p.vol1h_est_usd, depth1p_usd:0,
-                          direction_env:DIRECTION, side_bias:p.trendBias,
-                          entry_book:{ bid:book.bid, ask:book.ask }, slip_bps_long:Math.round(p.spreadBps/2), slip_bps_short:Math.round(p.spreadBps/2),
-                          spread_bps_entry:p.spreadBps
+                          direction_env:DIRECTION, side_bias:p.trendBias, entry_book:{ bid:book.bid, ask:book.ask }, slip_bps_long:Math.round(p.spreadBps/2), slip_bps_short:Math.round(p.spreadBps/2), spread_bps_entry:p.spreadBps
                         });
                       }
                     }
                     if (ALLOWED.has("short")) {
+                      let slS = Math.min(Math.round(0.55*atr), MAX_FALLBACK_SL_BPS);
                       const tpS = Math.round(1.0*atr);
-                      const slS = Math.round(0.55*atr);
                       const evS = Math.round(pShort_lcb*tpS - (1-pShort_lcb)*slS - costS);
-                      if (p.adx5>=FALLBACK_SHORT_ADX_MIN && p.spreadBps<=MAX_SPREAD_BPS &&
-                          pShort_lcb>=FALLBACK_PLCB_SHORT && evS>=EXP_LCB_MIN_BPS_FB) {
+                      if (p.adx5>=FALLBACK_SHORT_ADX_MIN && p.spreadBps<=MAX_SPREAD_BPS && pShort_lcb>=FALLBACK_PLCB_SHORT && evS>=EXP_LCB_MIN_BPS_FB) {
                         fbCands.push({
-                          symbol:p.c.symbol, base:p.c.base, quote:p.c.quote, qv:p.c.qv,
-                          side:"short", p_lcb:+pShort_lcb.toFixed(3), p_raw:+p.pShort0.toFixed(3),
+                          symbol:p.c.symbol, base:p.c.base, quote:p.c.quote, qv:p.c.qv, side:"short", p_lcb:+pShort_lcb.toFixed(3), p_raw:+p.pShort0.toFixed(3),
                           exp_bps:0, exp_lcb_bps:evS, tp_bps:tpS, sl_bps:slS, rrr:+(tpS/Math.max(1,slS)).toFixed(2),
-                          spread_bps:p.spreadBps, cost_bps:costS, adx:+(p.adx5||0).toFixed(1), atr_bps:atr,
-                          regime: (p.mrLocked || (p.adx5>22) ? "trend":"meanrevert"), style:"trend",
-                          score: 60, n_conf:60, obi:0, hold_sec:720, liq_pct:1.0,
-                          ret5:(()=>{ const r=[]; for(let i=1;i<p.c5.length;i++) r.push(Math.log(p.c5[i]/p.c5[i-1])); return r.slice(-36); })(),
-                          fill_prob:0.7, dyn_floor:EXP_LCB_MIN_BPS_FB,
+                          spread_bps:p.spreadBps, cost_bps:costS, adx:+(p.adx5||0).toFixed(1), atr_bps:atr, regime, style,
+                          score: 60, n_conf:60, obi: p.obi||0, hold_sec:720, liq_pct: p.liq_pct || 0,
+                          ret5:(()=>{ const r=[]; for(let i=1;i<p.c5.length;i++) r.push(Math.log(p.c5[i]/p.c5[i-1])); return r.slice(-36); })(), fill_prob:0.7, dyn_floor:EXP_LCB_MIN_BPS_FB,
                           rsi14:p.rsi14, z_vwap:p.z_vwap, vol1h_est_usd:p.vol1h_est_usd, depth1p_usd:0,
-                          direction_env:DIRECTION, side_bias:p.trendBias,
-                          entry_book:{ bid:book.bid, ask:book.ask }, slip_bps_long:Math.round(p.spreadBps/2), slip_bps_short:Math.round(p.spreadBps/2),
-                          spread_bps_entry:p.spreadBps
+                          direction_env:DIRECTION, side_bias:p.trendBias, entry_book:{ bid:book.bid, ask:book.ask }, slip_bps_long:Math.round(p.spreadBps/2), slip_bps_short:Math.round(p.spreadBps/2), spread_bps_entry:p.spreadBps
                         });
                       }
                     }
                   } catch {}
                 }
                 fbCands.sort((a,b)=> b.exp_lcb_bps - a.exp_lcb_bps || b.rrr - a.rrr || (b.qv||0)-(a.qv||0));
-                tryAdd(fbCands);
+                
+                // TODO: Depth check for top 4-6 fbCands before tryAdd
+                await tryAdd(fbCands);
               }
               
-              if (refined.length > 0) tryAdd(refined);
+              if (refined.length > 0) await tryAdd(refined);
+              
+              const fbTop5 = [...fbConsidered].sort((a,b) => b.ev - a.ev || b.score - a.score).slice(0,5);
+              const fbMinScorePass = fbConsidered.length ? Math.min(...fbConsidered.map(x => x.score ?? 0)) : null;
+              console.log("[log] fallback.top5_considered", { top5: fbTop5, min_score_pass: fbMinScorePass, considered: fbConsidered.length, pushed: fallbackAdded.length, drops: fbDrop });
             }
-            console.log("[stats] fallback", { enabled: ALWAYS3_ENABLE, added: fallbackAdded.length, drops: fbDrop });
-
+            console.log("[stats] final selection", { selected: selected.length });
+            
             snapCounts({ selected: selected.length });
 
             // Assemble picks
@@ -1094,7 +1030,7 @@ jobs:
               }
               if(x.mp_fill) size_bps = Math.round(size_bps * ALWAYS3_SIZE_FACTOR);
 
-              // long-side kill downsize
+              // TODO: Implement per-key kill switch based on state.metrics
               try{
                 const last200=(state.closed||[]).slice(-200);
                 const longs=last200.filter(r=>r.side==="long");
@@ -1118,7 +1054,6 @@ jobs:
                 ret5:x.ret5, direction_env:x.direction_env, side_bias:x.side_bias,
                 vol1h_est_usd:x.vol1h_est_usd, depth1p_usd:x.depth1p_usd||0, exec:exec_policy,
                 mgmt:{ be_at_r:0.6, partial_take_at_r:0.7, partial_take_pct:0.4, trail_atr_mult:0.5 },
-                // enriched pending/provenance
                 trade_id: `${x.symbol}:${entry_ts_ms}`, entry_ts_ms, ttl_ts_ms,
                 entry_book: x.entry_book, spread_bps_entry: x.spread_bps_entry, slip_bps_entry: x.side==="long" ? (x.slip_bps_long??null) : (x.slip_bps_short??null),
                 depth1p_entry_usd: x.depth1p_usd, obi_entry:x.obi||0,
@@ -1155,37 +1090,9 @@ jobs:
               }
             }catch(e){ console.log("[warn] var/es", e?.message||e); }
 
-            // Persist state (cooldown + pending + push_log)
+            // Persist state
             try{
-              const nowMs=Date.now(); const ideasTs=new Date(nowMs).toISOString();
-              for(const p of picks){
-                const bk=bookMap.get(p.symbol_full); const mid=bk? (bk.bid+bk.ask)/2 : 0;
-                const entry_mid=p.entry_mid ?? mid;
-                const entry_new=p.entry_limit ?? (p.side==="long" ? entry_mid*(1 - p.sl_bps/10000) : entry_mid*(1 + p.sl_bps/10000));
-                const tp_abs=p.tp_abs ?? (p.side==="long" ? entry_new*(1 + p.tp_bps/10000) : entry_new*(1 - p.tp_bps/10000));
-                const sl_abs=p.sl_abs ?? (p.side==="long" ? entry_new*(1 - p.sl_bps/10000) : entry_new*(1 + p.sl_bps/10000));
-                state.cooldown[p.symbol]=nowMs; state.cooldown_side[p.symbol]={ side:p.side, ts_ms:nowMs };
-                (state.pending ||= []).push({
-                  ts:ideasTs, ts_ms:nowMs, symbolFull:p.symbol_full, base:p.symbol, quote:p.quote, side:p.side,
-                  entry_policy:p.entry_policy, entry_mid, entry_price:entry_new, entry_limit:entry_new, tp_abs, sl_abs, hold_sec:p.ttl_sec,
-                  tp_bps:p.tp_bps, sl_bps:p.sl_bps, regime:p.regime, cost_bps:p.cost_bps, gp_feat:p.gp_feat, tier:p.tier, mp_fill:!!p.mp_fill,
-                  p_lcb:p.p_lcb, p_raw:p.p_raw, p_win0:p.p_win, exp_lcb_bps:p.exp_lcb_bps, style_final:p.style, direction_env:p.direction_env, calib_key:p.calib_key,
-                  trade_id: p.trade_id, entry_ts_ms: p.entry_ts_ms, ttl_ts_ms: p.ttl_ts_ms,
-                  entry_book: p.entry_book, spread_bps_entry: p.spread_bps_entry, slip_bps_entry: p.slip_bps_entry,
-                  depth1p_entry_usd: p.depth1p_entry_usd, obi_entry: p.obi_entry,
-                  notional_usd: p.notional_usd, size_bps: p.size_bps,
-                  run_id: p.run_id, code_commit_sha: p.code_commit_sha, pusher_version: p.pusher_version,
-                  config_hash: p.config_hash, exchange_base: p.exchange_base,
-                  mexc_server_time_ms: p.mexc_server_time_ms, mexc_time_offset_ms: p.mexc_time_offset_ms,
-                  p_model: p.p_model, calib_type: p.calib_type, calib_n: p.calib_n,
-                  events: p.events
-                });
-              }
-              if(state.pending.length>550) state.pending=state.pending.slice(-550);
-              state.push_log=Array.isArray(state.push_log)? state.push_log : [];
-              state.push_log.push({ ts:new Date().toISOString(), tier:(ALWAYS3_ENABLE?"strict_plus_fallback":"strict"), direction_env:DIRECTION, top_n:picks.length,
-                counts:{ strict:picks.filter(p=>!p.mp_fill).length, fallback:picks.filter(p=>p.mp_fill).length },
-                regime_post:weightsReg, symbols:picks.map(p=>({ symbol:p.symbol_full, side:p.side, style:p.style, tier:p.tier, mp_fill:!!p.mp_fill })) });
+              const nowMs=Date.now();
               state.last_ts=new Date().toISOString();
               await saveState(persist,state);
               console.log("[ok] state saved", { pending: state.pending.length, closed: (state.closed||[]).length });
@@ -1195,16 +1102,7 @@ jobs:
             const meta={
               exchange:"mexc", exchange_base:BASE,
               counts:{ universe:universe.length, refined:refined.length, selected:picks.length },
-              filters:{
-                dyn_min_qv:dynMinQV, univ_target_min:UNIV_TARGET_MIN, univ_target_max:UNIV_TARGET_MAX,
-                max_spread_bps:MAX_SPREAD_BPS, ema_fast:EMA_FAST, ema_slow:EMA_SLOW, adx_p:ADX_P, atr_p:ATR_P, vwap_5m_win:VWAP_5M_WIN,
-                depth_limit:MEXC_DEPTH_LIMIT, obi_topn:OBI_TOPN,
-                fees_bps:FEES_BPS, notional_usd:NOTIONAL,
-                exp_lcb_min_bps_strict:EXP_LCB_MIN_BPS, exp_lcb_min_bps_fb:EXP_LCB_MIN_BPS_FB,
-                always3:ALWAYS3_ENABLE, fallback_topup:true
-              },
               tier:(ALWAYS3_ENABLE?"strict_plus_fallback":"strict"),
-              schema_version:"1.2.0",
               run:{ run_id, code_commit_sha, pusher_version, config_hash, exchange_base:BASE, ...mexcTime }
             };
             const payload={ ts:new Date().toISOString(), mode:"normal", source:"external_pusher", meta:{ origin:"github_actions", ...meta }, top_n:picks.length||0, ideas:picks||[] };
@@ -1213,6 +1111,7 @@ jobs:
               const r=await fetchWithTimeout(PUSH_URL,{ method:"POST", headers:{ "Content-Type":"application/json","Authorization":`Bearer ${PUSH_TOKEN}` }, body: JSON.stringify(payload) },15000);
               let txt=""; try{ txt=await r.text(); }catch{} console.log("[ok] push status", r?.status||"ERR", (txt||"").slice(0,300));
             }catch(e){ console.log("[warn] push failed", e?.message||e); }
+
           })();
           NODE
 
