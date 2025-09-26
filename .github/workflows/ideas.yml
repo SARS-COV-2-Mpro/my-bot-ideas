@@ -65,11 +65,11 @@ jobs:
               let x=(x0==null?obs[0]:x0), p=p0;
               const out=[];
               for(const z of obs){
-                p+=q;
-                const K=p/(p+r);
-                x=x + K*(z-x);
-                p=(1-K)*p;
-                out.push(x);
+              p+=q;
+              const K=p/(p+r);
+              x=x + K*(z-x);
+              p=(1-K)*p;
+              out.push(x);
               }
               return out;
             }
@@ -287,8 +287,9 @@ jobs:
             async function getJSON(url,ms=12000,tries=2){ for(let a=0;a<tries;a++){ try{ const r=await fetchWithTimeout(url,{},ms); if(r?.ok){ return await r.json(); } }catch{} await sleep(jitter(220)); } return null; }
 
             const DIRECTION=(process.env.DIRECTION||"both").trim().toLowerCase();
-            const ALWAYS3_ENABLE_STR=(process.env.ALWAYS3_ENABLE||"false").toLowerCase();
-            const ALWAYS3_ENABLE=(ALWAYS3_ENABLE_STR==="true"||ALWAYS3_ENABLE_STR==="1");
+            const ALWAYS3_ENV_RAW = (process.env.ALWAYS3_ENABLE ?? "").toString();
+            const ALWAYS3_ENABLE = /^(true|1|yes|y|on)$/i.test(ALWAYS3_ENV_RAW.trim());
+            console.log("[env] ALWAYS3_ENABLE raw:", JSON.stringify(ALWAYS3_ENV_RAW.trim()));
             const FORCE_SIZE_BPS=Number(process.env.FORCE_SIZE_BPS||"0")||0;
 
             const EXCHANGE="mexc";
@@ -403,8 +404,11 @@ jobs:
             echo "[gha] node exited early ($EXIT_CODE)"; exit 1
           fi
 
-          # NOTE: This is the beginning of the second section, now with fixes applied.
-          set +e
+      - name: Run pusher (selection/push) — Section 2/2
+        shell: bash
+        run: |
+          set -euo pipefail
+
           node - <<'NODE'
           (async ()=>{
             'use strict';
@@ -569,7 +573,9 @@ jobs:
             async function getJSON(url,ms=12000,tries=2){ for(let a=0;a<tries;a++){ try{ const r=await fetchWithTimeout(url,{},ms); if(r?.ok){ return await r.json(); } }catch{} await sleep(jitter(220)); } return null; }
 
             const DIRECTION=(process.env.DIRECTION||"both").trim().toLowerCase();
-            const ALWAYS3_ENABLE=((process.env.ALWAYS3_ENABLE||"false").toLowerCase()==="true");
+            const ALWAYS3_ENV_RAW = (process.env.ALWAYS3_ENABLE ?? "").toString();
+            const ALWAYS3_ENABLE = /^(true|1|yes|y|on)$/i.test(ALWAYS3_ENV_RAW.trim());
+            console.log("[env] ALWAYS3_ENABLE raw:", JSON.stringify(ALWAYS3_ENV_RAW.trim()));
             const FORCE_SIZE_BPS=Number(process.env.FORCE_SIZE_BPS||"0")||0;
 
             const EXCHANGE="mexc";
@@ -634,7 +640,6 @@ jobs:
 
             const PUSH_URL=process.env.WORKER_PUSH_URL||"";
             const PUSH_TOKEN=process.env.PUSH_TOKEN||"";
-            const HEALTH_URL=(()=>{ try{ const u=new URL(PUSH_URL); return `${u.origin}${u.pathname.replace(/\/signals\/push(\?.*)?$/,"/health")}`;}catch{return PUSH_URL.replace(/\/signals\/push(\?.*)?$/,"/health");}})();
 
             // Adapter
             async function pickMexcBase(){ for(const b of MEXC_BASES){ try{ const r=await fetchWithTimeout(`${b}/api/v3/time`,{},4000); if(r?.ok) return b; }catch{} } throw new Error("No healthy MEXC base"); }
@@ -935,7 +940,7 @@ jobs:
                   slip_bps_long: slipL, slip_bps_short: slipS,
                   spread_bps_entry: p.spreadBps
                 });
-              }catch(e){ console.log("[warn] refine", e?.message||e); }
+              }catch{}
             }
             refined.sort((a,b)=> b.exp_lcb_bps - a.exp_lcb_bps || b.exp_bps - a.exp_bps || b.score - a.score || (b.qv||0)-(a.qv||0));
             snapCounts({ refined: refined.length });
@@ -990,13 +995,81 @@ jobs:
                   have.add(cand.symbol);
                 }
               };
-              tryAdd(refined); // use refined-ranked list to top-up
+              
+              const fbCands = [];
+              if (refined.length === 0) {
+                for (const p of picksRaw) {
+                  try {
+                    const book = bookMap.get(p.c.symbol);
+                    if (!book?.bid || !book?.ask) continue;
+                    const mid = (book.bid + book.ask) / 2;
+                    const costL = FEES_BPS + Math.max(0, Math.round(p.spreadBps/2));
+                    const costS = FEES_BPS + Math.max(0, Math.round(p.spreadBps/2));
+                    if (Math.max(costL, costS) > MAX_COST_BPS_HARD) continue;
+              
+                    const pLong_lcb = wilsonLCB(p.pLong0, 80, WILSON_Z);
+                    const pShort_lcb= wilsonLCB(p.pShort0,80, WILSON_Z);
+              
+                    const atr = Math.max(4, Math.min(260, p.atr_bps||0));
+                    if (ALLOWED.has("long")) {
+                      const tpL = Math.round(Math.max(0.9*atr, 0.6*atr));
+                      const slL = Math.round(Math.max(0.5*atr, 0.35*atr));
+                      const evL = Math.round(pLong_lcb*tpL - (1-pLong_lcb)*slL - costL);
+                      const btcOK = ALWAYS3_REQUIRE_BTC_GREEN ? (btcGreen===true) : true;
+                      const tfOK  = btcOK && (p.up15 && p.up1h);
+                      const naughty = LONG_NAUGHTY_BASES.has(p.c.base.toUpperCase());
+                      if (!naughty && p.spreadBps<=MAX_SPREAD_BPS && costL<=LONG_MAX_COST_BPS &&
+                          pLong_lcb>=FALLBACK_PLCB_LONG && evL>=EXP_LCB_MIN_BPS_FB && tfOK) {
+                        fbCands.push({
+                          symbol:p.c.symbol, base:p.c.base, quote:p.c.quote, qv:p.c.qv,
+                          side:"long", p_lcb:+pLong_lcb.toFixed(3), p_raw:+p.pLong0.toFixed(3),
+                          exp_bps:0, exp_lcb_bps:evL, tp_bps:tpL, sl_bps:slL, rrr:+(tpL/Math.max(1,slL)).toFixed(2),
+                          spread_bps:p.spreadBps, cost_bps:costL, adx:+(p.adx5||0).toFixed(1), atr_bps:atr,
+                          regime: (p.mrLocked || (p.adx5>22) ? "trend":"meanrevert"), style:"trend",
+                          score: 60, n_conf:60, obi:0, hold_sec:720, liq_pct:1.0,
+                          ret5:(()=>{ const r=[]; for(let i=1;i<p.c5.length;i++) r.push(Math.log(p.c5[i]/p.c5[i-1])); return r.slice(-36); })(),
+                          fill_prob:0.7, dyn_floor:EXP_LCB_MIN_BPS_FB,
+                          rsi14:p.rsi14, z_vwap:p.z_vwap, vol1h_est_usd:p.vol1h_est_usd, depth1p_usd:0,
+                          direction_env:DIRECTION, side_bias:p.trendBias,
+                          entry_book:{ bid:book.bid, ask:book.ask }, slip_bps_long:Math.round(p.spreadBps/2), slip_bps_short:Math.round(p.spreadBps/2),
+                          spread_bps_entry:p.spreadBps
+                        });
+                      }
+                    }
+                    if (ALLOWED.has("short")) {
+                      const tpS = Math.round(1.0*atr);
+                      const slS = Math.round(0.55*atr);
+                      const evS = Math.round(pShort_lcb*tpS - (1-pShort_lcb)*slS - costS);
+                      if (p.adx5>=FALLBACK_SHORT_ADX_MIN && p.spreadBps<=MAX_SPREAD_BPS &&
+                          pShort_lcb>=FALLBACK_PLCB_SHORT && evS>=EXP_LCB_MIN_BPS_FB) {
+                        fbCands.push({
+                          symbol:p.c.symbol, base:p.c.base, quote:p.c.quote, qv:p.c.qv,
+                          side:"short", p_lcb:+pShort_lcb.toFixed(3), p_raw:+p.pShort0.toFixed(3),
+                          exp_bps:0, exp_lcb_bps:evS, tp_bps:tpS, sl_bps:slS, rrr:+(tpS/Math.max(1,slS)).toFixed(2),
+                          spread_bps:p.spreadBps, cost_bps:costS, adx:+(p.adx5||0).toFixed(1), atr_bps:atr,
+                          regime: (p.mrLocked || (p.adx5>22) ? "trend":"meanrevert"), style:"trend",
+                          score: 60, n_conf:60, obi:0, hold_sec:720, liq_pct:1.0,
+                          ret5:(()=>{ const r=[]; for(let i=1;i<p.c5.length;i++) r.push(Math.log(p.c5[i]/p.c5[i-1])); return r.slice(-36); })(),
+                          fill_prob:0.7, dyn_floor:EXP_LCB_MIN_BPS_FB,
+                          rsi14:p.rsi14, z_vwap:p.z_vwap, vol1h_est_usd:p.vol1h_est_usd, depth1p_usd:0,
+                          direction_env:DIRECTION, side_bias:p.trendBias,
+                          entry_book:{ bid:book.bid, ask:book.ask }, slip_bps_long:Math.round(p.spreadBps/2), slip_bps_short:Math.round(p.spreadBps/2),
+                          spread_bps_entry:p.spreadBps
+                        });
+                      }
+                    }
+                  } catch {}
+                }
+                fbCands.sort((a,b)=> b.exp_lcb_bps - a.exp_lcb_bps || b.rrr - a.rrr || (b.qv||0)-(a.qv||0));
+                tryAdd(fbCands);
+              }
+              if (refined.length > 0) tryAdd(refined);
             }
             console.log("[stats] fallback", { enabled: ALWAYS3_ENABLE, added: fallbackAdded.length, drops: fbDrop });
 
             snapCounts({ selected: selected.length });
 
-            // Assemble picks
+            // Assemble and push
             const wEv=softmax(selected.map(x=>x.exp_lcb_bps),20);
             let picks = selected.map((x,i)=>{
               const bk=bookMap.get(x.symbol); const mid=(bk?.bid && bk?.ask)? ((+bk.bid + +bk.ask)/2) : null;
@@ -1017,7 +1090,6 @@ jobs:
               }
               const ttl=clamp(Math.round((x.hold_sec||720)+i*12), TTL_MIN, TTL_MAX);
 
-              // Sizing
               let size_bps=0;
               if(FORCE_SIZE_BPS>0) size_bps=Math.round(FORCE_SIZE_BPS);
               else{
@@ -1026,53 +1098,15 @@ jobs:
               }
               if(x.mp_fill) size_bps = Math.round(size_bps * ALWAYS3_SIZE_FACTOR);
 
-              // long-side kill downsize
-              try{
-                const last200=(state.closed||[]).slice(-200);
-                const longs=last200.filter(r=>r.side==="long");
-                const n=longs.length, wins=longs.filter(r=>(r.pnl_bps||0)>0).length, pnlSum=sum(longs.map(r=>r.pnl_bps||0));
-                const wr = n>0? wins/n : 1;
-                const killActive=(n>=LONG_KILL_MIN_TRADES)&&((wr<LONG_KILL_WINRATE)|| (pnlSum<0));
-                if(killActive && x.side==="long") size_bps=Math.max(4, Math.round(size_bps*LONG_KILL_SIZE_MULT));
-              }catch{}
-
-              const exec_policy = { exec:"maker_or_strict_limit", max_slip_bps:3, prefer_post_only: (x.spread_bps||99)<=6 && (x.depth1p_usd||0)>=DEPTH_1P_MIN_USD };
-              const entry_ts_ms = Date.now(); const ttl_ts_ms = entry_ts_ms + ttl*1000;
               return { symbol:x.base, symbol_full:x.symbol, quote:x.quote,
-                side:x.side, rank:i+1, ttl_sec:ttl, p_win:x.p_win, p_lcb:x.p_lcb, p_raw:x.p_raw, calib_key:`${x.side}_${String(x.regime).includes("mean")?"mr":"trend"}`,
+                side:x.side, rank:i+1, ttl_sec:ttl, p_win:x.p_win, p_lcb:x.p_lcb, p_raw:x.p_raw,
                 tp_bps:x.tp_bps, sl_bps:x.sl_bps, rrr:+(x.tp_bps/Math.max(1,x.sl_bps)).toFixed(2),
                 exp_lcb_bps:x.exp_lcb_bps, ev_bps:x.exp_bps,
-                spread_bps:x.spread_bps, cost_bps:x.cost_bps, adx:x.adx, atr_bps:x.atr_bps, n_conf:x.n_conf, obi:x.obi||0,
-                regime:x.regime, style:x.style, liq_pct:x.liq_pct, fill_prob:x.fill_prob||0.5,
+                spread_bps:x.spread_bps, cost_bps:x.cost_bps,
                 entry_policy, entry_type:"limit", activation:"on_fill", entry_mid:mid, entry_limit, tp_abs, sl_abs,
-                size_bps, tier:(x.mp_fill?"fallback":"strict"), mp_fill:!!x.mp_fill,
-                gp_feat:[ clamp((x.adx-16)/14,0,1), clamp(x.side==="long"? (x.z_vwap??0) : -(x.z_vwap??0), -3,3), x.side==="long"? ((x.rsi14??50)/100) : ((100-(x.rsi14??50))/100), 0.0, 0.0 ],
-                ret5:x.ret5, direction_env:x.direction_env, side_bias:x.side_bias,
-                vol1h_est_usd:x.vol1h_est_usd, depth1p_usd:x.depth1p_usd||0, exec:exec_policy,
-                mgmt:{ be_at_r:0.6, partial_take_at_r:0.7, partial_take_pct:0.4, trail_atr_mult:0.5 },
-                // enriched pending/provenance
-                trade_id: `${x.symbol}:${entry_ts_ms}`, entry_ts_ms, ttl_ts_ms,
-                entry_book: x.entry_book, spread_bps_entry: x.spread_bps_entry, slip_bps_entry: x.side==="long" ? (x.slip_bps_long??null) : (x.slip_bps_short??null),
-                depth1p_entry_usd: x.depth1p_usd, obi_entry:x.obi||0,
-                notional_usd: NOTIONAL, size_bps,
-                run_id: run_id, code_commit_sha: code_commit_sha, pusher_version: pusher_version,
-                config_hash: config_hash, exchange_base: BASE,
-                mexc_server_time_ms: mexcTime.mexc_server_time_ms, mexc_time_offset_ms: mexcTime.mexc_time_offset_ms,
-                p_model:{ gp_hash:"lite", calib_type:"mixed", calib_n:0 }, calib_type:"raw", calib_n:0,
-                events: [{ ts_ms: entry_ts_ms, type:"selected", meta:{ tier: (x.mp_fill?"fallback":"strict"), score: x.score } }]
+                size_bps, tier:(x.mp_fill?"fallback":"strict"), mp_fill:!!x.mp_fill
               };
             });
-
-            // Cap fallback risk to 25%
-            try{
-              const fb=picks.filter(p=>p.mp_fill);
-              const fbRisk=fb.reduce((a,p)=> a + (p.size_bps||0)*Math.max(1,p.sl_bps||1), 0);
-              const cap = 0.25 * TARGET_PORT_RISK_BPS * 100;
-              if(fbRisk > cap && fbRisk>0){
-                const scale = cap/fbRisk;
-                for (const p of fb) p.size_bps = Math.max(0, Math.round(p.size_bps * scale));
-              }
-            }catch{}
 
             // VaR/ES throttle
             try{
@@ -1085,58 +1119,12 @@ jobs:
               }else{
                 console.log("[ok] var/es", varStats);
               }
-            }catch(e){ console.log("[warn] var/es", e?.message||e); }
+            }catch{}
 
-            // Persist state (cooldown + pending + push_log)
-            try{
-              const nowMs=Date.now(); const ideasTs=new Date(nowMs).toISOString();
-              for(const p of picks){
-                const bk=bookMap.get(p.symbol_full); const mid=bk? (bk.bid+bk.ask)/2 : 0;
-                const entry_mid=p.entry_mid ?? mid;
-                const entry_new=p.entry_limit ?? (p.side==="long" ? entry_mid*(1 - p.sl_bps/10000) : entry_mid*(1 + p.sl_bps/10000));
-                const tp_abs=p.tp_abs ?? (p.side==="long" ? entry_new*(1 + p.tp_bps/10000) : entry_new*(1 - p.tp_bps/10000));
-                const sl_abs=p.sl_abs ?? (p.side==="long" ? entry_new*(1 - p.sl_bps/10000) : entry_new*(1 + p.sl_bps/10000));
-                state.cooldown[p.symbol]=nowMs; state.cooldown_side[p.symbol]={ side:p.side, ts_ms:nowMs };
-                (state.pending ||= []).push({
-                  ts:ideasTs, ts_ms:nowMs, symbolFull:p.symbol_full, base:p.symbol, quote:p.quote, side:p.side,
-                  entry_policy:p.entry_policy, entry_mid, entry_price:entry_new, entry_limit:entry_new, tp_abs, sl_abs, hold_sec:p.ttl_sec,
-                  tp_bps:p.tp_bps, sl_bps:p.sl_bps, regime:p.regime, cost_bps:p.cost_bps, gp_feat:p.gp_feat, tier:p.tier, mp_fill:!!p.mp_fill,
-                  p_lcb:p.p_lcb, p_raw:p.p_raw, p_win0:p.p_win, exp_lcb_bps:p.exp_lcb_bps, style_final:p.style, direction_env:p.direction_env, calib_key:p.calib_key,
-                  trade_id: p.trade_id, entry_ts_ms: p.entry_ts_ms, ttl_ts_ms: p.ttl_ts_ms,
-                  entry_book: p.entry_book, spread_bps_entry: p.spread_bps_entry, slip_bps_entry: p.slip_bps_entry,
-                  depth1p_entry_usd: p.depth1p_entry_usd, obi_entry: p.obi_entry,
-                  notional_usd: p.notional_usd, size_bps: p.size_bps,
-                  run_id: p.run_id, code_commit_sha: p.code_commit_sha, pusher_version: p.pusher_version,
-                  config_hash: p.config_hash, exchange_base: p.exchange_base,
-                  mexc_server_time_ms: p.mexc_server_time_ms, mexc_time_offset_ms: p.mexc_time_offset_ms,
-                  p_model: p.p_model, calib_type: p.calib_type, calib_n: p.calib_n,
-                  events: p.events
-                });
-              }
-              if(state.pending.length>550) state.pending=state.pending.slice(-550);
-              state.push_log=Array.isArray(state.push_log)? state.push_log : [];
-              state.push_log.push({ ts:new Date().toISOString(), tier:(ALWAYS3_ENABLE?"strict_plus_fallback":"strict"), direction_env:DIRECTION, top_n:picks.length,
-                counts:{ strict:picks.filter(p=>!p.mp_fill).length, fallback:picks.filter(p=>p.mp_fill).length },
-                regime_post:weightsReg, symbols:picks.map(p=>({ symbol:p.symbol_full, side:p.side, style:p.style, tier:p.tier, mp_fill:!!p.mp_fill })) });
-              state.last_ts=new Date().toISOString();
-              await saveState(persist,state);
-              console.log("[ok] state saved", { pending: state.pending.length, closed: (state.closed||[]).length });
-            }catch(e){ console.log("[warn] state save", e?.message||e); }
-
-            // POST
             const meta={
               exchange:"mexc", exchange_base:BASE,
               counts:{ universe:universe.length, refined:refined.length, selected:picks.length },
-              filters:{
-                dyn_min_qv:dynMinQV, univ_target_min:UNIV_TARGET_MIN, univ_target_max:UNIV_TARGET_MAX,
-                max_spread_bps:MAX_SPREAD_BPS, ema_fast:EMA_FAST, ema_slow:EMA_SLOW, adx_p:ADX_P, atr_p:ATR_P, vwap_5m_win:VWAP_5M_WIN,
-                depth_limit:MEXC_DEPTH_LIMIT, obi_topn:OBI_TOPN,
-                fees_bps:FEES_BPS, notional_usd:NOTIONAL,
-                exp_lcb_min_bps_strict:EXP_LCB_MIN_BPS, exp_lcb_min_bps_fb:EXP_LCB_MIN_BPS_FB,
-                always3:ALWAYS3_ENABLE, fallback_topup:true
-              },
               tier:(ALWAYS3_ENABLE?"strict_plus_fallback":"strict"),
-              schema_version:"1.2.0",
               run:{ run_id, code_commit_sha, pusher_version, config_hash, exchange_base:BASE, ...mexcTime }
             };
             const payload={ ts:new Date().toISOString(), mode:"normal", source:"external_pusher", meta:{ origin:"github_actions", ...meta }, top_n:picks.length||0, ideas:picks||[] };
