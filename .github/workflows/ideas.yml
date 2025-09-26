@@ -60,6 +60,19 @@ jobs:
             const ema=(arr,p)=>{ if(!arr||arr.length<p) return null; const k=2/(p+1); let e=arr.slice(0,p).reduce((a,b)=>a+b,0)/p; for(let i=p;i<arr.length;i++) e=arr[i]*k+e*(1-k); return e; };
             const emaSeries=(arr,p)=>{ if(!arr||arr.length<p) return null; const k=2/(p+1); const out=Array(arr.length).fill(null); let e=arr.slice(0,p).reduce((a,b)=>a+b,0)/p; out[p-1]=e; for(let i=p;i<arr.length;i++){ e=arr[i]*k+e*(1-k); out[i]=e; } return out; };
             const rsi=(cl,p=14)=>{ if(!cl||cl.length<=p) return null; let g=0,l=0; for(let i=1;i<=p;i++){ const d=cl[i]-cl[i-1]; g+=Math.max(0,d); l+=Math.max(0,-d); } let ag=g/p, al=l/p; for(let i=p+1;i<cl.length;i++){ const d=cl[i]-cl[i-1]; ag=(ag*(p-1)+Math.max(0,d))/p; al=(al*(p-1)+Math.max(0,-d))/p; } const rs=al===0?100:ag/al; return 100-100/(1+rs); };
+            function kalman1D(obs,{q=1e-5,r=1e-3,x0=null,p0=1e-2}={}){
+              if(!obs?.length) return [];
+              let x=(x0==null?obs[0]:x0), p=p0;
+              const out=[];
+              for(const z of obs){
+                p+=q;
+                const K=p/(p+r);
+                x=x + K*(z-x);
+                p=(1-K)*p;
+                out.push(x);
+              }
+              return out;
+            }
             const computeADX_ATR=(h,l,c,p=14)=>{ const n=c.length; if(n<p+2) return null; const TR=[],plusDM=[],minusDM=[];
               for(let i=1;i<n;i++){ const up=h[i]-h[i-1], down=l[i-1]-l[i]; plusDM.push((up>down&&up>0)?up:0); minusDM.push((down>up&&down>0)?down:0);
                 TR.push(Math.max(h[i]-l[i], Math.abs(h[i]-c[i-1]), Math.abs(l[i]-c[i-1]))); }
@@ -92,21 +105,6 @@ jobs:
                 const next = { ...prev, ...partial };
                 fs.writeFileSync('/tmp/pusher_counts.json', JSON.stringify(next));
               }catch{}
-            }
-
-            // Kalman (1D RW)
-            function kalman1D(obs,{q=1e-5,r=1e-3,x0=null,p0=1e-2}={}){
-              if(!obs?.length) return [];
-              let x=(x0==null?obs[0]:x0), p=p0;
-              const out=[];
-              for(const z of obs){
-                p+=q;
-                const K=p/(p+r);
-                x=x + K*(z-x);
-                p=(1-K)*p;
-                out.push(x);
-              }
-              return out;
             }
 
             // ---- Crypto + stable stringify for hashes ----
@@ -288,13 +286,11 @@ jobs:
             async function fetchWithTimeout(url,opts={},ms=12000){ const ac=new AbortController(); const t=setTimeout(()=>ac.abort(),ms); try{ return await fetch(url,{...opts,signal:ac.signal,headers:{"User-Agent":UA,...(opts?.headers||{})}});} finally{ clearTimeout(t);} }
             async function getJSON(url,ms=12000,tries=2){ for(let a=0;a<tries;a++){ try{ const r=await fetchWithTimeout(url,{},ms); if(r?.ok){ return await r.json(); } }catch{} await sleep(jitter(220)); } return null; }
 
-            // Only these read from env
             const DIRECTION=(process.env.DIRECTION||"both").trim().toLowerCase();
             const ALWAYS3_ENABLE_STR=(process.env.ALWAYS3_ENABLE||"false").toLowerCase();
             const ALWAYS3_ENABLE=(ALWAYS3_ENABLE_STR==="true"||ALWAYS3_ENABLE_STR==="1");
             const FORCE_SIZE_BPS=Number(process.env.FORCE_SIZE_BPS||"0")||0;
 
-            // Hardcoded operational defaults (safe, opinionated)
             const EXCHANGE="mexc";
             const MEXC_BASES=["https://api.mexc.com","https://www.mexc.com"];
             const TOP_N=3;
@@ -329,39 +325,40 @@ jobs:
             const LONG_KILL_MIN_TRADES=20;
             const LONG_KILL_WINRATE=0.20;
             const LONG_KILL_SIZE_MULT=0.5;
-
-            // Fallback knobs (coded)
             const ALWAYS3_SIZE_FACTOR=0.15;
             const ALWAYS3_REQUIRE_BTC_GREEN=false;
             const FALLBACK_SHORT_ADX_MIN=16;
             const FALLBACK_PLCB_LONG=0.58;
             const FALLBACK_PLCB_SHORT=0.55;
-
-            // Regime/bandit (fixed simple arm)
+            const WILSON_Z=1.34;
             const MR_ADX_MAX_DEFAULT=20;
             const MR_SLOPE_MAX_ATR50=0.50;
             const MR_BREAKOUT_DC_N=120;
             const MR_BREAKOUT_RET15_ATR=1.5;
             const MR_LOCKOUT_SEC=1800;
-
-            // Universe
             const UNIV_TARGET_MIN=100, UNIV_TARGET_MAX=120;
             const DYN_QV_MIN=6_000_000;
             const DYN_QV_STEP=5_000_000;
-
-            // Hygiene
             const STABLES=new Set(["USDT","USDC","USD","USDE","USDD","BUSD","FDUSD","TUSD","DAI","USDP","PAX","USTC","STBL"]);
             const LONG_NAUGHTY_BASES=new Set(["EDU","THE","HEMI","COOKIE","MNT","ASTER","AVNT","VANA","ETHFI","SIGN","STBL"]);
             const ALLOWED=new Set(DIRECTION==="both"? ["long","short"] : [DIRECTION]);
-
             const PUSH_URL=process.env.WORKER_PUSH_URL||"";
             const PUSH_TOKEN=process.env.PUSH_TOKEN||"";
             const HEALTH_URL=(()=>{ try{ const u=new URL(PUSH_URL); return `${u.origin}${u.pathname.replace(/\/signals\/push(\?.*)?$/,"/health")}`;}catch{return PUSH_URL.replace(/\/signals\/push(\?.*)?$/,"/health");}})();
 
-            // Adapter
+            console.log("[step] health-check:", HEALTH_URL);
+            try{
+              const r=await fetchWithTimeout(HEALTH_URL,{ headers:{ "Authorization":`Bearer ${PUSH_TOKEN}`, "User-Agent":UA }},5000);
+              let t=""; try{ t=await r.text(); }catch{}
+              console.log("[ok] health:", r?.status||"ERR", (t||"").slice(0,160));
+            }catch(e){ console.log("[warn] health error:", e?.message||e); }
+
+            // ---------- MEXC Adapter ----------
             async function pickMexcBase(){ for(const b of MEXC_BASES){ try{ const r=await fetchWithTimeout(`${b}/api/v3/time`,{},4000); if(r?.ok) return b; }catch{} } throw new Error("No healthy MEXC base"); }
             const BASE=await pickMexcBase();
             const api=(path,params={})=>{ const u=new URL(path,BASE); for(const [k,v] of Object.entries(params)){ if(v!==undefined&&v!==null) u.searchParams.set(k,String(v)); } return u.toString(); };
+            async function fetchK(sym,interval,limit,startTime,endTime){ const u=api("/api/v3/klines",{symbol:sym,interval,limit,startTime,endTime}); const r=await getJSON(u,10000,2); return Array.isArray(r)?r:null; }
+            async function fetchDepth(symbol){ return await getJSON(api("/api/v3/depth",{symbol,limit:MEXC_DEPTH_LIMIT}), 10000, 2); }
             async function fetchAll24hr(){
               let all = await getJSON(api("/api/v3/ticker/24hr"), 10000, 2);
               if(Array.isArray(all) && all.length) return all;
@@ -370,20 +367,35 @@ jobs:
               const out=[]; for(let i=0;i<syms.length;i+=24){ const chunk=syms.slice(i,i+24); const got=await Promise.all(chunk.map(s=>getJSON(api("/api/v3/ticker/24hr",{symbol:s}),6000,1))); for(const x of got) if(x) out.push(x); await sleep(180); }
               return out;
             }
-            async function fetchK(sym,interval,limit,startTime,endTime){ const u=api("/api/v3/klines",{symbol:sym,interval,limit,startTime,endTime}); const r=await getJSON(u,10000,2); return Array.isArray(r)?r:null; }
             async function fetchBookTicker(symbol){ return await getJSON(api("/api/v3/ticker/bookTicker",{symbol}), 8000, 1); }
-            async function fetchDepth(symbol){ return await getJSON(api("/api/v3/depth",{symbol,limit:MEXC_DEPTH_LIMIT}), 10000, 2); }
 
-            // Provenance
+            // ---------- Provenance ----------
             async function getMexcTime(){ const j=await getJSON(api("/api/v3/time"), 8000, 2); const st=+j?.serverTime||Date.now(); return { mexc_server_time_ms: st, mexc_time_offset_ms: st - Date.now() }; }
-            const run_id=new Date().toISOString()+"#6.2";
-            const code_commit_sha=(process.env.GITHUB_SHA||"").slice(0,40);
-            const mexcTime=await getMexcTime();
-            function cfgHash(){ const cfg={ EXCHANGE, TOP_N, MAX_SPREAD_BPS, FEES_BPS, LONG_MAX_COST_BPS, MAX_COST_BPS_HARD, MR_SPREAD_MAX_BPS, EXP_LCB_MIN_BPS, EXP_LCB_MIN_BPS_FB, NOTIONAL, OBI_TOPN, MEXC_DEPTH_LIMIT, MIN_VOL_1H_USD, DEPTH_1P_MIN_USD, EMA_FAST, EMA_SLOW, ADX_P, ATR_P, VWAP_5M_WIN, TTL_MIN, TTL_MAX, TARGET_PORT_RISK_BPS, MOMENTUM_SIZE_FACTOR, NO_LONG_DOWN_ENABLE, LONG_DOWN_RSI_CUTOFF, LONG_MR_DIVERGENCE_REQ, LONG_EDGE_MULT_MIN, LONG_BOUNCE_SL_ATR, LONG_BOUNCE_TP_ATR, LONG_BOUNCE_HOLD_MIN_SEC, LONG_BOUNCE_HOLD_MAX_SEC, LONG_ENTRY_BOUNCE_OFFSET, LONG_SIMILARITY_RHO, LONG_KILL_MIN_TRADES, LONG_KILL_WINRATE, LONG_KILL_SIZE_MULT, ALWAYS3_ENABLE, ALWAYS3_SIZE_FACTOR, ALWAYS3_REQUIRE_BTC_GREEN, FALLBACK_SHORT_ADX_MIN, FALLBACK_PLCB_LONG, FALLBACK_PLCB_SHORT, MR_ADX_MAX_DEFAULT, MR_SLOPE_MAX_ATR50, MR_BREAKOUT_DC_N, MR_BREAKOUT_RET15_ATR, MR_LOCKOUT_SEC, DYN_QV_MIN, DYN_QV_STEP, STABLES:[...STABLES], LONG_NAUGHTY_BASES:[...LONG_NAUGHTY_BASES], DIRECTION }; return "sha256:"+sha256Hex(stableStringify(cfg));}
-            const config_hash=cfgHash();
+            function buildConfigHash(){
+              const cfg = {
+                EXCHANGE, TOP_N, MAX_SPREAD_BPS, EXP_LCB_MIN_BPS, EXP_LCB_MIN_BPS_FB,
+                FEES_BPS, LONG_MAX_COST_BPS, MAX_COST_BPS_HARD, MR_SPREAD_MAX_BPS,
+                NOTIONAL, MEXC_DEPTH_LIMIT, OBI_TOPN, MIN_VOL_1H_USD, DEPTH_1P_MIN_USD,
+                EMA_FAST, EMA_SLOW, ADX_P, ATR_P, VWAP_5M_WIN, TTL_MIN, TTL_MAX,
+                TARGET_PORT_RISK_BPS, MOMENTUM_SIZE_FACTOR,
+                NO_LONG_DOWN_ENABLE, LONG_DOWN_RSI_CUTOFF, LONG_MR_DIVERGENCE_REQ,
+                LONG_EDGE_MULT_MIN, LONG_BOUNCE_SL_ATR, LONG_BOUNCE_TP_ATR,
+                LONG_BOUNCE_HOLD_MIN_SEC, LONG_BOUNCE_HOLD_MAX_SEC, LONG_ENTRY_BOUNCE_OFFSET,
+                LONG_SIMILARITY_RHO, LONG_KILL_MIN_TRADES, LONG_KILL_WINRATE, LONG_KILL_SIZE_MULT,
+                ALWAYS3_ENABLE, ALWAYS3_SIZE_FACTOR, ALWAYS3_REQUIRE_BTC_GREEN,
+                FALLBACK_SHORT_ADX_MIN, FALLBACK_PLCB_LONG, FALLBACK_PLCB_SHORT,
+                MR_ADX_MAX_DEFAULT, MR_SLOPE_MAX_ATR50, MR_BREAKOUT_DC_N, MR_BREAKOUT_RET15_ATR, MR_LOCKOUT_SEC,
+                STABLES:[...STABLES], LONG_NAUGHTY_BASES:[...LONG_NAUGHTY_BASES], DIRECTION
+              };
+              return "sha256:"+sha256Hex(stableStringify(cfg));
+            }
             const pusher_version="mexc-ultimate-6.2-prime";
-            console.log("[step] start selection", { run_id, base: BASE, direction: DIRECTION, always3: ALWAYS3_ENABLE, force_size_bps: FORCE_SIZE_BPS });
-            
+            const code_commit_sha=(process.env.GITHUB_SHA||"").slice(0,40);
+            const run_id=new Date().toISOString()+"#6.2";
+            const mexcTime=await getMexcTime();
+            const config_hash=buildConfigHash();
+            let run_prov={ run_id, code_commit_sha, pusher_version, config_hash, exchange_base:BASE, ...mexcTime, p_model:{ gp_hash:null, calib_type:"mixed", calib_n:0 } };
+            console.log("[step] provenance:", { run_id, base: BASE, direction: DIRECTION, always3: ALWAYS3_ENABLE, force_size_bps: FORCE_SIZE_BPS });
           })();
           NODE
           EXIT_CODE=$?
@@ -391,11 +403,8 @@ jobs:
             echo "[gha] node exited early ($EXIT_CODE)"; exit 1
           fi
 
-      - name: Run pusher (selection/push) — Section 2/2
-        shell: bash
-        run: |
-          set -euo pipefail
-
+          # NOTE: This is the beginning of the second section, now with fixes applied.
+          set +e
           node - <<'NODE'
           (async ()=>{
             'use strict';
@@ -409,6 +418,19 @@ jobs:
             const ema=(arr,p)=>{ if(!arr||arr.length<p) return null; const k=2/(p+1); let e=arr.slice(0,p).reduce((a,b)=>a+b,0)/p; for(let i=p;i<arr.length;i++) e=arr[i]*k+e*(1-k); return e; };
             const emaSeries=(arr,p)=>{ if(!arr||arr.length<p) return null; const k=2/(p+1); const out=Array(arr.length).fill(null); let e=arr.slice(0,p).reduce((a,b)=>a+b,0)/p; out[p-1]=e; for(let i=p;i<arr.length;i++){ e=arr[i]*k+e*(1-k); out[i]=e; } return out; };
             const rsi=(cl,p=14)=>{ if(!cl||cl.length<=p) return null; let g=0,l=0; for(let i=1;i<=p;i++){ const d=cl[i]-cl[i-1]; g+=Math.max(0,d); l+=Math.max(0,-d); } let ag=g/p, al=l/p; for(let i=p+1;i<cl.length;i++){ const d=cl[i]-cl[i-1]; ag=(ag*(p-1)+Math.max(0,d))/p; al=(al*(p-1)+Math.max(0,-d))/p; } const rs=al===0?100:ag/al; return 100-100/(1+rs); };
+            function kalman1D(obs,{q=1e-5,r=1e-3,x0=null,p0=1e-2}={}){
+              if(!obs?.length) return [];
+              let x=(x0==null?obs[0]:x0), p=p0;
+              const out=[];
+              for(const z of obs){
+              p+=q;
+              const K=p/(p+r);
+              x=x + K*(z-x);
+              p=(1-K)*p;
+              out.push(x);
+              }
+              return out;
+            }
             const corr=(a,b)=>{ const n=Math.min(a?.length||0,b?.length||0); if(n<5) return 0; const as=a.slice(-n), bs=b.slice(-n); const ma=mean(as), mb=mean(bs); let num=0,da=0,db=0; for(let i=0;i<n;i++){ const xa=as[i]-ma, xb=bs[i]-mb; num+=xa*xb; da+=xa*xa; db+=xb*xb; } const den=Math.sqrt(da*db)||1; return num/den; };
             const wilsonLCB=(p,n,z=1.34)=>{ if(n<=0) return p; const z2=z*z; const a=p + z2/(2*n); const b=z*Math.sqrt((p*(1-p)+z2/(4*n))/n); const c=1+z2/n; return clamp((a-b)/c, 0, 1); };
             const softmax=(arr,t=20)=>{ const m=Math.max(...arr,0); const ex=arr.map(x=>Math.exp((x-m)/t)); const s=ex.reduce((a,b)=>a+b,0)||1; return ex.map(x=>x/s); };
@@ -547,8 +569,7 @@ jobs:
             async function getJSON(url,ms=12000,tries=2){ for(let a=0;a<tries;a++){ try{ const r=await fetchWithTimeout(url,{},ms); if(r?.ok){ return await r.json(); } }catch{} await sleep(jitter(220)); } return null; }
 
             const DIRECTION=(process.env.DIRECTION||"both").trim().toLowerCase();
-            const ALWAYS3_ENABLE_STR=(process.env.ALWAYS3_ENABLE||"false").toLowerCase();
-            const ALWAYS3_ENABLE=(ALWAYS3_ENABLE_STR==="true"||ALWAYS3_ENABLE_STR==="1");
+            const ALWAYS3_ENABLE=((process.env.ALWAYS3_ENABLE||"false").toLowerCase()==="true");
             const FORCE_SIZE_BPS=Number(process.env.FORCE_SIZE_BPS||"0")||0;
 
             const EXCHANGE="mexc";
@@ -594,6 +615,7 @@ jobs:
             const FALLBACK_PLCB_SHORT=0.55;
 
             // Regime/bandit
+            const WILSON_Z=1.34;
             const MR_ADX_MAX_DEFAULT=20;
             const MR_SLOPE_MAX_ATR50=0.50;
             const MR_BREAKOUT_DC_N=120;
@@ -612,6 +634,7 @@ jobs:
 
             const PUSH_URL=process.env.WORKER_PUSH_URL||"";
             const PUSH_TOKEN=process.env.PUSH_TOKEN||"";
+            const HEALTH_URL=(()=>{ try{ const u=new URL(PUSH_URL); return `${u.origin}${u.pathname.replace(/\/signals\/push(\?.*)?$/,"/health")}`;}catch{return PUSH_URL.replace(/\/signals\/push(\?.*)?$/,"/health");}})();
 
             // Adapter
             async function pickMexcBase(){ for(const b of MEXC_BASES){ try{ const r=await fetchWithTimeout(`${b}/api/v3/time`,{},4000); if(r?.ok) return b; }catch{} } throw new Error("No healthy MEXC base"); }
@@ -716,7 +739,7 @@ jobs:
                   const k15=await fetchK(c.symbol,"15m",K15M); const k1h=await fetchK(c.symbol,"1h",K1H);
 
                   const c5_raw=k5.map(x=>+x[4]); 
-                  const c5=kalman1D(c5_raw, {q:1e-4,r:5e-4,x0:c5_raw[0],p0:1e-2});
+                  const c5=kalman1D(c5_raw,{q:1e-4,r:5e-4,x0:c5_raw[0],p0:1e-2});
                   const h5=k5.map(x=>+x[2]), l5=k5.map(x=>+x[3]), v5=k5.map(x=>+x[5]);
                   const em21=emaSeries(c5,EMA_FAST), em50s=emaSeries(c5,EMA_SLOW), em200s=emaSeries(c5,200);
                   const em50=em50s?.at(-1), em200=em200s?.at(-1), em50Prev=em50s?.at(-51);
@@ -802,7 +825,6 @@ jobs:
                 const depth=await fetchDepth(c.symbol);
                 let obi=0, slipL=p.spreadBps/2, slipS=p.spreadBps/2, fillL=0, fillS=0, depth1pUSD=0;
                 if(depth?.asks?.length && depth?.bids?.length){
-                  // OBI, slips and fills
                   const computeOBI=(depth, topN=12)=>{
                     const w=(i)=>Math.exp(-i*0.18); let bidNot=0, askNot=0;
                     for(let i=0;i<Math.min(topN, depth.bids.length); i++){ const p=+depth.bids[i][0], q=+depth.bids[i][1]; if(p>0&&q>0) bidNot += p*q*w(i); }
@@ -863,8 +885,7 @@ jobs:
                 if(allowedLong){
                   const mrOk = allowMR("long") && (LONG_MR_DIVERGENCE_REQ ? p.fadeLongDivergenceOK : true);
                   const styleL = mrOk ? "mr" : (strongTrend ? "momentum":"trend");
-                  let holdL = mrOk ? clamp(Math.round(Math.max(1800, hold_base)), 1200, 3600)
-                                   : clamp(Math.round(Math.max(LONG_BOUNCE_HOLD_MIN_SEC, Math.min(hold_base, LONG_BOUNCE_HOLD_MAX_SEC))), LONG_BOUNCE_HOLD_MIN_SEC, LONG_BOUNCE_HOLD_MAX_SEC);
+                  let holdL = mrOk ? clamp(Math.round(Math.max(1800, hold_base)), 1200, 3600) : clamp(Math.round(Math.max(LONG_BOUNCE_HOLD_MIN_SEC, Math.min(hold_base, LONG_BOUNCE_HOLD_MAX_SEC))), LONG_BOUNCE_HOLD_MIN_SEC, LONG_BOUNCE_HOLD_MAX_SEC);
                   let slL, tpL;
                   if(styleL==="mr"){ slL=Math.round(LONG_BOUNCE_SL_ATR*p.atr_bps); tpL=Math.round(LONG_BOUNCE_TP_ATR*p.atr_bps); }
                   else { slL=Math.round(clamp(p.atr_bps*0.50, Math.round(0.35*p.atr_bps), Math.round(0.65*p.atr_bps)));
@@ -914,7 +935,7 @@ jobs:
                   slip_bps_long: slipL, slip_bps_short: slipS,
                   spread_bps_entry: p.spreadBps
                 });
-              }catch{}
+              }catch(e){ console.log("[warn] refine", e?.message||e); }
             }
             refined.sort((a,b)=> b.exp_lcb_bps - a.exp_lcb_bps || b.exp_bps - a.exp_bps || b.score - a.score || (b.qv||0)-(a.qv||0));
             snapCounts({ refined: refined.length });
@@ -938,39 +959,44 @@ jobs:
             }
             console.log("[stats] strict", { strict_selected: selected.length, target: TARGET_K });
 
-            // Fallback
+            // Fallback top-up (ALWAYS3_ENABLE=true)
             const fallbackAdded=[];
+            const fbDrop={ tf:0, cost:0, plcblow:0, edge:0, naughty:0, spread:0, sim:0, shortADX:0 };
             if(ALWAYS3_ENABLE && selected.length < TARGET_K){
               const have=new Set(selected.map(s=>s.symbol));
               const tryAdd=(candList)=>{
                 for(const cand of candList){
                   if(selected.length>=TARGET_K) break;
                   if(have.has(cand.symbol)) continue;
+                  // refined-like gating for fallback (slightly looser floors)
                   if(cand.side==="long"){
-                    if(ALWAYS3_REQUIRE_BTC_GREEN && !btcGreen) continue;
-                    if(LONG_NAUGHTY_BASES.has(cand.base.toUpperCase())) continue;
-                    if(cand.spread_bps>MAX_SPREAD_BPS) continue;
-                    if(cand.cost_bps>LONG_MAX_COST_BPS) continue;
-                    if(!(cand.p_lcb>=FALLBACK_PLCB_LONG)) continue;
-                    if(!(cand.exp_lcb_bps>=EXP_LCB_MIN_BPS_FB)) continue;
+                    const btcOK = ALWAYS3_REQUIRE_BTC_GREEN ? btcGreen : true;
+                    const tfOK = btcOK && (cand.fill_prob||0)>=0.55;
+                    if(!tfOK){ fbDrop.tf++; continue; }
+                    if(LONG_NAUGHTY_BASES.has(cand.base.toUpperCase())){ fbDrop.naughty++; continue; }
+                    if(cand.spread_bps>MAX_SPREAD_BPS){ fbDrop.spread++; continue; }
+                    if(cand.cost_bps>LONG_MAX_COST_BPS){ fbDrop.cost++; continue; }
+                    if(!(cand.p_lcb>=FALLBACK_PLCB_LONG)){ fbDrop.plcblow++; continue; }
+                    if(!(cand.exp_lcb_bps>=EXP_LCB_MIN_BPS_FB)){ fbDrop.edge++; continue; }
                   }else{
-                    if(cand.adx < FALLBACK_SHORT_ADX_MIN) continue;
-                    if(!(cand.p_lcb>=FALLBACK_PLCB_SHORT)) continue;
-                    if(!(cand.exp_lcb_bps>=EXP_LCB_MIN_BPS_FB)) continue;
+                    if(cand.adx < FALLBACK_SHORT_ADX_MIN){ fbDrop.shortADX++; continue; }
+                    if(!(cand.p_lcb>=FALLBACK_PLCB_SHORT)){ fbDrop.plcblow++; continue; }
+                    if(!(cand.exp_lcb_bps>=EXP_LCB_MIN_BPS_FB)){ fbDrop.edge++; continue; }
                   }
                   let ok=true; for(const s of selected){ const r=corr(cand.ret5||[],s.ret5||[]); if(cand.side==="long" && s.side==="long" && r>LONG_SIMILARITY_RHO){ ok=false; break; } if(r>0.90){ ok=false; break; } }
-                  if(!ok){ continue; }
+                  if(!ok){ fbDrop.sim++; continue; }
                   selected.push({ ...cand, mp_fill:true, tier:"fallback" });
                   fallbackAdded.push(cand.symbol);
                   have.add(cand.symbol);
                 }
               };
-              tryAdd(refined);
+              tryAdd(refined); // use refined-ranked list to top-up
             }
-            console.log("[stats] fallback", { enabled: ALWAYS3_ENABLE, added: fallbackAdded.length });
+            console.log("[stats] fallback", { enabled: ALWAYS3_ENABLE, added: fallbackAdded.length, drops: fbDrop });
+
             snapCounts({ selected: selected.length });
 
-            // Assemble and push
+            // Assemble picks
             const wEv=softmax(selected.map(x=>x.exp_lcb_bps),20);
             let picks = selected.map((x,i)=>{
               const bk=bookMap.get(x.symbol); const mid=(bk?.bid && bk?.ask)? ((+bk.bid + +bk.ask)/2) : null;
@@ -991,6 +1017,7 @@ jobs:
               }
               const ttl=clamp(Math.round((x.hold_sec||720)+i*12), TTL_MIN, TTL_MAX);
 
+              // Sizing
               let size_bps=0;
               if(FORCE_SIZE_BPS>0) size_bps=Math.round(FORCE_SIZE_BPS);
               else{
@@ -999,15 +1026,53 @@ jobs:
               }
               if(x.mp_fill) size_bps = Math.round(size_bps * ALWAYS3_SIZE_FACTOR);
 
+              // long-side kill downsize
+              try{
+                const last200=(state.closed||[]).slice(-200);
+                const longs=last200.filter(r=>r.side==="long");
+                const n=longs.length, wins=longs.filter(r=>(r.pnl_bps||0)>0).length, pnlSum=sum(longs.map(r=>r.pnl_bps||0));
+                const wr = n>0? wins/n : 1;
+                const killActive=(n>=LONG_KILL_MIN_TRADES)&&((wr<LONG_KILL_WINRATE)|| (pnlSum<0));
+                if(killActive && x.side==="long") size_bps=Math.max(4, Math.round(size_bps*LONG_KILL_SIZE_MULT));
+              }catch{}
+
+              const exec_policy = { exec:"maker_or_strict_limit", max_slip_bps:3, prefer_post_only: (x.spread_bps||99)<=6 && (x.depth1p_usd||0)>=DEPTH_1P_MIN_USD };
+              const entry_ts_ms = Date.now(); const ttl_ts_ms = entry_ts_ms + ttl*1000;
               return { symbol:x.base, symbol_full:x.symbol, quote:x.quote,
-                side:x.side, rank:i+1, ttl_sec:ttl, p_win:x.p_win, p_lcb:x.p_lcb, p_raw:x.p_raw,
+                side:x.side, rank:i+1, ttl_sec:ttl, p_win:x.p_win, p_lcb:x.p_lcb, p_raw:x.p_raw, calib_key:`${x.side}_${String(x.regime).includes("mean")?"mr":"trend"}`,
                 tp_bps:x.tp_bps, sl_bps:x.sl_bps, rrr:+(x.tp_bps/Math.max(1,x.sl_bps)).toFixed(2),
                 exp_lcb_bps:x.exp_lcb_bps, ev_bps:x.exp_bps,
-                spread_bps:x.spread_bps, cost_bps:x.cost_bps,
+                spread_bps:x.spread_bps, cost_bps:x.cost_bps, adx:x.adx, atr_bps:x.atr_bps, n_conf:x.n_conf, obi:x.obi||0,
+                regime:x.regime, style:x.style, liq_pct:x.liq_pct, fill_prob:x.fill_prob||0.5,
                 entry_policy, entry_type:"limit", activation:"on_fill", entry_mid:mid, entry_limit, tp_abs, sl_abs,
-                size_bps, tier:(x.mp_fill?"fallback":"strict"), mp_fill:!!x.mp_fill
+                size_bps, tier:(x.mp_fill?"fallback":"strict"), mp_fill:!!x.mp_fill,
+                gp_feat:[ clamp((x.adx-16)/14,0,1), clamp(x.side==="long"? (x.z_vwap??0) : -(x.z_vwap??0), -3,3), x.side==="long"? ((x.rsi14??50)/100) : ((100-(x.rsi14??50))/100), 0.0, 0.0 ],
+                ret5:x.ret5, direction_env:x.direction_env, side_bias:x.side_bias,
+                vol1h_est_usd:x.vol1h_est_usd, depth1p_usd:x.depth1p_usd||0, exec:exec_policy,
+                mgmt:{ be_at_r:0.6, partial_take_at_r:0.7, partial_take_pct:0.4, trail_atr_mult:0.5 },
+                // enriched pending/provenance
+                trade_id: `${x.symbol}:${entry_ts_ms}`, entry_ts_ms, ttl_ts_ms,
+                entry_book: x.entry_book, spread_bps_entry: x.spread_bps_entry, slip_bps_entry: x.side==="long" ? (x.slip_bps_long??null) : (x.slip_bps_short??null),
+                depth1p_entry_usd: x.depth1p_usd, obi_entry:x.obi||0,
+                notional_usd: NOTIONAL, size_bps,
+                run_id: run_id, code_commit_sha: code_commit_sha, pusher_version: pusher_version,
+                config_hash: config_hash, exchange_base: BASE,
+                mexc_server_time_ms: mexcTime.mexc_server_time_ms, mexc_time_offset_ms: mexcTime.mexc_time_offset_ms,
+                p_model:{ gp_hash:"lite", calib_type:"mixed", calib_n:0 }, calib_type:"raw", calib_n:0,
+                events: [{ ts_ms: entry_ts_ms, type:"selected", meta:{ tier: (x.mp_fill?"fallback":"strict"), score: x.score } }]
               };
             });
+
+            // Cap fallback risk to 25%
+            try{
+              const fb=picks.filter(p=>p.mp_fill);
+              const fbRisk=fb.reduce((a,p)=> a + (p.size_bps||0)*Math.max(1,p.sl_bps||1), 0);
+              const cap = 0.25 * TARGET_PORT_RISK_BPS * 100;
+              if(fbRisk > cap && fbRisk>0){
+                const scale = cap/fbRisk;
+                for (const p of fb) p.size_bps = Math.max(0, Math.round(p.size_bps * scale));
+              }
+            }catch{}
 
             // VaR/ES throttle
             try{
@@ -1020,12 +1085,58 @@ jobs:
               }else{
                 console.log("[ok] var/es", varStats);
               }
-            }catch{}
+            }catch(e){ console.log("[warn] var/es", e?.message||e); }
 
+            // Persist state (cooldown + pending + push_log)
+            try{
+              const nowMs=Date.now(); const ideasTs=new Date(nowMs).toISOString();
+              for(const p of picks){
+                const bk=bookMap.get(p.symbol_full); const mid=bk? (bk.bid+bk.ask)/2 : 0;
+                const entry_mid=p.entry_mid ?? mid;
+                const entry_new=p.entry_limit ?? (p.side==="long" ? entry_mid*(1 - p.sl_bps/10000) : entry_mid*(1 + p.sl_bps/10000));
+                const tp_abs=p.tp_abs ?? (p.side==="long" ? entry_new*(1 + p.tp_bps/10000) : entry_new*(1 - p.tp_bps/10000));
+                const sl_abs=p.sl_abs ?? (p.side==="long" ? entry_new*(1 - p.sl_bps/10000) : entry_new*(1 + p.sl_bps/10000));
+                state.cooldown[p.symbol]=nowMs; state.cooldown_side[p.symbol]={ side:p.side, ts_ms:nowMs };
+                (state.pending ||= []).push({
+                  ts:ideasTs, ts_ms:nowMs, symbolFull:p.symbol_full, base:p.symbol, quote:p.quote, side:p.side,
+                  entry_policy:p.entry_policy, entry_mid, entry_price:entry_new, entry_limit:entry_new, tp_abs, sl_abs, hold_sec:p.ttl_sec,
+                  tp_bps:p.tp_bps, sl_bps:p.sl_bps, regime:p.regime, cost_bps:p.cost_bps, gp_feat:p.gp_feat, tier:p.tier, mp_fill:!!p.mp_fill,
+                  p_lcb:p.p_lcb, p_raw:p.p_raw, p_win0:p.p_win, exp_lcb_bps:p.exp_lcb_bps, style_final:p.style, direction_env:p.direction_env, calib_key:p.calib_key,
+                  trade_id: p.trade_id, entry_ts_ms: p.entry_ts_ms, ttl_ts_ms: p.ttl_ts_ms,
+                  entry_book: p.entry_book, spread_bps_entry: p.spread_bps_entry, slip_bps_entry: p.slip_bps_entry,
+                  depth1p_entry_usd: p.depth1p_entry_usd, obi_entry: p.obi_entry,
+                  notional_usd: p.notional_usd, size_bps: p.size_bps,
+                  run_id: p.run_id, code_commit_sha: p.code_commit_sha, pusher_version: p.pusher_version,
+                  config_hash: p.config_hash, exchange_base: p.exchange_base,
+                  mexc_server_time_ms: p.mexc_server_time_ms, mexc_time_offset_ms: p.mexc_time_offset_ms,
+                  p_model: p.p_model, calib_type: p.calib_type, calib_n: p.calib_n,
+                  events: p.events
+                });
+              }
+              if(state.pending.length>550) state.pending=state.pending.slice(-550);
+              state.push_log=Array.isArray(state.push_log)? state.push_log : [];
+              state.push_log.push({ ts:new Date().toISOString(), tier:(ALWAYS3_ENABLE?"strict_plus_fallback":"strict"), direction_env:DIRECTION, top_n:picks.length,
+                counts:{ strict:picks.filter(p=>!p.mp_fill).length, fallback:picks.filter(p=>p.mp_fill).length },
+                regime_post:weightsReg, symbols:picks.map(p=>({ symbol:p.symbol_full, side:p.side, style:p.style, tier:p.tier, mp_fill:!!p.mp_fill })) });
+              state.last_ts=new Date().toISOString();
+              await saveState(persist,state);
+              console.log("[ok] state saved", { pending: state.pending.length, closed: (state.closed||[]).length });
+            }catch(e){ console.log("[warn] state save", e?.message||e); }
+
+            // POST
             const meta={
               exchange:"mexc", exchange_base:BASE,
               counts:{ universe:universe.length, refined:refined.length, selected:picks.length },
+              filters:{
+                dyn_min_qv:dynMinQV, univ_target_min:UNIV_TARGET_MIN, univ_target_max:UNIV_TARGET_MAX,
+                max_spread_bps:MAX_SPREAD_BPS, ema_fast:EMA_FAST, ema_slow:EMA_SLOW, adx_p:ADX_P, atr_p:ATR_P, vwap_5m_win:VWAP_5M_WIN,
+                depth_limit:MEXC_DEPTH_LIMIT, obi_topn:OBI_TOPN,
+                fees_bps:FEES_BPS, notional_usd:NOTIONAL,
+                exp_lcb_min_bps_strict:EXP_LCB_MIN_BPS, exp_lcb_min_bps_fb:EXP_LCB_MIN_BPS_FB,
+                always3:ALWAYS3_ENABLE, fallback_topup:true
+              },
               tier:(ALWAYS3_ENABLE?"strict_plus_fallback":"strict"),
+              schema_version:"1.2.0",
               run:{ run_id, code_commit_sha, pusher_version, config_hash, exchange_base:BASE, ...mexcTime }
             };
             const payload={ ts:new Date().toISOString(), mode:"normal", source:"external_pusher", meta:{ origin:"github_actions", ...meta }, top_n:picks.length||0, ideas:picks||[] };
