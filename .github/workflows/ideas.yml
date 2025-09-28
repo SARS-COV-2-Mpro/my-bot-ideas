@@ -3,7 +3,7 @@ name: Ideas Pusher (MEXC ULTIMATE EV@Pusher+, PRIME v6.2 Calibrated HeavyTail MP
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "*/20 * * * *"
 
 permissions:
   contents: read
@@ -255,6 +255,16 @@ jobs:
             function fitIsotonic(p,y){ const idx=[...p.keys()].sort((i,j)=>p[i]-p[j]); const xs=[],ys=[]; for(const i of idx){ xs.push(p[i]); ys.push(y[i]); }
               const n=xs.length,g=ys.slice(),w=Array(n).fill(1); for(let i=0;i<n-1;i++){ if(g[i]>g[i+1]){ let j=i; while(j>=0 && g[j]>g[j+1]){ const ww=w[j]+w[j+1], gg=(w[j]*g[j]+w[j+1]*g[j+1])/ww; w[j]=ww; g[j]=gg; xs.splice(j,2,(xs[j])); ys.splice(j,2,(gg)); g.splice(j+1,1); w.splice(j+1,1); if(j>0) j--; } } } return { xs, ys:g, n }; }
             function applyIsotonic(p,iso){ if(!iso?.xs?.length||!iso?.ys?.length) return p; const xs=iso.xs, ys=iso.ys; return p.map(val=>{ if(val<=xs[0]) return ys[0]; if(val>=xs[xs.length-1]) return ys[ys.length-1]; let lo=0,hi=xs.length-1; while(hi-lo>1){ const mid=((lo+hi)>>1); if(xs[mid]<=val) lo=mid; else hi=mid; } const t=(val-xs[lo])/Math.max(1e-9,(xs[hi]-xs[lo])); return ys[lo]+t*(ys[hi]-ys[lo]); }); }
+
+            function calibrateP(state,side,regime,pRaw){
+              const k = `${side}_${String(regime).includes("mean")?"mr":"trend"}`;
+              const iso = state.calibration.isotonic[k];
+              const pl  = state.calibration.platt[k];
+              let pCal = pRaw, decay = 0;
+              if (iso?.n >= 120){ pCal = (applyIsotonic([pRaw], iso))[0]; decay = iso.decay || 0; }
+              else if (pl?.n >= 30){ pCal = (applyPlatt([pRaw], pl))[0]; decay = pl.decay || 0; }
+              return (1 - decay) * pCal + decay * pRaw;
+            }
 
             // ------------- Heavy-tail Monte Carlo (t + bootstrap) -------------
             function pathEVHeavy({entry,tp_bps,sl_bps,side,retSeries,mu,sigma,steps,N=192,cost_bps=10,t_df=5,boot_block=3}){
@@ -1046,7 +1056,9 @@ jobs:
                   const pLong_lcb=wilsonLCB(pLong,80,WILSON_Z), pShort_lcb=wilsonLCB(pShort,80,WILSON_Z);
                   const yR=[]; for(let i=1;i<p.c5.length;i++) yR.push(Math.log(p.c5[i]/p.c5[i-1]));
                   const mu5=mean(yR)||0, sig5=Math.max(1e-4,std(yR));
-                  const entryMid=mid; const hold_base=clamp(Math.round((0.45>0.45? 720:560)+240*clamp((p.adx5-16)/14,0,1)), TTL_MIN, TTL_MAX); const stepsBase=Math.max(1,Math.round(hold_base/300));
+                  const entryMid=mid;
+                  const hold_base=clamp(Math.round(560 + 240*clamp((p.adx5-16)/14, 0, 1)), TTL_MIN, TTL_MAX);
+                  const stepsBase=Math.max(1,Math.round(hold_base/300));
 
                   const allowMR=(side)=>{
                     if(side==="long" && !allowedLong) return false;
@@ -1220,7 +1232,7 @@ jobs:
                       if (tp_bps / Math.max(1, sl_bps) < rrrMin) tp_bps = Math.ceil(rrrMin * sl_bps);
 
                       const ev_lcb_bps = Math.round(pLCB * tp_bps - (1 - pLCB) * sl_bps - cost_bps);
-                      if (ev_lcb_bps < A3.EV_MIN_BPS && !pass.relax) continue;
+                      if (ev_lcb_bps < A3.EV_MIN_BPS) continue;
 
                       // Notional cap by side depth
                       const sideDepthUSD = (chosenSide === "long" ? bidsUSD : asksUSD);
