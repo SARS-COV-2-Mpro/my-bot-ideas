@@ -1,4 +1,3 @@
-
 name: Ideas Pusher (MEXC Ultimate 6.3)
 
 on:
@@ -108,7 +107,7 @@ jobs:
           const vwapFillLevels=(levels,targetUSD)=>{ let remain=targetUSD,val=0,qty=0; for(const [ps,qs] of levels){ const p=+ps, q=+qs; if(!(p>0&&q>0)) continue; const can=p*q, take=Math.min(remain,can), tq=take/p; val+=p*tq; qty+=tq; remain-=take; if(remain<=1e-6) break; } return { px: qty>0? val/qty : null, filledUSD: (targetUSD-remain) }; };
           const slipFromDepth=(depth,mid,side,notionalUSD)=>{ if(!depth?.asks?.length || !depth?.bids?.length || !(mid>0)) return { slip_bps:null, fill_prob:null }; if(side==="long"){ const buy=vwapFillLevels(depth.asks, Math.max(50,notionalUSD)); const slip = buy.px? Math.max(0, Math.round((buy.px - mid)/mid*10000)) : null; const fill = Math.min(1, (buy.filledUSD||0)/Math.max(1,notionalUSD)); return { slip_bps: slip, fill_prob: +fill.toFixed(4) }; }else{ const sell=vwapFillLevels(depth.bids, Math.max(50,notionalUSD)); const slip = sell.px? Math.max(0, Math.round((mid - sell.px)/mid*10000)) : null; const fill = Math.min(1, (sell.filledUSD||0)/Math.max(1,notionalUSD)); return { slip_bps: slip, fill_prob: +fill.toFixed(4) }; } };
           const depthWithinPctUSD=(depth, mid, pct=0.01)=>{ if(!depth?.asks?.length || !depth?.bids?.length || !(mid>0)) return { bidsUSD:0, asksUSD:0 }; const askLim=mid*(1+pct), bidLim=mid*(1-pct); let asksUSD=0, bidsUSD=0; for(const [ps,qs] of depth.asks){ const p=+ps, q=+qs; if(!(p>0&&q>0)) continue; if(p<=askLim) asksUSD += p*q; else break; } for(const [ps,qs] of depth.bids){ const p=+ps, q=+qs; if(!(p>0&&q>0)) continue; if(p>=bidLim) bidsUSD += p*q; else break; } return { bidsUSD, asksUSD }; };
-          const confidenceScore=({ p_cal, ev_bps, atr_bps, micro, regime, reliability, riskAdj })=>{ const ev_norm = atr_bps>0? ev_bps/atr_bps : 0; const ev_sig = 1/(1+Math.exp(-ev_norm)); const base = 0.6*p_cal + 0.4*ev_sig; const mult = clamp((micro||1)*(regime||1)*(reliability||1)*(riskAdj||1), 0.5, 1.2); return Math.round(100*base*mult); };
+          const confidenceScore=({ p_cal, ev_bps, atr_bps, micro, regime, reliability, riskAdj })=>{ const ev_norm = atr_bps>0? ev_bps/atr_bps : 0; const ev_sig = 1/(1+Math.exp(-ev_norm)); const base = 0.6*p_cal + 0.4*ev_sig; const mult = (micro||1)*(regime||1)*(reliability||1)*(riskAdj||1); return Math.round(100*base*mult); };
           const microprice=(bid,ask,qb,qa)=>{ const d=(qb||1)+(qa||1); return (ask*qb + bid*qa)/d; };
           const ofiProxy=(d0,d1)=>{ const lev=(side,d)=>d?.[side]?.slice(0,3).map(x=>+x[1]||0)||[]; const sum=a=>a.reduce((x,y)=>x+y,0); if(!d0||!d1) return 0; return (sum(lev("bids",d1))-sum(lev("bids",d0))) - (sum(lev("asks",d1))-sum(lev("asks",d0))); };
           const bookSlope=(depth, mid)=>{ const toPts=(levels)=>{ let cum=0; const pts=[]; for(const [ps,qs] of (levels||[])){ const p=+ps,q=+qs; if(!(p>0&&q>0)) continue; cum+=p*q; const x=Math.log(Math.abs(p-mid)/mid + 1e-6), y=Math.log(cum+1); pts.push([x,y]); if(pts.length>=10) break; } return pts; }; if(!depth?.asks?.length||!depth?.bids?.length||!(mid>0)) return { slope:0, r2:0 }; const pts=toPts(depth.asks).concat(toPts(depth.bids)); if(pts.length<6) return { slope:0, r2:0 }; const xs=pts.map(p=>p[0]), ys=pts.map(p=>p[1]), mx=mean(xs), my=mean(ys); let num=0,den=0,vy=0; for(let i=0;i<xs.length;i++){ const dx=xs[i]-mx, dy=ys[i]-my; num+=dx*dy; den+=dx*dx; vy+=dy*dy; } return { slope: den>1e-9? num/den : 0, r2: den>1e-9 && vy>1e-9? (num*num)/(den*vy):0 }; };
@@ -204,7 +203,13 @@ jobs:
           while(filt.length<UNIV_TARGET_MIN && dynMinQV>1_000_000){ dynMinQV=Math.max(1_000_000, dynMinQV-DYN_QV_STEP); filt=all.filter(x=>x.qv>=dynMinQV); }
           const universe=filt.slice(0,UNIV_TARGET_MAX);
           log("universe", universe.length, "dyn_min_qv", dynMinQV);
-          const BTC="BTCUSDT", ETH="ETHUSDT", SOL="SOLUSDT"; const kBTC1H=await getKCached(BTC,"1h",K1H); const btcUp1h=(k,f=EMA_FAST,s=EMA_SLOW)=>{ if(!k?.length) return false; const c=k.map(x=>+x[4]); return c.at(-1)>=ema(c,f)&&c.at(-1)>=ema(c,s); }(kBTC1H);
+          const BTC="BTCUSDT", ETH="ETHUSDT", SOL="SOLUSDT";
+          const kBTC1H=await getKCached(BTC,"1h",K1H);
+          const btcUp1h = (() => {
+            if (!kBTC1H?.length) return false;
+            const c = kBTC1H.map(x => +x[4]);
+            return c.at(-1) >= ema(c, EMA_FAST) && c.at(-1) >= ema(c, EMA_SLOW);
+          })();
           const { state, persist } = await loadState();
           try{ await evalPending(state); }catch(e){ log("evalPending warn", e?.message||e); }
           const equityStats=(eq)=>{ const day=Date.now()-24*3600*1000; let pnl24=0,cum=0,peak=0,dd=0; for(const e of eq||[]){ if(e.ts_ms>=day) pnl24+=e.pnl_bps; cum+=e.pnl_bps; if(cum>peak) peak=cum; dd=Math.min(dd,cum-peak); } return { pnl24_bps:Math.round(pnl24), peak_dd_bps:Math.round(dd) }; };
@@ -239,8 +244,8 @@ jobs:
           if(DIRECTION!=="short" && !p.noLongDown && btcUp1h){ const tp=Math.round(LONG_BOUNCE_TP_ATR*p.atr_bps), sl=Math.round(LONG_BOUNCE_SL_ATR*p.atr_bps); const sim=pathEVHeavy({entry:mid,tp_bps:tp,sl_bps:sl,side:"long",retSeries:yR,mu:mu5,sigma:sig5,steps:4,N:192,cost_bps:costLong}); const evLCB=Math.round(pLong_lcb*tp-(1-pLong_lcb)*sl-costLong); if(tp>=LONG_EDGE_MULT_MIN*costLong && evLCB>=EXP_LCB_MIN_BPS_BASE) candLong={ side:"long", p_lcb:pLong_lcb,p_raw:p.pLong0, ev_bps:sim.ev_bps, exp_lcb_bps:evLCB, tp_bps:tp, sl_bps:sl, cost_bps:costLong, style:"mr", regime }; }
           if(DIRECTION!=="long"){ const tp=Math.round(p.atr_bps*1.0), sl=Math.round(p.atr_bps*0.5); const sim=pathEVHeavy({entry:mid,tp_bps:tp,sl_bps:sl,side:"short",retSeries:yR,mu:mu5,sigma:sig5,steps:4,N:192,cost_bps:costShort}); const evLCB=Math.round(pShort_lcb*tp-(1-pShort_lcb)*sl-costShort); if(tp>=4*costShort && evLCB>=EXP_LCB_MIN_BPS_BASE) candShort={ side:"short", p_lcb:pShort_lcb,p_raw:p.pShort0, ev_bps:sim.ev_bps, exp_lcb_bps:evLCB, tp_bps:tp, sl_bps:sl, cost_bps:costShort, style:"mr", regime }; }
           const chosen=candLong&&candShort?(candLong.exp_lcb_bps>=candShort.exp_lcb_bps?candLong:candShort):(candLong||candShort||null); if(!chosen) continue;
-          const microQ=clamp((Math.max(0,1-(p.spreadBps||0)/20))*(1-Math.min(0.6,(chosen.cost_bps-COST_BPS)/20))*(1+clamp(obi,-0.2,0.2)),0.5,1.2);
-          const regimeQ=clamp(0.7+0.4*tfAlign,0.6,1.2); const reliability=1, riskAdj=1;
+          const microQ=(Math.max(0,1-(p.spreadBps||0)/20))*(1-Math.min(0.6,(chosen.cost_bps-COST_BPS)/20))*(1+clamp(obi,-0.2,0.2));
+          const regimeQ=0.7+0.4*tfAlign; const reliability=1, riskAdj=1;
           const conf=confidenceScore({ p_cal:chosen.p_lcb, ev_bps:chosen.ev_bps, atr_bps:p.atr_bps, micro:microQ, regime:regimeQ, reliability, riskAdj });
           const slipEst=chosen.side==="long"?slipL:slipS;
           const reasons=reasonBuilder({adx1h:ind1h?.adx||0,ofi30s,tfAlign,spread_bps:p.spreadBps,slip_bps_est:slipEst});
@@ -259,12 +264,12 @@ jobs:
           const meta={ exchange:"mexc",exchange_base:BASE, counts:{universe:universe.length,refined:refined.length,selected:picks.length}, dd_gate:{pnl24_bps,peak_dd_bps,throttle}, tod:{active:S_H!=null&&E_H!=null,start:S_H,end:E_H}, tier:selectionTier, idea_logs:ideaLogs };
           const payload={ ts:new Date().toISOString(),mode:"normal",source:"external_pusher",meta:{origin:"github_actions",reason,...meta},top_n:picks.length||0,ideas:picks||[] };
           log(`pushing ${picks.length} ideas (${selectionTier}) to ${PUSH_URL}`);
-          try{ const r=await fetchWithTimeout(PUSH_URL,{method:"POST",headers:{"Content-Type":"application/json","Authorization":`Bearer ${PUSH_TOKEN}`},body:JSON.stringify(payload)},15000); let txt=""; try{ txt=await r.text(); }catch{} log("push status",r?.status||"ERR",(txt||"").slice(0,400)); }catch(e){ log("push failed",e?.message||e); }
+          try{ const r=await fetchWithTimeout(PUSH_URL,{method:"POST",headers:{\"Content-Type\":\"application/json\",\"Authorization\":\`Bearer \${PUSH_TOKEN}\`},body:JSON.stringify(payload)},15000); let txt=""; try{ txt=await r.text(); }catch{} log("push status",r?.status||"ERR",(txt||"").slice(0,400)); }catch(e){ log("push failed",e?.message||e); }
           }catch(e){
           reason=reason!=="ok"?reason:"data_error";
           const payload={ ts:new Date().toISOString(),mode:"normal",source:"external_pusher",meta:{origin:"github_actions",reason,error:(e?.message||String(e)).slice(0,220)},top_n:0,ideas:[] };
           log("pushing 0 ideas to",PUSH_URL);
-          try{ const r=await fetchWithTimeout(PUSH_URL,{method:"POST",headers:{"Content-Type":"application/json","Authorization":`Bearer ${PUSH_TOKEN}`},body:JSON.stringify(payload)},15000); let txt=""; try{ txt=await r.text(); }catch{} log("push status",r?.status||"ERR",(txt||"").slice(0,200)); }catch(e2){ log("push failed",e2?.message||e2); }
+          try{ const r=await fetchWithTimeout(PUSH_URL,{method:"POST",headers:{\"Content-Type\":\"application/json\",\"Authorization\":\`Bearer \${PUSH_TOKEN}\`},body:JSON.stringify(payload)},15000); let txt=""; try{ txt=await r.text(); }catch{} log("push status",r?.status||"ERR",(txt||"").slice(0,200)); }catch(e2){ log("push failed",e2?.message||e2); }
           }
           })();
           NODE
@@ -275,23 +280,33 @@ jobs:
           if [[ $EXIT_CODE -ne 0 ]]; then
             echo "[gha] pusher exited with code $EXIT_CODE — sending minimal payload so tail shows a [push] line"
 
+            # Sanitize and derive URLs
+            raw_push_url="$(printf '%s' "${WORKER_PUSH_URL}" | tr -d '\r\n')"
+            health_url="$(printf '%s' "${raw_push_url}" | sed -E 's#/signals/push(\?.*)?$#/health#')"
+
             # 1) Fallback health GET (guaranteed Worker hit)
-            health_url="${WORKER_PUSH_URL//\/signals\/push/\/health}"
             echo "[gha] fallback health GET ${health_url}"
-            http_code_h=$(curl -sS -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${PUSH_TOKEN}" --max-time 8 "${health_url}" || true)
+            http_code_h=$(curl -g -sS -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bearer ${PUSH_TOKEN}" \
+              --max-time 8 \
+              "${health_url}" || true)
             echo "[gha] fallback health status ${http_code_h}"
 
             # 2) Minimal POST with 0 ideas
             now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
             payload='{"ts":"'"${now}"'","mode":"normal","source":"external_pusher","meta":{"origin":"github_actions","reason":"fallback_node_error"},"top_n":0,"ideas":[]}'
-            echo "[gha] pushing 0 ideas to ${WORKER_PUSH_URL}"
-            http_code=$(curl -sS -o /tmp/push_resp.txt -w "%{http_code}" -X POST \
+            echo "[gha] pushing 0 ideas to ${raw_push_url}"
+            mkdir -p /tmp
+            : > /tmp/push_resp.txt
+            http_code=$(curl -g -sS -o /tmp/push_resp.txt -w "%{http_code}" -X POST \
               -H "Content-Type: application/json" \
               -H "Authorization: Bearer ${PUSH_TOKEN}" \
-              --data "${payload}" \
+              --data-raw "${payload}" \
               --max-time 12 \
-              "${WORKER_PUSH_URL}" || true)
+              "${raw_push_url}" || true)
             body="$(head -c 400 /tmp/push_resp.txt || true)"
             echo "[gha] push status ${http_code} ${body}"
+            # Optional: print URL bytes once for debugging hidden chars
+            # printf 'URL bytes: %s\n' "$(printf '%s' "${raw_push_url}" | od -An -tx1)"
             exit 0
           fi
