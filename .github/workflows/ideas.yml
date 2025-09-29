@@ -461,7 +461,7 @@ jobs:
           try{
             const r=await fetchWithTimeout(PUSH_URL,{
               method:"POST",
-              headers:{ "Content-Type":"application/json","Authorization":`Bearer ${PUSH_TOKEN}` },
+              headers:{ "Content-Type":"application/json", "Authorization":"Bearer " + PUSH_TOKEN },
               body:JSON.stringify(payload)
             },15000);
             let txt=""; try{ txt=await r.text(); }catch{}
@@ -474,7 +474,7 @@ jobs:
           try{
             const r=await fetchWithTimeout(PUSH_URL,{
               method:"POST",
-              headers:{ "Content-Type":"application/json","Authorization":`Bearer ${PUSH_TOKEN}` },
+              headers:{ "Content-Type":"application/json", "Authorization":"Bearer " + PUSH_TOKEN },
               body:JSON.stringify(payload)
             },15000);
             let txt=""; try{ txt=await r.text(); }catch{}
