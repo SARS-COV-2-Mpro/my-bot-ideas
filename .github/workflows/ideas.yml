@@ -3,7 +3,7 @@ name: Ideas Pusher (MEXC Ultimate 6.3)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/11 * * * *" # runs every 10 minutes
+    - cron: "*/10 * * * *" # runs every 10 minutes
 
 permissions:
   contents: read
@@ -20,10 +20,6 @@ jobs:
       # Required secrets
       WORKER_PUSH_URL: ${{ secrets.WORKER_PUSH_URL }}
       PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
-
-      # Required for trade reconciliation
-      MEXC_API_KEY: ${{ secrets.MEXC_API_KEY }}
-      MEXC_SECRET_KEY: ${{ secrets.MEXC_SECRET_KEY }}
 
       # Optional (safe defaults inside the script)
       GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
@@ -82,7 +78,6 @@ jobs:
           node - <<'NODE'
           (async ()=>{
           'use strict';
-          const crypto = require('crypto');
           
           // ---------------- Utils ----------------
           const clamp=(x,a,b)=>Math.max(a,Math.min(b,x));
@@ -112,6 +107,7 @@ jobs:
           const vwapFillLevels=(levels,targetUSD)=>{ let remain=targetUSD,val=0,qty=0; for(const [ps,qs] of levels){ const p=+ps, q=+qs; if(!(p>0&&q>0)) continue; const can=p*q, take=Math.min(remain,can), tq=take/p; val+=p*tq; qty+=tq; remain-=take; if(remain<=1e-6) break; } return { px: qty>0? val/qty : null, filledUSD: (targetUSD-remain) }; };
           const slipFromDepth=(depth,mid,side,notionalUSD)=>{ if(!depth?.asks?.length || !depth?.bids?.length || !(mid>0)) return { slip_bps:null, fill_prob:null }; if(side==="long"){ const buy=vwapFillLevels(depth.asks, Math.max(50,notionalUSD)); const slip = buy.px? Math.max(0, Math.round((buy.px - mid)/mid*10000)) : null; const fill = Math.min(1, (buy.filledUSD||0)/Math.max(1,notionalUSD)); return { slip_bps: slip, fill_prob: +fill.toFixed(4) }; }else{ const sell=vwapFillLevels(depth.bids, Math.max(50,notionalUSD)); const slip = sell.px? Math.max(0, Math.round((mid - sell.px)/mid*10000)) : null; const fill = Math.min(1, (sell.filledUSD||0)/Math.max(1,notionalUSD)); return { slip_bps: slip, fill_prob: +fill.toFixed(4) }; } };
           const depthWithinPctUSD=(depth, mid, pct=0.01)=>{ if(!depth?.asks?.length || !depth?.bids?.length || !(mid>0)) return { bidsUSD:0, asksUSD:0 }; const askLim=mid*(1+pct), bidLim=mid*(1-pct); let asksUSD=0, bidsUSD=0; for(const [ps,qs] of depth.asks){ const p=+ps, q=+qs; if(!(p>0&&q>0)) continue; if(p<=askLim) asksUSD += p*q; else break; } for(const [ps,qs] of depth.bids){ const p=+ps, q=+qs; if(!(p>0&&q>0)) continue; if(p>=bidLim) bidsUSD += p*q; else break; } return { bidsUSD, asksUSD }; };
+          // DON: confidence without clamp (allows >100 for sharper separation)
           const confidenceScore=({ p_cal, ev_bps, atr_bps, micro, regime, reliability, riskAdj })=>{ const ev_norm = atr_bps>0? ev_bps/atr_bps : 0; const ev_sig = 1/(1+Math.exp(-ev_norm)); const base = 0.6*p_cal + 0.4*ev_sig; const mult = (micro||1)*(regime||1)*(reliability||1)*(riskAdj||1); return Math.round(100*base*mult); };
           const microprice=(bid,ask,qb,qa)=>{ const d=(qb||1)+(qa||1); return (ask*qb + bid*qa)/d; };
           const ofiProxy=(d0,d1)=>{ const lev=(side,d)=>d?.[side]?.slice(0,3).map(x=>+x[1]||0)||[]; const sum=a=>a.reduce((x,y)=>x+y,0); if(!d0||!d1) return 0; return (sum(lev("bids",d1))-sum(lev("bids",d0))) - (sum(lev("asks",d1))-sum(lev("asks",d0))); };
@@ -134,8 +130,6 @@ jobs:
           // ---------- Config / ENV ----------
           const EXCHANGE=(process.env.EXCHANGE||"mexc").toLowerCase().replace("mexci","mexc");
           if(EXCHANGE!=="mexc"){ log("This build targets MEXC. Set EXCHANGE=mexc"); process.exit(1); }
-          const MEXC_API_KEY = process.env.MEXC_API_KEY || "";
-          const MEXC_SECRET_KEY = process.env.MEXC_SECRET_KEY || "";
           const MEXC_BASES=[process.env.MEXC_BASE,"https://api.mexc.com","https://www.mexc.com"].filter(Boolean);
           const MIN_QV_ENV = Number(process.env.MIN_QV_USD||"0") || 0;
           const UNIV_TARGET_MIN=100, UNIV_TARGET_MAX=120, DYN_QV_MIN=Number(process.env.DYN_QV_MIN||"10000000"), DYN_QV_STEP=5_000_000;
@@ -174,25 +168,6 @@ jobs:
           async function pickMexcBase(){ for(const b of MEXC_BASES){ try{ const r=await fetchWithTimeout(`${b}/api/v3/time`,{},4000); if(r?.ok) return b; }catch{} } throw new Error("No healthy MEXC base"); }
           const BASE=await pickMexcBase();
           const api=(path,params={})=>{ const u=new URL(path,BASE); for(const [k,v] of Object.entries(params)){ if(v!==undefined&&v!==null) u.searchParams.set(k,String(v)); } return u.toString(); };
-          async function mexcSignedRequest(path, params = {}, method = 'GET') {
-              if (!MEXC_API_KEY || !MEXC_SECRET_KEY) return null;
-              const timestamp = Date.now();
-              const queryString = new URLSearchParams({ ...params, timestamp }).toString();
-              const signature = crypto.createHmac('sha256', MEXC_SECRET_KEY).update(queryString).digest('hex');
-              const url = new URL(path, BASE);
-              url.search = queryString + `&signature=${signature}`;
-              const options = { method, headers: { 'X-MEXC-APIKEY': MEXC_API_KEY, 'Content-Type': 'application/json', 'User-Agent': UA } };
-              try {
-                  const r = await fetchWithTimeout(url.toString(), options, 15000);
-                  if (r.ok) return await r.json();
-                  log(`MEXC signed request failed: ${r.status}`, (await r.text()||'').slice(0,100));
-                  return null;
-              } catch (e) {
-                  log(`MEXC signed request error: ${e?.message||e}`);
-                  return null;
-              }
-          }
-          async function fetchMyTrades(symbol, startTime) { return await mexcSignedRequest('/api/v3/myTrades', { symbol, startTime, limit: 1000 }); }
           async function fetchK(sym,interval,limit,startTime,endTime){ const u=api("/api/v3/klines",{symbol:sym,interval,limit,startTime,endTime}); const r=await getJSON(u,10000,2); return Array.isArray(r)?r:null; }
           async function fetchDepth(symbol){ return await getJSON(api("/api/v3/depth",{symbol,limit:DEPTH_LIMIT}), 10000, 2); }
           async function fetchAll24hr(){
@@ -208,73 +183,10 @@ jobs:
           const tfInd=(k)=>{ if(!k?.length) return null; const h=k.map(x=>+x[2]), l=k.map(x=>+x[3]), c=k.map(x=>+x[4]); const adxatr=computeADX_ATR(h,l,c,14)||{adx:0,atr:0}; const up=c.at(-1)>=ema(c,21)&&c.at(-1)>=ema(c,50); return {adx:adxatr.adx||0,atr:adxatr.atr||0,up}; };
 
           // ---------- State (Gist) ----------
-          async function loadState(){ const token=process.env.GIST_TOKEN, id=process.env.GIST_ID; const init={ v:"mexc-ultimate-6.3-confidence", cooldown:{}, cooldown_side:{}, pending:[], equity:[], closed:[], mr_lockout:{}, sym_stats:{}, calibCoeffs:{}, lastReconcileTs:0 }; if(!token||!id) return { state:init, persist:null }; try{ const r=await fetchWithTimeout(`https://api.github.com/gists/${id}`,{ headers:{Authorization:`Bearer ${token}`,"Accept":"application/vnd.github+json","User-Agent":UA}}); if(!r.ok) return { state:init, persist:null }; const g=await r.json(); const c=g.files?.["state.json"]?.content; const s=c?JSON.parse(c):init; if(!s.cooldown)s.cooldown={}; if(!s.cooldown_side)s.cooldown_side={}; if(!Array.isArray(s.pending))s.pending=[]; if(!Array.isArray(s.closed))s.closed=[]; if(!s.mr_lockout)s.mr_lockout={}; if(!s.sym_stats)s.sym_stats={}; if(!s.calibCoeffs)s.calibCoeffs={}; if(!s.lastReconcileTs)s.lastReconcileTs=0; return { state:s, persist:{id,token} }; }catch{ return { state:init, persist:null }; }
+          async function loadState(){ const token=process.env.GIST_TOKEN, id=process.env.GIST_ID; const init={ v:"mexc-ultimate-6.3-confidence", cooldown:{}, cooldown_side:{}, pending:[], equity:[], closed:[], mr_lockout:{}, sym_stats:{}, calibCoeffs:{} }; if(!token||!id) return { state:init, persist:null }; try{ const r=await fetchWithTimeout(`https://api.github.com/gists/${id}`,{ headers:{Authorization:`Bearer ${token}`,"Accept":"application/vnd.github+json","User-Agent":UA}}); if(!r.ok) return { state:init, persist:null }; const g=await r.json(); const c=g.files?.["state.json"]?.content; const s=c?JSON.parse(c):init; if(!s.cooldown)s.cooldown={}; if(!s.cooldown_side)s.cooldown_side={}; if(!Array.isArray(s.pending))s.pending=[]; if(!Array.isArray(s.closed))s.closed=[]; if(!s.mr_lockout)s.mr_lockout={}; if(!s.sym_stats)s.sym_stats={}; if(!s.calibCoeffs)s.calibCoeffs={}; return { state:s, persist:{id,token} }; }catch{ return { state:init, persist:null }; }
           }
           async function saveState(persist,state){ if(!persist) return; try{ await fetchWithTimeout(`https://api.github.com/gists/${persist.id}`,{ method:"PATCH", headers:{Authorization:`Bearer ${persist.token}`,"Accept":"application/vnd.github+json","Content-Type":"application/json","User-Agent":UA}, body: JSON.stringify({ files:{ "state.json":{ content: JSON.stringify(state) } } }) }); }catch{} }
-          
-          async function reconcileClosedFromExchange(state) {
-              if (!MEXC_API_KEY || !MEXC_SECRET_KEY) {
-                  log("Skipping reconciliation: MEXC_API_KEY/SECRET_KEY not provided.");
-                  return;
-              }
-              log("Starting reconciliation of pending ideas with actual exchange trades...");
-              const now = Date.now();
-              const initialPendingCount = (state.pending || []).length;
-              const newPending = [];
-              const symbolsToFetch = [...new Set((state.pending || []).map(p => p.symbolFull))];
-              const tradeMap = new Map();
-              const startTime = (state.lastReconcileTs || 0) > 0 ? state.lastReconcileTs - 60000 : now - 3 * 24 * 3600 * 1000;
-              for (const symbol of symbolsToFetch) {
-                  const trades = await fetchMyTrades(symbol, startTime);
-                  if (trades && Array.isArray(trades) && trades.length > 0) {
-                      tradeMap.set(symbol, trades.sort((a, b) => a.time - b.time));
-                  }
-                  await sleep(250);
-              }
-              if (tradeMap.size === 0) { log("No new trades found for any pending symbols."); state.lastReconcileTs = now; return; }
-          
-              for (const p of (state.pending || [])) {
-                  const trades = tradeMap.get(p.symbolFull);
-                  let isReconciled = false;
-                  if (trades) {
-                      // NOTE: This links an "idea" to a "trade" based on time proximity and side. This can be incorrect
-                      // if multiple strategies trade the same symbol on one account. A robust solution needs unique IDs.
-                      const entryTrade = trades.find(t =>
-                          t.time >= p.ts_ms - 15000 && t.time < p.ts_ms + 5 * 60 * 1000 &&
-                          (p.side === 'long' ? t.isBuyer : !t.isBuyer)
-                      );
-                      if (entryTrade) {
-                          const exitTrade = trades.find(t =>
-                              t.time > entryTrade.time && (p.side === 'long' ? !t.isBuyer : t.isBuyer) &&
-                              Math.abs(parseFloat(t.qty) - parseFloat(entryTrade.qty)) < parseFloat(entryTrade.qty) * 0.02
-                          );
-                          if (exitTrade) {
-                              const entryPrice = parseFloat(entryTrade.price), exitPrice = parseFloat(exitTrade.price);
-                              const ret = p.side === 'long' ? (exitPrice / entryPrice - 1) : (entryPrice / exitPrice - 1);
-                              const commissionBps = (parseFloat(entryTrade.commission) / (entryPrice * parseFloat(entryTrade.qty)) + parseFloat(exitTrade.commission) / (exitPrice * parseFloat(exitTrade.qty))) * 10000;
-                              const pnl_bps = Math.round(ret * 10000 - (isNaN(commissionBps) ? COST_BPS : commissionBps));
-          
-                              const closedRec = { symbolFull:p.symbolFull, side:p.side, pnl_bps, ts_entry_ms:entryTrade.time, ts_exit_ms:exitTrade.time, price_entry:entryPrice, price_exit:exitPrice, qty:parseFloat(entryTrade.qty), reconciliation:'exchange_trade_history', p_pred:p.p_lcb, p_raw:p.p_raw, calib_key:p.calib_key, regime:p.regime, predicted_snapshot:p.predicted };
-                              (state.closed ||= []).push(closedRec);
-                              const outcome = pnl_bps > 0 ? 1 : 0;
-                              if (p.regime && p.p_raw != null) updateCalibration(state, p.side, p.regime, p.p_raw, outcome);
-                              state.equity.push({ ts_ms:p.ts_ms, pnl_bps, tier:p.tier });
-                              const sb=state.sym_stats?.[p.base]||{n:0,wins:0,pnl_sum:0};
-                              sb.n++; if(pnl_bps>0) sb.wins++; sb.pnl_sum+=pnl_bps; state.sym_stats[p.base]=sb;
-                              isReconciled = true;
-                          }
-                      }
-                  }
-                  if (!isReconciled) {
-                      newPending.push(p);
-                  }
-              }
-              state.pending = newPending;
-              state.lastReconcileTs = now;
-              log(`Reconciliation complete. ${initialPendingCount - newPending.length} ideas closed via trades. ${newPending.length} remain pending.`);
-          }
-          
-          async function evalPending(state){ const now=Date.now(); const keep=[]; for(const p of state.pending||[]){ const ttl_ts_ms=p.ttl_ts_ms || (p.ts_ms + (p.hold_sec||0)*1000); if(now < ttl_ts_ms + 5000){ keep.push(p); continue; } const k = await fetchK(p.symbolFull,"1m",K1M, p.ts_ms-60*1000, ttl_ts_ms+60*1000); if(!k){ keep.push(p); continue; } const ts=k.map(x=>+x[0]), highs=k.map(x=>+x[2]), lows=k.map(x=>+x[3]), closes=k.map(x=>+x[4]); const long=p.side==="long"; const entry=Number.isFinite(p.entry_limit)?p.entry_limit:p.entry_price; const tpB=(p.tp_bps||0)/10000, slB=(p.sl_bps||0)/10000; const tp_abs=Number.isFinite(p.tp_abs)?p.tp_abs:(long?entry*(1+tpB):entry*(1-tpB)); const sl_abs=Number.isFinite(p.sl_abs)?p.sl_abs:(long?entry*(1-slB):entry*(1+slB)); let filled=false,iFill=-1; for(let i=0;i<k.length;i++){ if(ts[i]<p.ts_ms-1000) continue; if(ts[i]>ttl_ts_ms) break; if(long?(lows[i]<=entry):(highs[i]>=entry)){ iFill=i; filled=true; break; } } if(!filled){ keep.push(p); continue; } let exit_px=closes.at(-1), exit_reason="ttl"; let mfe=0, mae=0; for(let i=iFill;i<k.length;i++){ if(ts[i]>ttl_ts_ms) break; const hi=highs[i], lo=lows[i]; const rHi=long?(hi/entry-1):(entry/hi-1), rLo=long?(lo/entry-1):(entry/lo-1); mfe=Math.max(mfe,rHi*10000); mae=Math.min(mae,rLo*10000); if(long){ if(hi>=tp_abs){ exit_px=tp_abs; exit_reason="tp"; break; } if(lo<=sl_abs){ exit_px=sl_abs; exit_reason="sl"; break; } }else{ if(lo<=tp_abs){ exit_px=tp_abs; exit_reason="tp"; break; } if(hi>=sl_abs){ exit_px=sl_abs; exit_reason="sl"; break; } } } const ret=long?(exit_px/entry-1):(entry/exit_px-1); const pnl_bps=Math.round(ret*10000)-(p.cost_bps||0); const outcome = pnl_bps > 0 ? 1 : 0; if(p.regime && p.p_raw != null) updateCalibration(state, p.side, p.regime, p.p_raw, outcome); state.equity.push({ ts_ms:p.ts_ms, pnl_bps, tier:p.tier }); const closedRec = { symbolFull:p.symbolFull, side:p.side, pnl_bps, p_pred:p.p_lcb, p_raw:p.p_raw, calib_key:p.calib_key, regime:p.regime, reconciliation:"candle_simulation", predicted_snapshot:p.predicted, realized:{tp_hit:exit_reason==="tp",sl_hit:exit_reason==="sl",ttl_exit:exit_reason==="ttl",max_favorable_excursion_bps:mfe,max_adverse_excursion_bps:mae}, error_analysis:{was_correct:outcome===1, calibration_error:p.predicted?((pnl_bps>0?1:0)-p.predicted.p_cal):null, attribution:(p.predicted?.reasons||[]).map(r=>({factor:r.factor,expected:Math.sign(r.contribution),realized:null}))} }; (state.closed ||= []).push(closedRec); const sb=state.sym_stats?.[p.base]||{n:0,wins:0,pnl_sum:0}; sb.n++; if(pnl_bps>0) sb.wins++; sb.pnl_sum+=pnl_bps; state.sym_stats[p.base]=sb; } state.pending=keep; if(state.equity.length>6000) state.equity=state.equity.slice(-6000); if(state.closed?.length>5000) state.closed=state.closed.slice(-5000); }
+          async function evalPending(state){ const now=Date.now(); const keep=[]; for(const p of state.pending||[]){ const ttl_ts_ms=p.ttl_ts_ms || (p.ts_ms + (p.hold_sec||0)*1000); if(now < ttl_ts_ms + 5000){ keep.push(p); continue; } const k = await fetchK(p.symbolFull,"1m",K1M, p.ts_ms-60*1000, ttl_ts_ms+60*1000); if(!k){ keep.push(p); continue; } const ts=k.map(x=>+x[0]), highs=k.map(x=>+x[2]), lows=k.map(x=>+x[3]), closes=k.map(x=>+x[4]); const long=p.side==="long"; const entry=Number.isFinite(p.entry_limit)?p.entry_limit:p.entry_price; const tpB=(p.tp_bps||0)/10000, slB=(p.sl_bps||0)/10000; const tp_abs=Number.isFinite(p.tp_abs)?p.tp_abs:(long?entry*(1+tpB):entry*(1-tpB)); const sl_abs=Number.isFinite(p.sl_abs)?p.sl_abs:(long?entry*(1-slB):entry*(1+slB)); let filled=false,iFill=-1; for(let i=0;i<k.length;i++){ if(ts[i]<p.ts_ms-1000) continue; if(ts[i]>ttl_ts_ms) break; if(long?(lows[i]<=entry):(highs[i]>=entry)){ iFill=i; filled=true; break; } } if(!filled){ keep.push(p); continue; } let exit_px=closes.at(-1), exit_reason="ttl"; let mfe=0, mae=0; for(let i=iFill;i<k.length;i++){ if(ts[i]>ttl_ts_ms) break; const hi=highs[i], lo=lows[i]; const rHi=long?(hi/entry-1):(entry/hi-1), rLo=long?(lo/entry-1):(entry/lo-1); mfe=Math.max(mfe,rHi*10000); mae=Math.min(mae,rLo*10000); if(long){ if(hi>=tp_abs){ exit_px=tp_abs; exit_reason="tp"; break; } if(lo<=sl_abs){ exit_px=sl_abs; exit_reason="sl"; break; } }else{ if(lo<=tp_abs){ exit_px=tp_abs; exit_reason="tp"; break; } if(hi>=sl_abs){ exit_px=sl_abs; exit_reason="sl"; break; } } } const ret=long?(exit_px/entry-1):(entry/exit_px-1); const pnl_bps=Math.round(ret*10000)-(p.cost_bps||0); const outcome = pnl_bps > 0 ? 1 : 0; if(p.regime && p.p_raw != null) updateCalibration(state, p.side, p.regime, p.p_raw, outcome); state.equity.push({ ts_ms:p.ts_ms, pnl_bps, tier:p.tier }); const closedRec = { symbolFull:p.symbolFull, side:p.side, pnl_bps, p_pred:p.p_lcb, p_raw:p.p_raw, calib_key:p.calib_key, regime:p.regime, predicted_snapshot:p.predicted, realized:{tp_hit:exit_reason==="tp",sl_hit:exit_reason==="sl",ttl_exit:exit_reason==="ttl",max_favorable_excursion_bps:mfe,max_adverse_excursion_bps:mae}, error_analysis:{was_correct:outcome===1, calibration_error:p.predicted?((pnl_bps>0?1:0)-p.predicted.p_cal):null, attribution:(p.predicted?.reasons||[]).map(r=>({factor:r.factor,expected:Math.sign(r.contribution),realized:null}))} }; (state.closed ||= []).push(closedRec); const sb=state.sym_stats?.[p.base]||{n:0,wins:0,pnl_sum:0}; sb.n++; if(pnl_bps>0) sb.wins++; sb.pnl_sum+=pnl_bps; state.sym_stats[p.base]=sb; } state.pending=keep; if(state.equity.length>6000) state.equity=state.equity.slice(-6000); if(state.closed?.length>5000) state.closed=state.closed.slice(-5000); }
           
           function getCoeffs(state, side, regime){ const key=`${side}_${regime}`; if(!state.calibCoeffs) state.calibCoeffs={}; if(!state.calibCoeffs[key]) state.calibCoeffs[key]={a:0,b:1,n:0}; return state.calibCoeffs[key]; }
           function updateCalibration(state, side, regime, pRaw, outcome){ if(pRaw==null) return; const coeff=getCoeffs(state,side,regime); const lr=0.05; const z=coeff.a+coeff.b*pRaw; const pHat=sigmoid(z); const err=outcome-pHat; coeff.a += lr*err; coeff.b += lr*err*pRaw; coeff.n++; state.calibCoeffs[`${side}_${regime}`]=coeff; }
@@ -285,10 +197,6 @@ jobs:
           // ---------- Main ----------
           let reason="ok", selectionTier="confidence";
           try{
-          const { state, persist } = await loadState();
-          try{ await reconcileClosedFromExchange(state); }catch(e){ log("reconciliation warn", e?.message||e); }
-          try{ await evalPending(state); }catch(e){ log("evalPending (backup) warn", e?.message||e); }
-          
           const ALL24 = await fetchAll24hr();
           const booksRaw=await getJSON(api("/api/v3/ticker/bookTicker"),10000,2) || [];
           const bookMap=new Map(booksRaw.map(b=>[b.symbol,{ bid:+b.bidPrice, ask:+b.askPrice }]));
@@ -308,7 +216,8 @@ jobs:
             const c = kBTC1H.map(x => +x[4]);
             return c.at(-1) >= ema(c, EMA_FAST) && c.at(-1) >= ema(c, EMA_SLOW);
           })();
-          
+          const { state, persist } = await loadState();
+          try{ await evalPending(state); }catch(e){ log("evalPending warn", e?.message||e); }
           const equityStats=(eq)=>{ const day=Date.now()-24*3600*1000; let pnl24=0,cum=0,peak=0,dd=0; for(const e of eq||[]){ if(e.ts_ms>=day) pnl24+=e.pnl_bps; cum+=e.pnl_bps; if(cum>peak) peak=cum; dd=Math.min(dd,cum-peak); } return { pnl24_bps:Math.round(pnl24), peak_dd_bps:Math.round(dd) }; };
           const { pnl24_bps, peak_dd_bps } = equityStats(state.equity);
           const throttle=(pnl24_bps<=DD_24H_LIMIT_BPS) || (peak_dd_bps<=DD_PEAK_LIMIT_BPS);
@@ -550,9 +459,8 @@ jobs:
               });
             }
             if(state.pending.length>550) state.pending=state.pending.slice(-550);
-          }catch(e){ log("state update warn",e?.message||e); }
-          
-          await saveState(persist,state);
+            await saveState(persist,state);
+          }catch(e){ log("state save warn",e?.message||e); }
 
           for (const p of picks) { log(`idea ${p.symbol_full} ${p.side} conf=${p.confidence} reasons=${(p.reasons_text||[]).join("; ")}`); }
           const ideaLogs=picks.map(p=>({symbol:p.symbol_full,side:p.side,confidence:p.confidence,reasons:p.reasons_text,p_cal:+p.p_lcb.toFixed(3),ev_bps:p.ev_bps}));
