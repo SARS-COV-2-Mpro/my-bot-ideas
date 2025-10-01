@@ -25,7 +25,7 @@ MEXC_SECRET_KEY: ${{ secrets.MEXC_SECRET_KEY }}
 GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
 GIST_ID: ${{ secrets.GIST_ID }}
 
-text
+
 
   # Exchange + tuning knobs (via Repo/Org Variables)
   EXCHANGE: mexc
