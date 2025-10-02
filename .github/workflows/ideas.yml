@@ -211,13 +211,20 @@ jobs:
               return await fetch(url,{...opts,signal:ac.signal,headers:{"User-Agent":UA,...(opts?.headers||{})}});
             } finally { clearTimeout(t); }
           }
-          async function getJSON(url,ms=12000,tries=2){
-            for(let a=0;a<tries;a++){
-              try{
-                const r=await fetchWithTimeout(url,{},ms);
-                if(r?.ok){ return await r.json(); }
-              }catch{}
-              await sleep(jitter(220));
+          async function getJSON(url, ms = 12000, tries = 2) {
+            for (let a = 0; a < tries; a++) {
+              try {
+                const r = await fetchWithTimeout(url, {}, ms);
+                if (r?.ok) {
+                  const ct = (r.headers.get("content-type") || "").toLowerCase();
+                  if (!ct.includes("application/json")) {
+                    const txt = await r.text();
+                    try { return JSON.parse(txt); } catch { return null; }
+                  }
+                  return await r.json();
+                }
+              } catch {}
+              await sleep(220 + Math.floor(Math.random() * 180));
             }
             return null;
           }
@@ -445,15 +452,39 @@ jobs:
 
           async function fetchK(symbol, interval, limit, startTime, endTime){
             const u=api("/api/v3/klines",{symbol,interval,limit,startTime,endTime});
-            return await getJSON(u,10000,2);
+            return await getJSON(u, 15000, 3);
+          }
+
+          const cacheK = new Map();
+          const TTL_K_MS = 60_000;
+          const warnOnceSet = new Set();
+          function warnOnce(sym, tf, msg){
+            const key = `${sym}|${tf}`;
+            if (warnOnceSet.has(key)) return;
+            warnOnceSet.add(key);
+            log(msg);
+          }
+          async function getKCached(symbol, interval, limit, startTime, endTime){
+            const key = `${symbol}|${interval}|${limit}|${startTime||""}|${endTime||""}`;
+            const c = cacheK.get(key);
+            if (c && Date.now() - c.ts < TTL_K_MS) return c.v;
+            const v = await fetchK(symbol, interval, limit, startTime, endTime);
+            if (v) cacheK.set(key, { v, ts: Date.now() });
+            return v;
           }
 
           async function fetchKlinesMTF(symbol) {
             const allData = {};
             for (const tf of TIMEFRAMES) {
+              // tiny stagger to reduce burstiness
+              await sleep(120);
+
               const limit = TF_CANDLE_LIMITS[tf];
-              const k = await fetchK(symbol, tf, limit);
-              if (!k || k.length < Math.max(RSI_PERIOD + 1, ADX_PERIOD + 1)) { log(`MTF Warn: Insufficient data for ${symbol} ${tf}`); return null; }
+              const k = await getKCached(symbol, tf, limit);
+              if (!k || k.length < Math.max(RSI_PERIOD + 1, ADX_PERIOD + 1)) {
+                warnOnce(symbol, tf, `[gha] MTF Warn: Insufficient data for ${symbol} ${tf}`);
+                return null;
+              }
               const closes = k.map(x => +x[4]);
               allData[tf] = {
                 ts: k.map(x=>+x[0]),
@@ -877,7 +908,7 @@ jobs:
               }
 
               // 5) Scan universe in batches with MTF compute
-              const picksRaw=[]; const B=10;
+              const picksRaw=[]; const B=6;
               for(let i=0; i<universe.length; i+=B){
                 const batch=await Promise.all(universe.slice(i,i+B).map(async c=>{
                   try{
