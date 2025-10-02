@@ -701,7 +701,7 @@ jobs:
                 const lastTs=state.cooldown?.[c.base]||0; if(lastTs && (Date.now()-lastTs)<COOLDOWN_MS) return null;
                 const book=bookMap.get(c.symbol) || await getBookTickerCached(c.symbol); if(!book?.bid||!book?.ask) return null;
                 const mid=(+book.bid + +book.ask)/2; if(!(mid>0)) return null;
-                const spreadBps=Math.round(((book.ask-book.bid)/mid)*10000); if(spreadBps>MAX_SPREAD_BPS) return null;
+                const spreadBps=Math.round(((book.ask-book.bid)/mid)*10000); // soft gate: keep, penalize in confidence
 
                 const k5=await getKCached(c.symbol,"5m",K5M); if(!k5||k5.length<Math.max(EMA_SLOW+5,ATR_P+5)) return null;
                 const c5_raw=k5.map(x=>+x[4]);
@@ -772,11 +772,9 @@ jobs:
                 const km=await getKMultiTF(c.symbol);
                 const mtf=computeMTFIndicators(km, TF_WEIGHTS);
                 const tfAlign=mtf?.tfAlign||0;
-                if(tfAlign < MIN_TF_ALIGN) continue; // hard gate by config knob
                 const mtfAgg=mtf?.agg||{ rsi:50, adx:0, atr_bps:0, roc1:0, roc3:0 };
 
                 const ind5=tfInd(km["5m"]),ind15=tfInd(km["15m"]),ind1h=tfInd(km["1h"]),ind4h=tfInd(km["4h"]);
-                // Keep tfAlign as correlation metric for downstream
                 const sideSlipL=slipFromDepth(depth,mid,"long",NOTIONAL), sideSlipS=slipFromDepth(depth,mid,"short",NOTIONAL);
                 const slipL=sideSlipL?.slip_bps??Math.round(p.spreadBps/2), slipS=sideSlipS?.slip_bps??Math.round(p.spreadBps/2);
                 const costLong=COST_BPS+slipL, costShort=COST_BPS+slipS;
@@ -801,9 +799,11 @@ jobs:
                   tp = Math.max(tp, Math.round(sl * 1.5));
                   const sim=pathEVHeavy({entry:mid,tp_bps:tp,sl_bps:sl,side:"long",retSeries:yR,mu:mu5,sigma:sig5,steps:4,N:192,cost_bps:costLong});
                   const evLCB=Math.round(pLong_lcb*tp-(1-pLong_lcb)*sl-costLong);
-                  if(tp>=LONG_EDGE_MULT_MIN*costLong && evLCB>=EXP_LCB_MIN_BPS_BASE){
-                    candLong={ side:"long", p_lcb:pLong_lcb,p_raw:p.pLong0, ev_bps:sim.ev_bps, exp_lcb_bps:evLCB, tp_bps:tp, sl_bps:sl, cost_bps:costLong, style:"mr", regime };
-                  }
+                  // Viability becomes a multiplier (no hard reject)
+                  const edgeL = tp/Math.max(1, LONG_EDGE_MULT_MIN*costLong);
+                  const evScoreL = evLCB/Math.max(8, EXP_LCB_MIN_BPS_BASE);
+                  const viabMultL = clamp(0.5*clamp(edgeL,0.3,1.4)+0.5*clamp(evScoreL,0.3,1.4), 0.3, 1.3);
+                  candLong={ side:"long", p_lcb:pLong_lcb,p_raw:p.pLong0, ev_bps:sim.ev_bps, exp_lcb_bps:evLCB, tp_bps:tp, sl_bps:sl, cost_bps:costLong, style:"mr", regime, viab_mult:viabMultL };
                 }
                 if(DIRECTION!=="long"){
                   let tp=Math.round(p.atr_bps*1.0);
@@ -812,25 +812,30 @@ jobs:
                   tp = Math.max(tp, Math.round(sl * 1.5));
                   const sim=pathEVHeavy({entry:mid,tp_bps:tp,sl_bps:sl,side:"short",retSeries:yR,mu:mu5,sigma:sig5,steps:4,N:192,cost_bps:costShort});
                   const evLCB=Math.round(pShort_lcb*tp-(1-pShort_lcb)*sl-costShort);
-                  if(tp>=4*costShort && evLCB>=EXP_LCB_MIN_BPS_BASE){
-                    candShort={ side:"short", p_lcb:pShort_lcb,p_raw:p.pShort0, ev_bps:sim.ev_bps, exp_lcb_bps:evLCB, tp_bps:tp, sl_bps:sl, cost_bps:costShort, style:"mr", regime };
-                  }
+                  const edgeS = tp/Math.max(1, 4*costShort);
+                  const evScoreS = evLCB/Math.max(8, EXP_LCB_MIN_BPS_BASE);
+                  const viabMultS = clamp(0.5*clamp(edgeS,0.3,1.4)+0.5*clamp(evScoreS,0.3,1.4), 0.3, 1.3);
+                  candShort={ side:"short", p_lcb:pShort_lcb,p_raw:p.pShort0, ev_bps:sim.ev_bps, exp_lcb_bps:evLCB, tp_bps:tp, sl_bps:sl, cost_bps:costShort, style:"mr", regime, viab_mult:viabMultS };
                 }
 
                 const chosen=candLong&&candShort?(candLong.exp_lcb_bps>=candShort.exp_lcb_bps?candLong:candShort):(candLong||candShort||null);
                 if(!chosen) continue;
 
                 const microQ=(Math.max(0,1-(p.spreadBps||0)/20))*(1-Math.min(0.6,(chosen.cost_bps-COST_BPS)/20))*(1+clamp(obi,-0.2,0.2));
+                // Soft TF alignment (no hard gate)
+                const gTF = clamp(0.4 + 0.8*tfAlign, 0.2, 1.2);
                 const regimeQ=0.7+0.4*tfAlign;
-                const gSpread = clamp(1 - Math.max(0,(p.spreadBps - MAX_SPREAD_BPS))/MAX_SPREAD_BPS, 0.2, 1.0);
-                const gCost   = clamp(1 - Math.max(0,(chosen.cost_bps - COST_BPS))/20, 0.2, 1.0);
-                const gVol    = clamp((p.vol1h_est_usd||0)/Math.max(1, MIN_VOL_1H_USD), 0.2, 1.0);
-                const gDepth  = clamp(depth1pUSD/Math.max(1, DEPTH_1P_MIN_USD), 0.2, 1.0);
-                const gMR     = p.mrLocked ? 0.6 : 1.0;
-                const gDir    = (chosen.side==="long" && p.noLongDown) ? 0.6 : 1.0;
-                const gBTC    = (chosen.side==="long" && !btcUp1h) ? 0.7 : 1.0;
-                const gTF     = tfAlign>=MIN_TF_ALIGN ? 1.0 : 0.0; // hard gate already; multiplier for transparency
-                const gateMult= clamp(gSpread * gCost * gVol * gDepth * gMR * gDir * gBTC * gTF, 0.2, 1.2);
+
+                const gSpread = clamp(1 - Math.max(0,(p.spreadBps - MAX_SPREAD_BPS))/MAX_SPREAD_BPS, 0.2, 1.1);
+                const gCost   = clamp(1 - Math.max(0,(chosen.cost_bps - COST_BPS))/20, 0.2, 1.1);
+                const gVol    = clamp((p.vol1h_est_usd||0)/Math.max(1, MIN_VOL_1H_USD), 0.2, 1.1);
+                const gDepth  = clamp(depth1pUSD/Math.max(1, DEPTH_1P_MIN_USD), 0.2, 1.1);
+                const gMR     = p.mrLocked ? 0.7 : 1.05;
+                const gDir    = (chosen.side==="long" && p.noLongDown) ? 0.8 : 1.0;
+                const gBTC    = (chosen.side==="long" && !btcUp1h) ? 0.85 : 1.0;
+                const gEV     = clamp(chosen.viab_mult||1, 0.3, 1.3);
+
+                const gateMult= clamp(gSpread * gCost * gVol * gDepth * gMR * gDir * gBTC * gTF * gEV, 0.2, 1.4);
 
                 const conf = confidenceScore({
                   p_cal: chosen.p_lcb,
@@ -890,9 +895,12 @@ jobs:
             }
 
             refined.sort((a,b)=>b.confidence-a.confidence);
+
+            const TARGET_TOP_N = 3; // enforce exactly 3 pushed ideas
+
             const selected=[];
             for (const cand of refined) {
-              if (selected.length >= TOP_N) break;
+              if (selected.length >= TARGET_TOP_N) break;
               let ok=true;
               for (const s of selected) {
                 const r=corr(cand.ret5||[], s.ret5||[]);
@@ -900,16 +908,19 @@ jobs:
               }
               if (ok) selected.push(cand);
             }
-            if (selected.length < TOP_N) {
+            // If still fewer than 3, fill ignoring correlation guard by descending confidence
+            if (selected.length < TARGET_TOP_N) {
               const have=new Set(selected.map(s=>s.symbol+":"+s.side));
               for (const c of refined) {
-                if (selected.length >= TOP_N) break;
+                if (selected.length >= TARGET_TOP_N) break;
                 const k=c.symbol+":"+c.side;
                 if (!have.has(k)) { selected.push(c); have.add(k); }
               }
             }
+            // Just in case refined was tiny, ensure we never exceed 3
+            if (selected.length > TARGET_TOP_N) selected.splice(TARGET_TOP_N);
 
-            // Risk weights via softmax of EV
+            // Risk weights via softmax of EV (unchanged)
             const wEv=softmax(selected.map(x=>x.exp_lcb_bps),20);
 
             let picks=selected.map((x,i)=>{
@@ -933,7 +944,6 @@ jobs:
               if(Number(process.env.FORCE_SIZE_BPS||"0")>0) size_bps=Math.round(Number(process.env.FORCE_SIZE_BPS));
               else size_bps=x.sl_bps>0?Math.min(220,Math.round((wEv[i]*TARGET_PORT_RISK_BPS/x.sl_bps)*100)):0;
 
-              // IDs
               const idea_id=uuidv4();
               const client_order_id=uuidv4();
 
