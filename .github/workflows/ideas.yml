@@ -858,9 +858,7 @@ jobs:
               if(PUSH_URL&&PUSH_TOKEN){
                 await fetchWithTimeout(PUSH_URL,{ method:"POST", headers:{ "Content-Type":"application/json","Authorization":"Bearer "+PUSH_TOKEN }, body:JSON.stringify(payload) });
               }
-            }
-            }
-            // end try/catch
+            } // end try/catch in main
 
           })(); // invoke main
           })(); // end outer async IIFE
