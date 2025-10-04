@@ -1,4 +1,3 @@
-PUSHER:
 name: Ideas Pusher (MEXC Ultimate 7.7.7)
 
 on:
@@ -194,7 +193,6 @@ jobs:
           const SCHEMA_VERSION=(process.env.SCHEMA_VERSION||"1");
           const GIT_SHA=(process.env.GIT_SHA||"unknown");
 
-          // NEW: Mode toggle (defaults to plan-only)
           const PUSHER_MODE=(process.env.PUSHER_MODE||"plan_only").toLowerCase();
 
           const MIN_QV_ENV = Number(process.env.MIN_QV_USD||"0") || 0;
@@ -342,9 +340,12 @@ jobs:
                 headers:{Authorization:`Bearer ${token}`,"Accept":"application/vnd.github+json","User-Agent":UA}
               });
               if(!r.ok) return { state:init, persist:null };
+              const etag=r.headers.get("etag");
               const g=await r.json();
               const c=g.files?.["state.json"]?.content;
               const s=c?JSON.parse(c):init;
+
+              // ensure defaults
               if(!s.cooldown)s.cooldown={};
               if(!s.cooldown_side)s.cooldown_side={};
               if(!Array.isArray(s.pending))s.pending=[];
@@ -356,46 +357,117 @@ jobs:
               if(!s.calibCoeffs)s.calibCoeffs={};
               if(!s.calibration_holdout)s.calibration_holdout=[];
               if(!s.lastReconcileTs)s.lastReconcileTs=0;
-              return { state:s, persist:{id,token} };
-            }catch{ return { state:init, persist:null }; }
+
+              return { state:s, persist:{ id, token, etag } };
+            }catch(e){ log("loadState warn", e?.message||e); return { state:init, persist:null }; }
           }
-          async function saveState(persist,state, auditOut){
+          
+          function mergeStates(remote, local){
+            const merged = { ...remote, ...local }; // Pusher-owned fields win by default
+
+            // Worker is the source of truth for these fields. Always take remote.
+            merged.equity = remote.equity || [];
+            merged.sym_stats_real = remote.sym_stats_real || {};
+            merged.sym_stats = remote.sym_stats || {};
+            merged.lastReconcileTs = remote.lastReconcileTs || 0;
+            if ('fees' in remote) merged.fees = remote.fees;
+
+            // Closed: Remote is truth. We only overlay our 'learned' status. No local appends.
+            const keyClosed = (c) => {
+              const cid = c?.trade_details?.client_order_id || c.client_order_id || c.idea_id || "";
+              const tx  = c?.ts_exit_ms || c?.exit_ts_ms || "";
+              return `${cid}|${tx}`;
+            };
+            const localClosedMap = new Map((local.closed||[]).map(c => [keyClosed(c), c]));
+            merged.closed = (remote.closed || []).map(rc => {
+              const lc = localClosedMap.get(keyClosed(rc));
+              if (!lc) return rc;
+              const learned = Boolean(rc.learned || lc.learned);
+              const learned_at_ts = learned ? (rc.learned_at_ts || lc.learned_at_ts) : undefined;
+              return { ...rc, learned, learned_at_ts };
+            });
+
+            // Pending: Remote is truth, but we append our new plans.
+            const remotePendingIds = new Set((remote.pending||[]).map(p=>p.client_order_id));
+            const newLocalPending = (local.pending||[]).filter(p => !remotePendingIds.has(p.client_order_id));
+            merged.pending = [...(remote.pending||[]), ...newLocalPending];
+            
+            merged.version_ts = Date.now();
+            return merged;
+          }
+
+          async function saveState(persist,state, auditOut, retries=1){
             if(!persist) return;
             try{
+              // Only save state.json
               const files={ "state.json":{ content: JSON.stringify(state) } };
-              if(auditOut?.closedAudit) files["closed_audit.jsonl"]={ content: auditOut.closedAudit };
-              if(auditOut?.disagreements) files["reconciliation_disagreements.jsonl"]={ content: auditOut.disagreements };
-              if(auditOut?.tradesCsv) files["trades.csv"]={ content: auditOut.tradesCsv };
-              await fetchWithTimeout(`https://api.github.com/gists/${persist.id}`,{
-                method:"PATCH",
-                headers:{Authorization:`Bearer ${persist.token}`,"Accept":"application/vnd.github+json","Content-Type":"application/json","User-Agent":UA},
-                body: JSON.stringify({ files })
+
+              const headers={
+                Authorization:`Bearer ${persist.token}`,
+                "Accept":"application/vnd.github+json",
+                "Content-Type":"application/json",
+                "User-Agent":UA
+              };
+              if (persist.etag) headers["If-Match"] = persist.etag;
+
+              const r = await fetchWithTimeout(`https://api.github.com/gists/${persist.id}`,{
+                method:"PATCH", headers, body: JSON.stringify({ files })
               });
+              if (r.ok) return;
+
+              if (r.status === 412 && retries > 0) {
+                log("Gist save conflict (412), merging with remote and retrying...");
+                const r2 = await fetchWithTimeout(`https://api.github.com/gists/${persist.id}`,{
+                  headers:{ Authorization:`Bearer ${persist.token}`, "Accept":"application/vnd.github+json", "User-Agent":UA }
+                });
+                if (!r2.ok) { log("Failed to refetch gist for merge."); return; }
+                const remoteEtag = r2.headers.get("etag");
+                const remoteGist = await r2.json();
+                const remoteContent = remoteGist.files?.["state.json"]?.content;
+                const remoteState = remoteContent ? JSON.parse(remoteContent) : {};
+                const mergedState = mergeStates(remoteState, state);
+                const newPersist = { ...persist, etag: remoteEtag };
+                await saveState(newPersist, mergedState, auditOut, retries - 1);
+              } else {
+                log(`saveState failed status=${r.status}`, (await r.text()||"").slice(0,200));
+              }
             }catch(e){ log("saveState warn", e?.message||e); }
+          }
+          
+          function learnFromGistRealFills(state){
+            const learnable = (state.closed || []).filter(c =>
+              c.reconciliation === "exchange_trade_history" &&
+              !c.learned &&
+              c.p_raw != null &&
+              c.regime
+            );
+            for (const c of learnable) {
+              const outcome = (c.pnl_bps || 0) > 0 ? 1 : 0;
+              try { updateCalibration(state, c.side, c.regime, c.p_raw, outcome); }
+              catch(e){ log("learnFromGistRealFills warn", e?.message||e); }
+              c.learned = true;
+              c.learned_at_ts = Date.now();
+            }
+            if (learnable.length) log(`learnFromGistRealFills: updated from ${learnable.length} real fills.`);
           }
 
           const getCoeffs=(state, side, regime)=>{ const key=`${side}_${regime}`; if(!state.calibCoeffs) state.calibCoeffs={}; if(!state.calibCoeffs[key]) state.calibCoeffs[key]={a:0,b:1,n:0}; return state.calibCoeffs[key]; }
           function updateCalibration(state, side, regime, pRaw, outcome){ if(pRaw==null) return; const coeff=getCoeffs(state,side,regime); const lr=0.05; const z=coeff.a+coeff.b*pRaw; const pHat=sigmoid(z); const err=outcome-pHat; coeff.a += lr*err; coeff.b += lr*err*pRaw; coeff.n++; state.calibCoeffs[`${side}_${regime}`]=coeff; }
           const calibrateP=(state, side, regime, pRaw)=>{ const coeff=getCoeffs(state,side,regime); return sigmoid(coeff.a+coeff.b*pRaw); };
           const calibratorInfo=(state,side,regime)=>{ const coeff=getCoeffs(state,side,regime); return { type:"logistic", n:coeff.n, a:coeff.a, b:coeff.b }; };
-
-          // NEW: Learn pass (from Worker-truth closed trades)
-          async function learnFromWorkerClosed(state){
-            const toLearn=(state.closed||[]).filter(t=>t.reconciliation==="exchange_trade_history" && t.learned!==true);
-            for(const t of toLearn){
-              const pRaw=t.p_raw;
-              if(pRaw==null) continue;
-              const side=t.side||"long";
-              const regime=t.regime||"mr";
-              const outcome=(t.pnl_bps||0)>0?1:0;
-              updateCalibration(state, side, regime, pRaw, outcome);
-              t.learned=true;
-              t.learned_at_ts=Date.now();
-            }
-            return { learned: toLearn.length };
+          function getSymbolAdj(state, base) {
+            const real = state.sym_stats_real?.[base];
+            const s = real || state.sym_stats?.[base];
+            if (!s || s.n < 6) return 1.0;
+            const winRate = s.wins / s.n;
+            const avgPnL = s.pnl_sum / s.n;
+            let m = 1.0;
+            if (winRate < 0.4) m *= 0.7;
+            if (avgPnL < 0) m *= 0.8;
+            return clamp(m, 0.5, 1.2);
           }
 
-          // Build audit outputs from state
+          // Build audit outputs from state (kept for diagnostics)
           const TRADE_CSV_KEYS=["ts_close_iso","idea_id","client_order_id","symbol","side","pnl_bps","entry_ts_ms","exit_ts_ms","entry_price","exit_price","qty","commission_bps","commission_quote_usdt","commission_asset_entry","commission_asset_exit","maker_taker_entry","maker_taker_exit","slip_realized_bps","reconciliation","fingerprint_entry","fingerprint_exit","calib_key","p_raw","p_pred","regime","source"];
           function buildAuditOutputs(state){
             const lastNClosed=(state.closed||[]).slice(-5000);
@@ -490,211 +562,16 @@ jobs:
               };
             }catch(e){ return { status:"sim_error", error:e?.message||String(e), closed:false }; }
           }
-
-          // Trade utility: commissions into quote and bps
-          async function computeCommissionInfo(entryTrade, exitTrade, quote="USDT"){
-            try{
-              const c1=+(entryTrade?.commission||0), a1=(entryTrade?.commissionAsset||"").toUpperCase();
-              const c2=+(exitTrade?.commission||0), a2=(exitTrade?.commissionAsset||"").toUpperCase();
-              const r1=await getConversionRate(a1, quote);
-              const r2=await getConversionRate(a2, quote);
-              const cq=(c1*r1)+(c2*r2);
-              const not1=(+entryTrade.price||0)*(+entryTrade.qty||0);
-              const not2=(+exitTrade.price||0)*(+exitTrade.qty||0);
-              const commission_bps=Math.round(((cq/Math.max(1e-9,not1)) + (cq/Math.max(1e-9,not2)))*10000);
-              return { commission_quote_usdt: +cq.toFixed(8), commission_bps, commission_asset_entry:a1, commission_asset_exit:a2 };
-            }catch{ return { commission_quote_usdt:null, commission_bps:null, commission_asset_entry:"", commission_asset_exit:"" }; }
-          }
-
-          // Reconciliation: API fills + Candle sim compare + audit/holdout gate
-          async function reconcileClosedFromExchange(state){
-            const out={ closed_api:0, closed_sim:0, disagreements:0 };
-
-            // Preserve original behavior if keys missing
-            if (!MEXC_API_KEY || !MEXC_SECRET_KEY) {
-              log("Skipping reconciliation: MEXC_API_KEY/SECRET_KEY not provided.");
-              return out;
-            }
-
-            // PLAN-ONLY: keep logs identical, do nothing else
-            if (PUSHER_MODE === 'plan_only') {
-              log("Starting reconciliation of pending ideas with actual exchange trades...");
-              log(`Reconciliation complete. 0 ideas closed via API. ${(state.pending||[]).length} remain pending. disagreements=0`);
-              return out;
-            }
-
-            log("Starting reconciliation of pending ideas with actual exchange trades...");
-            const now = Date.now();
-            const initialPendingCount = (state.pending || []).length;
-            const newPending = [];
-            const symbolsToFetch = [...new Set((state.pending || []).map(p => p.symbolFull))];
-            const tradeMap = new Map();
-            const startTime = (state.lastReconcileTs || 0) > 0 ? state.lastReconcileTs - 60000 : now - 3 * 24 * 3600 * 1000;
-
-            for (const symbol of symbolsToFetch) {
-              const trades = await fetchMyTrades(symbol, startTime);
-              if (trades && Array.isArray(trades) && trades.length > 0) {
-                  tradeMap.set(symbol, trades.sort((a, b) => a.time - b.time));
-              }
-              await sleep(200);
-            }
-            if (tradeMap.size === 0) { log("No new trades found for any pending symbols."); state.lastReconcileTs = now; return out; }
-
-            for (const p of (state.pending || [])) {
-              const trades = tradeMap.get(p.symbolFull);
-              let reconciled = false;
-              let status = "no_trades_found";
-              if (trades) {
-                // try link by time + side
-                const entryTrade = trades.find(t =>
-                    t.time >= p.ts_ms - 15000 && t.time < p.ts_ms + 5*60*1000 &&
-                    (p.side === 'long' ? t.isBuyer : !t.isBuyer)
-                );
-                if (entryTrade) {
-                  status = "entry_found";
-                  const exitTrade = trades.find(t =>
-                      t.time > entryTrade.time && (p.side === 'long' ? !t.isBuyer : t.isBuyer) &&
-                      Math.abs(parseFloat(t.qty) - parseFloat(entryTrade.qty)) < Math.max(0.02, parseFloat(entryTrade.qty) * 0.02)
-                  );
-                  if (exitTrade) {
-                    status = "closed_api";
-                    const entryPrice = parseFloat(entryTrade.price), exitPrice = parseFloat(exitTrade.price);
-                    const ret = p.side === 'long' ? (exitPrice / entryPrice - 1) : (entryPrice / exitPrice - 1);
-                    const comInfo = await computeCommissionInfo(entryTrade, exitTrade, p.quote||"USDT");
-                    const pnl_bps = Math.round(ret * 10000 - (Number.isFinite(comInfo.commission_bps)?comInfo.commission_bps:COST_BPS));
-                    const outcome = pnl_bps > 0 ? 1 : 0;
-
-                    const sim = await candleSimForIdea(p);
-                    let agree=null;
-                    if(sim.closed){
-                      // Disagreement if sign differs or > 20 bps gap
-                      const signA=pnl_bps>0?1:(pnl_bps<0?-1:0);
-                      const signC=sim.pnl_bps>0?1:(sim.pnl_bps<0?-1:0);
-                      agree = (signA===signC) && (Math.abs(pnl_bps - sim.pnl_bps) <= 20);
-                      if(!agree){
-                        out.disagreements++;
-                        const hold={ ts_ms:Date.now(), symbol:p.symbolFull, side:p.side, api_pnl_bps:pnl_bps, candle_pnl_bps:sim.pnl_bps, entry_ts_ms:entryTrade.time, exit_ts_ms:exitTrade.time, reason:"api_vs_candle", calib_key:p.calib_key, p_raw:p.p_raw, p_pred:p.p_lcb, regime:p.regime };
-                        (state.calibration_holdout ||= []).push(hold);
-                        if(state.calibration_holdout.length>500) state.calibration_holdout=state.calibration_holdout.slice(-500);
-                      }
-                    }
-
-                    const closedRec = {
-                      symbolFull:p.symbolFull, side:p.side, pnl_bps,
-                      ts_entry_ms:entryTrade.time, ts_exit_ms:exitTrade.time,
-                      price_entry:entryPrice, price_exit:exitPrice, qty:parseFloat(entryTrade.qty),
-                      reconciliation:'exchange_trade_history',
-                      reconciliation_compare: sim.closed?{ candle_pnl_bps:sim.pnl_bps, agree } : null,
-                      p_pred:p.p_lcb, p_raw:p.p_raw, calib_key:p.calib_key, regime:p.regime,
-                      predicted_snapshot:p.predicted,
-                      trade_details:{
-                        fingerprint_entry:getTradeFingerprint(entryTrade),
-                        fingerprint_exit:getTradeFingerprint(exitTrade),
-                        maker_taker_entry: entryTrade.isMaker===true?"maker":(entryTrade.isMaker===false?"taker":""),
-                        maker_taker_exit: exitTrade.isMaker===true?"maker":(exitTrade.isMaker===false?"taker":""),
-                        commission_bps: comInfo.commission_bps,
-                        commission_quote_usdt: comInfo.commission_quote_usdt,
-                        commission_asset_entry: comInfo.commission_asset_entry,
-                        commission_asset_exit: comInfo.commission_asset_exit,
-                        slip_realized_bps: null,
-                        client_order_id: p.client_order_id || "",
-                        idea_id: p.idea_id || ""
-                      }
-                    };
-
-                    (state.closed ||= []).push(closedRec);
-                    const sb=state.sym_stats?.[p.base]||{n:0,wins:0,pnl_sum:0};
-                    sb.n++; if(pnl_bps>0) sb.wins++; sb.pnl_sum+=pnl_bps; state.sym_stats[p.base]=sb;
-
-                    // Calibration only if we have candle confirmation and they agree
-                    if(sim.closed && sim.realimagined!==false){
-                      const agreeFlag = (closedRec.reconciliation_compare?.agree===true);
-                      if(agreeFlag && p.regime && p.p_raw != null) updateCalibration(state, p.side, p.regime, p.p_raw, outcome);
-                    }
-
-                    state.equity.push({ ts_ms:p.ts_ms, pnl_bps, tier:p.tier, recon:"api" });
-                    out.closed_api++;
-                    reconciled = true;
-                  } else {
-                    status = "exit_not_found";
-                  }
-                } else {
-                  status = (trades && trades.length>0) ? "entry_not_found" : "no_trades_found";
-                }
-              }
-
-              if (!reconciled) {
-                // keep pending until TTL; candle fallback handled separately
-                p.recon_status=status;
-                newPending.push(p);
-              }
-            }
-
-            state.pending = newPending;
-            state.lastReconcileTs = now;
-            log(`Reconciliation complete. ${out.closed_api} ideas closed via API. ${newPending.length} remain pending. disagreements=${out.disagreements}`);
-            return out;
-          }
-
-          // Fallback: close expired via candle sim; no calibration update (holdout-by-design)
-          async function evalPendingFallback(state){
-            if (PUSHER_MODE === 'plan_only') {
-              log("evalPendingFallback closed via candles:", 0);
-              return { closed_sim: 0 };
-            }
-            const now=Date.now(); const keep=[]; let closedSim=0;
-            for(const p of state.pending||[]){
-              const ttl_ts_ms=p.ttl_ts_ms || (p.ts_ms + (p.hold_sec||0)*1000);
-              if(now < ttl_ts_ms + 5000){ keep.push(p); continue; }
-              const sim=await candleSimForIdea(p);
-              if(!sim.closed){ keep.push(p); continue; }
-              const pnl_bps=sim.pnl_bps;
-              state.equity.push({ ts_ms:p.ts_ms, pnl_bps, tier:p.tier, recon:"candle" });
-              const closedRec = {
-                symbolFull:p.symbolFull, side:p.side, pnl_bps, p_pred:p.p_lcb, p_raw:p.p_raw, calib_key:p.calib_key, regime:p.regime,
-                reconciliation:"candle_simulation",
-                predicted_snapshot:p.predicted,
-                ts_entry_ms:sim.ts_entry_ms, ts_exit_ms:sim.ts_exit_ms, price_entry:sim.price_entry, price_exit:sim.price_exit, qty:null,
-                realized: sim.realized || null,
-                trade_details:{
-                  fingerprint_entry:null, fingerprint_exit:null, maker_taker_entry:"", maker_taker_exit:"",
-                  commission_bps:null, commission_quote_usdt:null, commission_asset_entry:"", commission_asset_exit:"",
-                  slip_realized_bps:null, client_order_id: p.client_order_id || "", idea_id: p.idea_id || ""
-                }
-              };
-              (state.closed ||= []).push(closedRec);
-              const sb=state.sym_stats?.[p.base]||{n:0,wins:0,pnl_sum:0};
-              sb.n++; if(pnl_bps>0) sb.wins++; sb.pnl_sum+=pnl_bps; state.sym_stats[p.base]=sb;
-              closedSim++;
-            }
-            state.pending=keep;
-            if(state.equity.length>6000) state.equity=state.equity.slice(-6000);
-            if(state.closed?.length>5000) state.closed=state.closed.slice(-5000);
-            log("evalPendingFallback closed via candles:", closedSim);
-            return { closed_sim: closedSim };
-          }
-
+          
           // ---------- Main ----------
           let reason="ok", selectionTier="confidence";
           try{
             const { state, persist } = await loadState();
-
-            // NEW: learn pass (Worker-truth only), silent to preserve logs
-            try { await learnFromWorkerClosed(state); } catch(e){ /* no-op to keep logs identical */ }
+            learnFromGistRealFills(state);
 
             // Heartbeat existing pending
             const heartbeat = await heartbeatCheck(state);
             if((heartbeat?.zombies||0)>0) log("heartbeat zombies", heartbeat.zombies, (heartbeat.details||[]).slice(0,5));
-
-            // Reconcile via API then fallback candles for expired
-            let reconStats={closed_api:0,disagreements:0}; try{ reconStats = await reconcileClosedFromExchange(state); }catch(e){ log("reconciliation warn", e?.message||e); }
-            let simStats={closed_sim:0}; try{ simStats = await evalPendingFallback(state); }catch(e){ log("evalPendingFallback warn", e?.message||e); }
-
-            // Build audit artifacts after reconciliations
-            const auditOutInitial=buildAuditOutputs(state);
-            try{ await pushAuditSecondary("audit/closed_audit.jsonl", auditOutInitial.closedAudit); }catch(e){ log("audit secondary closed warn", e?.message||e); }
-            try{ await pushAuditSecondary("audit/reconciliation_disagreements.jsonl", auditOutInitial.disagreements); }catch(e){ log("audit secondary disagree warn", e?.message||e); }
-            try{ await pushAuditSecondary("audit/trades.csv", auditOutInitial.tradesCsv); }catch(e){ log("audit secondary trades warn", e?.message||e); }
 
             const ALL24 = await fetchAll24hr();
             const booksRaw=await getJSON(api("/api/v3/ticker/bookTicker"),10000,2) || [];
@@ -924,19 +801,6 @@ jobs:
               }
               refined[i].uniqMult = clamp(1 - Math.max(0, mx - 0.6)/0.4, 0.6, 1.1);
             }
-
-            // Symbol bias: read Worker-only real stats; fallback to legacy if empty
-            function getSymbolAdj(state, base) {
-              const s = state.sym_stats_real?.[base] || state.sym_stats?.[base];
-              if (!s || s.n < 6) return 1.0;
-              const winRate = s.wins / s.n;
-              const avgPnL = s.pnl_sum / s.n;
-              let m = 1.0;
-              if (winRate < 0.4) m *= 0.7;
-              if (avgPnL < 0) m *= 0.8;
-              return clamp(m, 0.5, 1.2);
-            }
-
             for (const x of refined) {
               const uniqMult = x.uniqMult || 1;
               const symMult = getSymbolAdj(state, x.base);
@@ -945,7 +809,7 @@ jobs:
 
             refined.sort((a,b)=>b.confidence-a.confidence);
 
-            const TARGET_TOP_N = 3; // enforce exactly 3 pushed ideas
+            const TARGET_TOP_N = Math.max(1, TOP_N || 3);
 
             const selected=[];
             for (const cand of refined) {
@@ -957,7 +821,7 @@ jobs:
               }
               if (ok) selected.push(cand);
             }
-            // If still fewer than 3, fill ignoring correlation guard by descending confidence
+            // If still fewer than target, fill ignoring correlation guard by descending confidence
             if (selected.length < TARGET_TOP_N) {
               const have=new Set(selected.map(s=>s.symbol+":"+s.side));
               for (const c of refined) {
@@ -966,7 +830,7 @@ jobs:
                 if (!have.has(k)) { selected.push(c); have.add(k); }
               }
             }
-            // Just in case refined was tiny, ensure we never exceed 3
+            // Just in case refined was tiny, ensure we never exceed target
             if (selected.length > TARGET_TOP_N) selected.splice(TARGET_TOP_N);
 
             // Risk weights via softmax of EV (unchanged)
@@ -1071,7 +935,6 @@ jobs:
                   notional_usd:NOTIONAL,size_bps:p.size_bps,
                   idea_id:p.idea_id, client_order_id:p.client_order_id,
                   trend5m:p.trend5m,
-                  // NEW lifecycle placeholders for Worker
                   status:"planned",
                   entry_ts_ms:null,
                   entry_price:null,
