@@ -16,6 +16,7 @@ jobs:
   push:
     runs-on: ubuntu-latest
     timeout-minutes: 12
+
     env:
       # Required secrets
       WORKER_PUSH_URL: ${{ secrets.WORKER_PUSH_URL }}
@@ -363,16 +364,22 @@ jobs:
           }
           
           function mergeStates(remote, local){
-            const merged = { ...remote, ...local }; // Pusher-owned fields win by default
+            const merged = { ...remote };
 
-            // Worker is the source of truth for these fields. Always take remote.
-            merged.equity = remote.equity || [];
+            // Worker-owned: keep remote as truth
+            merged.equity = Array.isArray(remote.equity) ? remote.equity : [];
             merged.sym_stats_real = remote.sym_stats_real || {};
             merged.sym_stats = remote.sym_stats || {};
             merged.lastReconcileTs = remote.lastReconcileTs || 0;
             if ('fees' in remote) merged.fees = remote.fees;
 
-            // Closed: Remote is truth. We only overlay our 'learned' status. No local appends.
+            // Pusher-owned: keep local
+            merged.cooldown = local.cooldown || {};
+            merged.cooldown_side = local.cooldown_side || {};
+            merged.mr_lockout = local.mr_lockout || {};
+            merged.calibCoeffs = local.calibCoeffs || remote.calibCoeffs || {};
+
+            // Closed: remote truth + overlay learned flags only
             const keyClosed = (c) => {
               const cid = c?.trade_details?.client_order_id || c.client_order_id || c.idea_id || "";
               const tx  = c?.ts_exit_ms || c?.exit_ts_ms || "";
@@ -383,53 +390,110 @@ jobs:
               const lc = localClosedMap.get(keyClosed(rc));
               if (!lc) return rc;
               const learned = Boolean(rc.learned || lc.learned);
-              const learned_at_ts = learned ? (rc.learned_at_ts || lc.learned_at_ts) : undefined;
+              const learned_at_ts = learned ? (rc.learned_at_ts || lc.learned_at_ts || Date.now()) : undefined;
               return { ...rc, learned, learned_at_ts };
             });
 
-            // Pending: Remote is truth, but we append our new plans.
-            const remotePendingIds = new Set((remote.pending||[]).map(p=>p.client_order_id));
-            const newLocalPending = (local.pending||[]).filter(p => !remotePendingIds.has(p.client_order_id));
-            merged.pending = [...(remote.pending||[]), ...newLocalPending];
-            
+            // Pending: append only truly-new local plans (dedup by client_order_id or idea_id)
+            const id = (p) => (p?.client_order_id || p?.clientOrderId || p?.idea_id || "");
+            const remoteIds = new Set((remote.pending || []).map(id));
+            const newLocalPending = (local.pending || []).filter(p => {
+              const k = id(p);
+              return k && !remoteIds.has(k);
+            });
+            merged.pending = [...(remote.pending || []), ...newLocalPending];
+
             merged.version_ts = Date.now();
+
+            console.log("[gha] mergeStates: appended_new_pending", newLocalPending.length,
+                        "remote_pending", (remote.pending||[]).length,
+                        "merged_pending", merged.pending.length);
+
             return merged;
           }
 
-          async function saveState(persist, state, auditOut, retries=0) {  // retries=0 disables merge
-            if(!persist) {
-              log("WARN: No persist—skipping Gist save (check GIST_TOKEN/ID).");
-              return;
-            }
-            try {
-              const files={ "state.json":{ content: JSON.stringify(state) } };
-              const headers={
-                Authorization:`Bearer ${persist.token}`,
-                "Accept":"application/vnd.github+json",
-                "Content-Type":"application/json",
-                "User-Agent":UA
+          async function saveState(persist, state, auditOut, retries=2, blindFallback=true) {
+            if (!persist) { log("WARN: No persist—skipping Gist save."); return; }
+
+            const gistUrl = `https://api.github.com/gists/${persist.id}`;
+            const mkFiles = (s) => ({ "state.json": { content: JSON.stringify(s) } });
+
+            async function patch(files, etag) {
+              const headers = {
+                Authorization: `Bearer ${persist.token}`,
+                "Accept": "application/vnd.github+json",
+                "Content-Type": "application/json",
+                "User-Agent": UA
               };
-              // ETag disabled for blind PATCH (no conflicts, like first pusher)
-              // if (persist.etag) headers["If-Match"] = persist.etag;  // COMMENTED OUT
-
-              log("DEBUG: Saving to Gist ID=", persist.id, "pending length=", (state.pending || []).length, "files=", Object.keys(files).join(","));
-
-              const r = await fetchWithTimeout(`https://api.github.com/gists/${persist.id}`,{
-                method:"PATCH",
+              if (etag) headers["If-Match"] = etag;
+              return await fetchWithTimeout(gistUrl, {
+                method: "PATCH",
                 headers,
                 body: JSON.stringify({ files })
-              });
+              }, 15000);
+            }
 
+            let toSave = state;
+            let etag = persist.etag || null;
+
+            for (let attempt = 0; attempt <= retries; attempt++) {
+              log("DEBUG: saveState attempt", attempt, "etag?", !!etag, "pending=", (toSave.pending||[]).length);
+              const r = await patch(mkFiles(toSave), etag);
               if (r.ok) {
-                log("SUCCESS: Gist updated! Status=", r.status, "pending now=", (state.pending || []).length);
-                persist.etag = r.headers.get("etag");  // Update for future, but not used
+                const newEtag = r.headers.get("etag");
+                persist.etag = newEtag || persist.etag;
+                log("SUCCESS: Gist updated! Status=", r.status, "pending now=", (toSave.pending||[]).length);
                 return;
-              } else {
-                const errText = (await r.text() || "").slice(0, 200);
-                log("ERROR: Gist save failed! Status=", r.status, "Error=", errText);
               }
-            } catch(e) {
-              log("ERROR: saveState exception:", e?.message || String(e), "Gist not updated.");
+
+              const body = (await r.text().catch(()=> ""))?.slice(0, 300) || "";
+              log("WARN: saveState failed status=", r.status, "body=", body);
+
+              if (r.status === 429) {
+                const ra = Number(r.headers.get("retry-after") || 2);
+                log("WARN: Rate limited. Backing off", ra, "s");
+                await sleep(ra * 1000);
+                continue;
+              }
+
+              if (r.status === 412) {
+                // Conflict: re-fetch + merge + retry
+                const r2 = await fetchWithTimeout(gistUrl, {
+                  headers: {
+                    Authorization: `Bearer ${persist.token}`,
+                    "Accept": "application/vnd.github+json",
+                    "User-Agent": UA
+                  }
+                }, 12000);
+                if (!r2.ok) {
+                  log("ERROR: Refetch for merge failed status=", r2.status);
+                  break;
+                }
+                const remoteEtag = r2.headers.get("etag");
+                const remoteGist = await r2.json();
+                const remoteContent = remoteGist.files?.["state.json"]?.content;
+                const remoteState = remoteContent ? JSON.parse(remoteContent) : {};
+                toSave = mergeStates(remoteState, state);
+                etag = remoteEtag || null;
+                await sleep(250 + Math.floor(Math.random()*250)); // small jitter
+                continue;
+              }
+
+              // Other non-retryable errors: break and optionally blind-patch
+              break;
+            }
+
+            if (blindFallback) {
+              log("WARN: Falling back to blind PATCH (no If-Match).");
+              const r3 = await patch(mkFiles(toSave), null);
+              if (r3.ok) {
+                const newEtag = r3.headers.get("etag");
+                persist.etag = newEtag || persist.etag;
+                log("SUCCESS: Blind Gist update ok. pending=", (toSave.pending||[]).length);
+              } else {
+                const body = (await r3.text().catch(()=> ""))?.slice(0, 300) || "";
+                log("ERROR: Blind save failed status=", r3.status, "body=", body);
+              }
             }
           }
           
@@ -947,7 +1011,7 @@ jobs:
             // Persist state + audit artifacts
             const auditOut=buildAuditOutputs(state);
             log("DEBUG: Pre-save: pending length=", (state.pending || []).length);
-            await saveState(persist, state, auditOut, 0);  // retries=0 disables merge
+            await saveState(persist, state, auditOut, 2, true);
             log("DEBUG: saveState call complete.");
 
             // Logs + payload
