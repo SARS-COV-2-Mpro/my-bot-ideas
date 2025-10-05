@@ -485,6 +485,30 @@ jobs:
 
             if (blindFallback) {
               log("WARN: Falling back to blind PATCH (no If-Match).");
+              
+              // Pre-merge before blind patch to avoid clobbering Worker updates
+              try {
+                  const r2 = await fetchWithTimeout(gistUrl, {
+                    headers: {
+                      Authorization: `Bearer ${persist.token}`,
+                      "Accept": "application/vnd.github+json",
+                      "User-Agent": UA
+                    }
+                  }, 12000);
+
+                  if (r2.ok) {
+                    const remoteGist = await r2.json();
+                    const remoteContent = remoteGist.files?.["state.json"]?.content;
+                    const remoteState = remoteContent ? JSON.parse(remoteContent) : {};
+                    toSave = mergeStates(remoteState, state);
+                    log("DEBUG: Pre-blind-patch merge successful.");
+                  } else {
+                    log("WARN: Pre-blind-patch re-fetch failed status=", r2.status, ". Will save local state.");
+                  }
+              } catch (e) {
+                  log("ERROR: Exception during pre-blind-patch re-fetch:", e?.message || String(e));
+              }
+              
               const r3 = await patch(mkFiles(toSave), null);
               if (r3.ok) {
                 const newEtag = r3.headers.get("etag");
