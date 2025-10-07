@@ -1,10 +1,9 @@
-12
 name: Ideas Pusher (MEXC Ultimate 7.7.7)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/35 * * * *" # runs every 25 minutes
+    - cron: "*/25 * * * *" # runs every 25 minutes
 
 permissions:
   contents: read
@@ -119,6 +118,11 @@ jobs:
 
           // ---------- New Helpers ----------
           const uuidv4=()=>{ try{ return crypto.randomUUID(); }catch{ const b=crypto.randomBytes(16); b[6]=(b[6]&0x0f)|0x40; b[8]=(b[8]&0x3f)|0x80; const h=b.toString("hex"); return [h.slice(0,8),h.slice(8,12),h.slice(12,16),h.slice(16,20),h.slice(20)].join("-"); } };
+          const mkClientOrderId = (prefix="mxu") => {
+            const raw = (crypto.randomUUID ? crypto.randomUUID() : uuidv4()).replace(/-/g, "");
+            const base = (prefix + "_" + raw).replace(/[^A-Za-z0-9_-]/g, "").slice(0, 30);
+            return base.padEnd(Math.max(24, base.length), "0");
+          };
           const hashObj=(o)=>{ const norm=(x)=>{ if(x&&typeof x==="object"&&!Array.isArray(x)){ const ks=Object.keys(x).sort(); const y={}; for(const k of ks) y[k]=norm(x[k]); return y; } if(Array.isArray(x)) return x.map(norm); return x; }; const s=JSON.stringify(norm(o)); return crypto.createHash("sha256").update(s).digest("hex"); };
           const toCSVLine=(row,keys)=> keys.map(k=>{ let v=row?.[k]; if(v==null) return ""; if(typeof v==="object") v=JSON.stringify(v); const s=String(v); return s.includes(",")||s.includes("\n")||s.includes('"')? `"${s.replace(/"/g,'""')}"`: s; }).join(",");
 
@@ -183,6 +187,10 @@ jobs:
           const setCached=(map,key,v)=>map.set(key,{ v, ts: Date.now() });
 
           // ---------- Config / ENV ----------
+          const TARGET_EXCHANGE = "bybit_futures_testnet";
+          const MARKET_TYPE     = "futures";
+          const MARGIN_MODE     = "isolated";
+          const LEVERAGE        = 1;
           const EXCHANGE=(process.env.EXCHANGE||"mexc").toLowerCase().replace("mexci","mexc");
           if(EXCHANGE!=="mexc"){ log("This build targets MEXC. Set EXCHANGE=mexc"); process.exit(1); }
           const MEXC_API_KEY = process.env.MEXC_API_KEY || "";
@@ -682,7 +690,6 @@ jobs:
             const split=(sym)=>{ for(const q of QUOTES) if(sym.endsWith(q)) return { base:sym.slice(0,-q.length), quote:q }; return null; };
             const all=[]; for(const t of ALL24||[]){ const sym=t.symbol||t.s; if(!sym) continue; const sq=split(sym); if(!sq) continue; if(STABLES.has(sq.base)) continue; const qv=+(t.quoteVolume||t.q||0); if(!isFinite(qv)||qv<=0) continue; all.push({ symbol:sym, base:sq.base, quote:sq.quote, qv }); }
             all.sort((a,b)=>b.qv-a.qv);
-            const UNIV_TARGET_MIN=100, UNIV_TARGET_MAX=120;
             let dynMinQV=Math.max(MIN_QV_ENV||0,DYN_QV_MIN), filt=all.filter(x=>x.qv>=dynMinQV);
             while(filt.length<UNIV_TARGET_MIN && dynMinQV>1_000_000){ dynMinQV=Math.max(1_000_000, dynMinQV-DYN_QV_STEP); filt=all.filter(x=>x.qv>=dynMinQV); }
             const universe=filt.slice(0,UNIV_TARGET_MAX);
@@ -940,58 +947,58 @@ jobs:
                   sl_abs=entry_limit*(1+slF);
                 }
               }
-              const ttl=clamp(Math.round((x.hold_sec||720)+i*12),TTL_MIN,TTL_MAX);
-              let size_bps=0;
-              if(Number(process.env.FORCE_SIZE_BPS||"0")>0) size_bps=Math.round(Number(process.env.FORCE_SIZE_BPS));
-              else size_bps=x.sl_bps>0?Math.min(220,Math.round((wEv[i]*TARGET_PORT_RISK_BPS/x.sl_bps)*100)):0;
-
-              const idea_id=uuidv4();
-              const client_order_id=uuidv4();
-
-              const calInfo=calibratorInfo(state,x.side,x.regime);
-              const reasons_text=(x.reasons||[]).slice(0,3).map(r=>`${r.factor}:${r.value}(${r.contribution>=0?"+":""}${r.contribution})`);
-
-              const predicted={
-                ts_ms:Date.now(),
-                p_cal:x.p_lcb,
-                ev_bps:x.exp_lcb_bps??x.exp_bps,
-                confidence_score:x.confidence,
-                micro:{spread_bps:x.spread_bps,slip_bps_est:x.slip_est,obi:x.obi,ofi_30s:x.ofi30s,microprice_bias_bps:x.micro_bias_bps},
-                regime:{tf_align:x.tfAlign},
-                mtf:{ agg:x.mtf_agg, weights:x.mtf_weights },
-                meta:{
-                  strategy: STRATEGY_NAME, model_version: MODEL_VERSION, schema_version: SCHEMA_VERSION,
-                  git_sha: GIT_SHA, config_hash: CONFIG_HASH, calib: calInfo
-                },
-                trend5m: x.trend5m,
-                gates:{
-                  spread_bps:x.spread_bps,
-                  cost_bps:x.cost_bps,
-                  vol1h_usd:x.vol1h_est_usd,
-                  depth1p_usd:x.depth1p_usd,
-                  mr_locked:x.mr_locked||false,
-                  btc_gate:btcUp1h,
-                  tf_align_req:MIN_TF_ALIGN,
-                  btc_corr:x.btc_corr
-                },
-                uniq_mult:x.uniqMult || 1,
-                reasons:x.reasons
-              };
+              const idea_id = uuidv4();
+              const client_order_id = mkClientOrderId("mxu");
 
               return {
                 idea_id, client_order_id,
-                symbol:x.base,symbol_full:x.symbol,quote:x.quote,side:x.side,rank:i+1,
-                ttl_sec:ttl,
-                p_win:x.p_lcb,p_lcb:x.p_lcb,p_raw:x.p_raw,
-                calib_key:`${x.side}_${String(x.regime).includes("mean")?"mr":"trend"}`,
-                tp_bps:x.tp_bps,sl_bps:x.sl_bps,rrr:x.rrr,
-                exp_lcb_bps:x.exp_lcb_bps,cost_bps:x.cost_bps,
-                entry_policy:"smart_swing_limit",entry_type:"limit",activation:"on_fill",
-                entry_mid:mid,entry_limit,tp_abs,sl_abs,
-                size_bps,tier:"confidence",
-                predicted,confidence:x.confidence,reasons:x.reasons,reasons_text,
-                ev_bps:x.exp_bps,ret5:x.ret5,regime:x.regime,
-                trend5m:x.trend5m
+
+                symbol: x.base,
+                symbol_full: x.symbol,
+                symbolFull: x.symbol,
+                quote: x.quote,
+                side: x.side,
+                rank: i+1,
+
+                target_exchange: TARGET_EXCHANGE,
+                market_type: MARKET_TYPE,
+                margin_mode: MARGIN_MODE,
+                leverage: LEVERAGE,
+
+                entry_policy: "maker_join",
+                exec: { exec: "post_only" },
+
+                entry_mid: mid,
+                entry_limit,
+
+                tp_bps: x.tp_bps,
+                sl_bps: x.sl_bps,
+                rrr: x.rrr,
+                exp_lcb_bps: x.exp_lcb_bps,
+                ev_bps: x.exp_bps,
+                cost_bps: x.cost_bps,
+
+                p_win: x.p_lcb,
+                p_lcb: x.p_lcb,
+                p_raw: x.p_raw,
+                calib_key: `side:${x.side}|regime:${x.regime}`,
+                regime: x.regime,
+
+                ttl_sec: clamp(Math.round((x.hold_sec || 720)+i*12), TTL_MIN, TTL_MAX),
+                size_bps: (Number(process.env.FORCE_SIZE_BPS||"0")>0)
+                            ? Math.round(Number(process.env.FORCE_SIZE_BPS))
+                            : (x.sl_bps>0?Math.min(220,Math.round((wEv[i]*TARGET_PORT_RISK_BPS/x.sl_bps)*100)):0),
+
+                predicted: {
+                  ts_ms: Date.now(),
+                  p_cal: x.p_lcb,
+                  ev_bps: x.exp_lcb_bps ?? x.exp_bps,
+                  confidence_score: x.confidence
+                },
+
+                confidence: x.confidence,
+                reasons: x.reasons,
+                reasons_text: (x.reasons||[]).slice(0,3).map(r=>`${r.factor}:${r.value}(${r.contribution>=0?"+":""}${r.contribution})`)
               };
             });
             // Portfolio VaR/ES throttle on sizes
@@ -1014,19 +1021,44 @@ jobs:
                 state.cooldown[p.symbol]=nowMs;
                 state.cooldown_side[p.symbol]={side:p.side,ts_ms:nowMs};
                 state.pending.push({
-                  ts:ideasTs,ts_ms:nowMs,ttl_ts_ms:nowMs+p.ttl_sec*1000,
-                  symbolFull:p.symbol_full,base:p.symbol,quote:p.quote,side:p.side,
-                  entry_limit:p.entry_limit,tp_abs:p.tp_abs,sl_abs:p.sl_abs,hold_sec:p.ttl_sec,
-                  tp_bps:p.tp_bps,sl_bps:p.sl_bps,cost_bps:p.cost_bps,tier:p.tier,
-                  p_lcb:p.p_lcb,p_raw:p.p_raw,calib_key:p.calib_key,predicted:p.predicted,regime:p.regime,
-                  decision_context:{tfs:["1m","5m","15m","1h","4h"], mtf_weights:TF_WEIGHTS},
-                  notional_usd:NOTIONAL,size_bps:p.size_bps,
-                  idea_id:p.idea_id, client_order_id:p.client_order_id,
-                  trend5m:p.trend5m,
-                  status:"planned",
-                  entry_ts_ms:null,
-                  entry_price:null,
-                  qty:null
+                  // Identity and timing
+                  ts_ms: nowMs,
+                  idea_id: p.idea_id,
+                  client_order_id: p.client_order_id,
+                  status: "planned",
+
+                  // Instrument and direction
+                  base: p.symbol,
+                  symbolFull: p.symbolFull || p.symbol_full,
+                  side: p.side,
+
+                  // Futures intent
+                  target_exchange: p.target_exchange || TARGET_EXCHANGE,
+                  market_type: p.market_type || MARKET_TYPE,
+                  margin_mode: p.margin_mode || MARGIN_MODE,
+                  leverage: p.leverage != null ? p.leverage : LEVERAGE,
+
+                  // Entry and execution
+                  entry_policy: p.entry_policy,               // "maker_join" or "market"
+                  ...(p.entry_policy === "maker_join" ? { entry_limit: p.entry_limit } : {}),
+                  ...(p.exec ? { exec: p.exec } : {}),        // { exec: "post_only" } for maker
+
+                  // Sizing
+                  notional_usd: NOTIONAL,
+
+                  // Exits
+                  tp_bps: p.tp_bps,
+                  sl_bps: p.sl_bps,
+
+                  // Probabilities and model metadata
+                  p_lcb: p.p_lcb,
+                  p_raw: p.p_raw,
+                  calib_key: p.calib_key,
+                  regime: p.regime,
+                  predicted: p.predicted,
+
+                  // TTL
+                  hold_sec: p.ttl_sec
                 });
               }
               if(state.pending.length>550) state.pending=state.pending.slice(-550);
