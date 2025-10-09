@@ -214,7 +214,6 @@ jobs:
           const VWAP_5M_WIN=36, COST_BPS=Number(process.env.FEES_BPS||"10"), NOTIONAL=Number(process.env.NOTIONAL_USD||"300");
           const DEPTH_LIMIT=Number(process.env.MEXC_DEPTH_LIMIT||"50"), OBI_TOPN=Number(process.env.OBI_TOPN||"12");
           const COOLDOWN_MS=3*60*60*1000, FLIP_GUARD_MS=30*60*1000;
-          const STALE_GRACE_MS = 60_000; // 60s grace after TTL (tune if needed)
           const DD_24H_LIMIT_BPS=-150, DD_PEAK_LIMIT_BPS=-300;
           const WILSON_Z=1.34, TARGET_PORT_RISK_BPS=52, TTL_MIN=540, TTL_MAX=1200;
           const S_H=process.env.ACTIVE_UTC_START?Number(process.env.ACTIVE_UTC_START):null;
@@ -340,47 +339,91 @@ jobs:
             return res;
           }
           
-          async function cleanupPendingBeforePlanning(state) {
+          const DROPPABLE_STATUSES = new Set(["planned","placed","pending","queued","ready"]);
+          const STALE_GRACE_MS = 60_000; // keep/tune
+          
+          function ttlDeadlineMs(p) {
+            const num = (x) => Number(x || 0) || 0;
+            const parseIso = (s) => { const t = Date.parse(s || ""); return Number.isFinite(t) ? t : 0; };
+          
+            // 1) Direct ttl_ts_ms
+            const t1 = num(p.ttl_ts_ms);
+            if (t1 > 0) return t1;
+          
+            // 2) ts_ms + hold_sec/ttl_sec
+            const ts2 = num(p.ts_ms);
+            const hold2 = num(p.hold_sec || p.ttl_sec || p.predicted?.ttl_sec);
+            if (ts2 > 0 && hold2 > 0) return ts2 + hold2 * 1000;
+          
+            // 3) ISO ts + hold
+            const tsIso = parseIso(p.ts || p.predicted?.ts || p.predicted?.ts_iso);
+            if (tsIso > 0 && hold2 > 0) return tsIso + hold2 * 1000;
+          
+            // 4) Fallback: consider expired after TTL_MAX from ts_ms/ISO
+            if (ts2 > 0) return ts2 + TTL_MAX * 1000;
+            if (tsIso > 0) return tsIso + TTL_MAX * 1000;
+          
+            return 0; // unknown → don’t drop
+          }
+          
+          async function cleanupPendingBeforePlanning(state, heartbeat) {
             const now = Date.now();
           
-            // Get all open orders once
+            // If we can’t safely check open orders, skip drops to avoid false positives
+            if (!process.env.MEXC_API_KEY || !process.env.MEXC_SECRET_KEY) {
+              log("cleanup: missing MEXC keys; skipping cleanup");
+              return { dropped: 0, dropCIDs: [], scanned: state.pending?.length || 0 };
+            }
+          
             let openAll = [];
             try { openAll = await fetchOpenOrders(); } catch {}
             const byClient = new Map((openAll || []).map(o => [String(o.clientOrderId || o.clientOrderID || "").trim(), o]));
           
+            // Optional: include heartbeat zombies as orphans
+            const zombieSet = new Set((heartbeat?.details || [])
+              .filter(d => d.type === "zombie")
+              .map(d => String(d.client_order_id || "").trim())
+              .filter(Boolean)
+            );
+          
             const keep = [];
             const dropCIDs = [];
+            let candidates = 0, expired = 0, noOpen = 0;
           
             for (const p of (state.pending || [])) {
               try {
                 const cid = String(p.client_order_id || p.clientOrderId || p.idea_id || "").trim();
-                const ttlTs = Number(p.ttl_ts_ms || 0) || ((Number(p.ts_ms || 0)) + (Number(p.hold_sec || 0) * 1000));
-                const isExpired = ttlTs && now > (ttlTs + STALE_GRACE_MS);
+                const status = (p.status || "planned").toLowerCase();
+                const ttlTs = ttlDeadlineMs(p);
+                const isExpired = ttlTs > 0 && now > (ttlTs + STALE_GRACE_MS);
                 const noEntryYet = !p.entry_ts_ms;
                 const onEx = cid && byClient.has(cid);
+                const orphan = !onEx || zombieSet.has(cid);
           
-                // Only drop: planned, expired, no fill, no open order on exchange
-                if ((p.status === "planned") && isExpired && noEntryYet && !onEx) {
+                const droppable = DROPPABLE_STATUSES.has(status) && noEntryYet;
+                if (droppable) candidates++;
+                if (droppable && isExpired) expired++;
+                if (droppable && isExpired && orphan) noOpen++;
+          
+                if (droppable && isExpired && orphan) {
                   dropCIDs.push(cid || p.idea_id || "");
-                  continue; // do not keep
+                  continue;
                 }
                 keep.push(p);
               } catch {
-                // if anything odd, keep it (safer)
                 keep.push(p);
               }
             }
           
             if (dropCIDs.length) {
               state.pending = keep;
-              // tell mergeStates not to re-add these from remote
               state.__drop_pending_cids = [...new Set([...(state.__drop_pending_cids || []), ...dropCIDs])];
-              log("cleanupPendingBeforePlanning: dropped expired without-results pending =", dropCIDs.length);
+              log(`cleanup: scanned=${state.pending.length + dropCIDs.length} candidates=${candidates} expired=${expired} no_open=${noOpen} dropped=${dropCIDs.length}`);
             } else {
-              log("cleanupPendingBeforePlanning: nothing to drop");
+              log(`cleanup: scanned=${state.pending?.length || 0} candidates=${candidates} expired=${expired} no_open=${noOpen} dropped=0`);
             }
           
-            return { dropped: dropCIDs.length, dropCIDs };
+            return { dropped: dropCIDs.length, dropCIDs, scanned: state.pending?.length || 0 };
           }
           
           // ---------- State (Gist) + Calibration + Audit ----------
@@ -711,14 +754,11 @@ jobs:
             const { state, persist } = await loadState();
             learnFromGistRealFills(state);
 
-            // Heartbeat existing pending
             const heartbeat = await heartbeatCheck(state);
-            if((heartbeat?.zombies||0)>0) log("heartbeat zombies", heartbeat.zombies, (heartbeat.details||[]).slice(0,5));
-
-            // 1) Drop stale pendings first
-            const cleaned = await cleanupPendingBeforePlanning(state);
+            
+            // 1) Drop stale pendings first (uses heartbeat zombies)
+            const cleaned = await cleanupPendingBeforePlanning(state, heartbeat);
             if (cleaned.dropped > 0) {
-              // Save now so Worker won’t see old plans
               const auditOut = buildAuditOutputs(state);
               await saveState(persist, state, auditOut, 2, true);
               log("cleanup saved to Gist before planning.");
