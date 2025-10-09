@@ -214,6 +214,7 @@ jobs:
           const VWAP_5M_WIN=36, COST_BPS=Number(process.env.FEES_BPS||"10"), NOTIONAL=Number(process.env.NOTIONAL_USD||"300");
           const DEPTH_LIMIT=Number(process.env.MEXC_DEPTH_LIMIT||"50"), OBI_TOPN=Number(process.env.OBI_TOPN||"12");
           const COOLDOWN_MS=3*60*60*1000, FLIP_GUARD_MS=30*60*1000;
+          const STALE_GRACE_MS = 60_000; // 60s grace after TTL (tune if needed)
           const DD_24H_LIMIT_BPS=-150, DD_PEAK_LIMIT_BPS=-300;
           const WILSON_Z=1.34, TARGET_PORT_RISK_BPS=52, TTL_MIN=540, TTL_MAX=1200;
           const S_H=process.env.ACTIVE_UTC_START?Number(process.env.ACTIVE_UTC_START):null;
@@ -338,6 +339,50 @@ jobs:
             }catch(e){ log("heartbeat warn", e?.message||e); }
             return res;
           }
+          
+          async function cleanupPendingBeforePlanning(state) {
+            const now = Date.now();
+          
+            // Get all open orders once
+            let openAll = [];
+            try { openAll = await fetchOpenOrders(); } catch {}
+            const byClient = new Map((openAll || []).map(o => [String(o.clientOrderId || o.clientOrderID || "").trim(), o]));
+          
+            const keep = [];
+            const dropCIDs = [];
+          
+            for (const p of (state.pending || [])) {
+              try {
+                const cid = String(p.client_order_id || p.clientOrderId || p.idea_id || "").trim();
+                const ttlTs = Number(p.ttl_ts_ms || 0) || ((Number(p.ts_ms || 0)) + (Number(p.hold_sec || 0) * 1000));
+                const isExpired = ttlTs && now > (ttlTs + STALE_GRACE_MS);
+                const noEntryYet = !p.entry_ts_ms;
+                const onEx = cid && byClient.has(cid);
+          
+                // Only drop: planned, expired, no fill, no open order on exchange
+                if ((p.status === "planned") && isExpired && noEntryYet && !onEx) {
+                  dropCIDs.push(cid || p.idea_id || "");
+                  continue; // do not keep
+                }
+                keep.push(p);
+              } catch {
+                // if anything odd, keep it (safer)
+                keep.push(p);
+              }
+            }
+          
+            if (dropCIDs.length) {
+              state.pending = keep;
+              // tell mergeStates not to re-add these from remote
+              state.__drop_pending_cids = [...new Set([...(state.__drop_pending_cids || []), ...dropCIDs])];
+              log("cleanupPendingBeforePlanning: dropped expired without-results pending =", dropCIDs.length);
+            } else {
+              log("cleanupPendingBeforePlanning: nothing to drop");
+            }
+          
+            return { dropped: dropCIDs.length, dropCIDs };
+          }
+          
           // ---------- State (Gist) + Calibration + Audit ----------
           async function loadState(){
             const token=process.env.GIST_TOKEN, id=process.env.GIST_ID;
@@ -374,29 +419,29 @@ jobs:
             }catch(e){ log("loadState warn", e?.message||e); return { state:init, persist:null }; }
           }
           
-          function mergeStates(remote, local){
+          function mergeStates(remote, local) {
             const merged = { ...remote };
-
-            // Worker-owned: keep remote as truth
-            merged.equity = Array.isArray(remote.equity) ? remote.equity : [];
-            merged.sym_stats_real = remote.sym_stats_real || {};
-            merged.sym_stats = remote.sym_stats || {};
-            merged.lastReconcileTs = remote.lastReconcileTs || 0;
-            if ('fees' in remote) merged.fees = remote.fees;
-
-            // Pusher-owned: keep local
-            merged.cooldown = local.cooldown || {};
-            merged.cooldown_side = local.cooldown_side || {};
-            merged.mr_lockout = local.mr_lockout || {};
-            merged.calibCoeffs = local.calibCoeffs || remote.calibCoeffs || {};
-
-            // Closed: remote truth + overlay learned flags only
+          
+            // Honor Pusher-requested drops so remote.pending doesn't reintroduce them
+            const dropSet = new Set((local.__drop_pending_cids || []).map(x => String(x).trim()).filter(Boolean));
+            const id = (p) => (p?.client_order_id || p?.clientOrderId || p?.idea_id || "");
+          
+            // Pending: remote truth minus drops, plus any truly new local
+            const remotePending = (remote.pending || []).filter(p => !dropSet.has(id(p)));
+            const remoteIds = new Set(remotePending.map(id));
+            const newLocalPending = (local.pending || []).filter(p => {
+              const k = id(p);
+              return k && !remoteIds.has(k);
+            });
+            merged.pending = [...remotePending, ...newLocalPending];
+          
+            // Closed: keep Worker-owned truth; merge local flags if present
             const keyClosed = (c) => {
               const cid = c?.trade_details?.client_order_id || c.client_order_id || c.idea_id || "";
               const tx  = c?.ts_exit_ms || c?.exit_ts_ms || "";
               return `${cid}|${tx}`;
             };
-            const localClosedMap = new Map((local.closed||[]).map(c => [keyClosed(c), c]));
+            const localClosedMap = new Map((local.closed || []).map(c => [keyClosed(c), c]));
             merged.closed = (remote.closed || []).map(rc => {
               const lc = localClosedMap.get(keyClosed(rc));
               if (!lc) return rc;
@@ -404,22 +449,21 @@ jobs:
               const learned_at_ts = learned ? (rc.learned_at_ts || lc.learned_at_ts || Date.now()) : undefined;
               return { ...rc, learned, learned_at_ts };
             });
-
-            // Pending: append only truly-new local plans (dedup by client_order_id or idea_id)
-            const id = (p) => (p?.client_order_id || p?.clientOrderId || p?.idea_id || "");
-            const remoteIds = new Set((remote.pending || []).map(id));
-            const newLocalPending = (local.pending || []).filter(p => {
-              const k = id(p);
-              return k && !remoteIds.has(k);
-            });
-            merged.pending = [...(remote.pending || []), ...newLocalPending];
-
+          
+            // Worker-owned fields
+            merged.equity = Array.isArray(remote.equity) ? remote.equity : [];
+            merged.sym_stats_real = remote.sym_stats_real || {};
+            merged.sym_stats = remote.sym_stats || {};
+            merged.lastReconcileTs = remote.lastReconcileTs || 0;
+            if ('fees' in remote) merged.fees = remote.fees;
+          
+            // Pusher-owned
+            merged.cooldown = local.cooldown || {};
+            merged.cooldown_side = local.cooldown_side || {};
+            merged.mr_lockout = local.mr_lockout || {};
+            merged.calibCoeffs = local.calibCoeffs || remote.calibCoeffs || {};
+          
             merged.version_ts = Date.now();
-
-            console.log("[gha] mergeStates: appended_new_pending", newLocalPending.length,
-                        "remote_pending", (remote.pending||[]).length,
-                        "merged_pending", merged.pending.length);
-
             return merged;
           }
 
@@ -671,6 +715,16 @@ jobs:
             const heartbeat = await heartbeatCheck(state);
             if((heartbeat?.zombies||0)>0) log("heartbeat zombies", heartbeat.zombies, (heartbeat.details||[]).slice(0,5));
 
+            // 1) Drop stale pendings first
+            const cleaned = await cleanupPendingBeforePlanning(state);
+            if (cleaned.dropped > 0) {
+              // Save now so Worker won’t see old plans
+              const auditOut = buildAuditOutputs(state);
+              await saveState(persist, state, auditOut, 2, true);
+              log("cleanup saved to Gist before planning.");
+            }
+            
+            // 2) Continue as before to build and push new ideas...
             const ALL24 = await fetchAll24hr();
             const booksRaw=await getJSON(api("/api/v3/ticker/bookTicker"),10000,2) || [];
             const bookMap=new Map(booksRaw.map(b=>[b.symbol,{ bid:+b.bidPrice, ask:+b.askPrice }]));
