@@ -251,97 +251,16 @@ jobs:
           log("health GET", HEALTH_URL);
           try{ const r=await fetchWithTimeout(HEALTH_URL,{ headers:{ "Authorization":`Bearer ${PUSH_TOKEN}`,"User-Agent":UA }},5000); let t=""; try{ t=await r.text(); }catch{} log("health status", r?.status||"ERR", (t||"").slice(0,160)); }catch(e){ log("health error", e?.message||e); }
 
-          // ---------- Bybit Testnet Data Adapter (for Market Data) ----------
-          const BYBIT_BASE = "https://api-testnet.bybit.com";
-          const api=(path,params={})=>{ const u=new URL(path,BYBIT_BASE); for(const [k,v] of Object.entries(params)){ if(v!==undefined&&v!==null) u.searchParams.set(k,String(v)); } return u.toString(); };
-          
-          // Helper to map interval formats from script's convention to Bybit's
-          const mapIntervalToBybit = (interval) => {
-            const mapping = {
-                '1m': '1', '3m': '3', '5m': '5', '15m': '15', '30m': '30',
-                '1h': '60', '2h': '120', '4h': '240', '12h': '720', '1d': 'D'
-            };
-            return mapping[interval] || interval;
-          };
-
-          async function fetchK(sym, interval, limit) {
-              const bybitInterval = mapIntervalToBybit(interval);
-              const u = api("/v5/market/klines", { category: "linear", symbol: sym, interval: bybitInterval, limit });
-              const data = await getJSON(u, 10000, 2);
-              // Reformat Bybit response [ts, open, high, low, close, vol, turnover] to match the script's expected format.
-              // Bybit returns newest first, so we reverse it.
-              if (data?.result?.list && Array.isArray(data.result.list)) {
-                  return data.result.list.map(k => [
-                      +k[0], // timestamp
-                      k[1],  // open
-                      k[2],  // high
-                      k[3],  // low
-                      k[4],  // close
-                      k[5],  // volume
-                      k[6]   // turnover
-                  ]).reverse();
-              }
-              return null;
-          }
-
-          async function fetchDepth(symbol) {
-              const u = api("/v5/market/orderbook", { category: "linear", symbol, limit: DEPTH_LIMIT });
-              const data = await getJSON(u, 10000, 2);
-              // Reformat Bybit response to { bids: [...], asks: [...] }
-              if (data?.result) {
-                  return {
-                      bids: data.result.b,
-                      asks: data.result.a,
-                  };
-              }
-              return null;
-          }
-
-          async function fetchBookTicker(symbol) {
-              const u = api("/v5/market/tickers", { category: "linear", symbol });
-              const data = await getJSON(u, 8000, 1);
-              // Reformat Bybit response to match { bidPrice: '...', askPrice: '...' }
-              if (data?.result?.list?.[0]) {
-                  const ticker = data.result.list[0];
-                  return {
-                      symbol: ticker.symbol,
-                      bidPrice: ticker.bid1Price,
-                      askPrice: ticker.ask1Price,
-                  };
-              }
-              return null;
-          }
-          
-          async function fetchBybitUniverse() {
-            const u = api("/v5/market/tickers", { category: "linear" });
-            const data = await getJSON(u, 10000, 2);
-            if (!data?.result?.list || !Array.isArray(data.result.list)) {
-              log("Failed to fetch Bybit universe or list is empty.");
-              return [];
-            }
-            return data.result.list.map(t => ({
-              symbol: t.symbol,
-              qv: +(t.turnover24h || 0)
-            }));
-          }
-
-          async function getKCached(symbol,interval,limit,startTime,endTime){ const key=[symbol,interval,limit].join("|"); const c=getCached(cache.k,key,TTL.k); if(c) return c; const v=await fetchK(symbol,interval,limit); if(v) setCached(cache.k,key,v); return v; }
-          async function getDepthCached(symbol){ const c=getCached(cache.depth,symbol,TTL.depth); if(c) return c; const v=await fetchDepth(symbol); if(v) setCached(cache.depth,symbol,v); return v; }
-          async function getBookTickerCached(symbol){ const c=getCached(cache.bt,symbol,TTL.bt); if(c) return c; const v=await fetchBookTicker(symbol); if(v) setCached(cache.bt,symbol,v); return v; }
-          async function getKMultiTF(symbol){ const pairs=[["1m",300],["3m",300],["5m",K5M],["15m",K15M],["30m",300],["1h",K1H],["2h",200],["4h",K4H],["12h",120],["1d",90]]; const out={}; for(const [tf,lim] of pairs){ out[tf]=await getKCached(symbol, tf, lim); } return out; }
-          const tfInd=(k)=>{ if(!k?.length) return null; const h=k.map(x=>+x[2]), l=k.map(x=>+x[3]), c=k.map(x=>+x[4]); const adxatr=computeADX_ATR(h,l,c,14)||{adx:0,atr:0}; const up=c.at(-1)>=ema(c,21)&&c.at(-1)>=ema(c,50); return {adx:adxatr.adx||0,atr:adxatr.atr||0,up}; };
-
-          // ---------- MEXC Signed Requests (for Reconciliation & Heartbeat) ----------
-          // These are kept to interact with the Gist state and check against your MEXC worker.
-          const MEXC_BASES=["https://api.mexc.com","https://www.mexc.com"].filter(Boolean);
+          // ---------- MEXC Adapter ----------
           async function pickMexcBase(){ for(const b of MEXC_BASES){ try{ const r=await fetchWithTimeout(`${b}/api/v3/time`,{},4000); if(r?.ok) return b; }catch{} } throw new Error("No healthy MEXC base"); }
-          const MEXC_BASE_URL = await pickMexcBase();
+          const BASE=await pickMexcBase();
+          const api=(path,params={})=>{ const u=new URL(path,BASE); for(const [k,v] of Object.entries(params)){ if(v!==undefined&&v!==null) u.searchParams.set(k,String(v)); } return u.toString(); };
           async function mexcSignedRequest(path, params = {}, method = 'GET') {
               if (!MEXC_API_KEY || !MEXC_SECRET_KEY) return null;
               const timestamp = Date.now();
               const queryString = new URLSearchParams({ ...params, timestamp }).toString();
               const signature = crypto.createHmac('sha256', MEXC_SECRET_KEY).update(queryString).digest('hex');
-              const url = new URL(path, MEXC_BASE_URL);
+              const url = new URL(path, BASE);
               url.search = queryString + `&signature=${signature}`;
               const options = { method, headers: { 'X-MEXC-APIKEY': MEXC_API_KEY, 'Content-Type': 'application/json', 'User-Agent': UA } };
               try {
@@ -356,6 +275,39 @@ jobs:
           }
           async function fetchMyTrades(symbol, startTime) { return await mexcSignedRequest('/api/v3/myTrades', { symbol, startTime, limit: 1000 }); }
           async function fetchOpenOrders(symbol) { return await mexcSignedRequest('/api/v3/openOrders', symbol?{ symbol }:{}) || []; }
+          async function fetchK(sym,interval,limit,startTime,endTime){ const u=api("/api/v3/klines",{symbol:sym,interval,limit,startTime,endTime}); const r=await getJSON(u,10000,2); return Array.isArray(r)?r:null; }
+          async function fetchDepth(symbol){ return await getJSON(api("/api/v3/depth",{symbol,limit:DEPTH_LIMIT}), 10000, 2); }
+          async function fetchAll24hr(){
+            let all=await getJSON(api("/api/v3/ticker/24hr"),10000,2); if(Array.isArray(all)&&all.length) return all;
+            const exi=await getJSON(api("/api/v3/exchangeInfo"),10000,2); const syms=(exi?.symbols||[]).filter(s=>s.status==="TRADING").map(s=>s.symbol).slice(0,300);
+            const out=[]; for(let i=0;i<syms.length;i+=24){ const chunk=syms.slice(i,i+24); const got=await Promise.all(chunk.map(s=>getJSON(api("/api/v3/ticker/24hr",{symbol:s}),6000,1))); for(const x of got) if(x) out.push(x); await sleep(180); } return out;
+          }
+          async function fetchBookTicker(symbol){ return await getJSON(api("/api/v3/ticker/bookTicker",{symbol}), 8000, 1); }
+
+          async function getKCached(symbol,interval,limit,startTime,endTime){ const key=[symbol,interval,limit,startTime||"",endTime||""].join("|"); const c=getCached(cache.k,key,TTL.k); if(c) return c; const v=await fetchK(symbol,interval,limit,startTime,endTime); if(v) setCached(cache.k,key,v); return v; }
+          async function getDepthCached(symbol){ const c=getCached(cache.depth,symbol,TTL.depth); if(c) return c; const v=await fetchDepth(symbol); if(v) setCached(cache.depth,symbol,v); return v; }
+          async function getBookTickerCached(symbol){ const c=getCached(cache.bt,symbol,TTL.bt); if(c) return c; const v=await fetchBookTicker(symbol); if(v) setCached(cache.bt,symbol,v); return v; }
+          async function getKMultiTF(symbol){ const pairs=[["1m",300],["3m",300],["5m",K5M],["15m",K15M],["30m",300],["1h",K1H],["2h",200],["4h",K4H],["12h",120],["1d",90]]; const out={}; for(const [tf,lim] of pairs){ out[tf]=await getKCached(symbol, tf, lim); } return out; }
+          const tfInd=(k)=>{ if(!k?.length) return null; const h=k.map(x=>+x[2]), l=k.map(x=>+x[3]), c=k.map(x=>+x[4]); const adxatr=computeADX_ATR(h,l,c,14)||{adx:0,atr:0}; const up=c.at(-1)>=ema(c,21)&&c.at(-1)>=ema(c,50); return {adx:adxatr.adx||0,atr:adxatr.atr||0,up}; };
+
+          // ---------- Conversion rate helper for commissions ----------
+          async function getConversionRate(asset, quote="USDT"){
+            try{
+              if(!asset||asset.toUpperCase()===quote.toUpperCase()) return 1;
+              const key=asset.toUpperCase()+"_"+quote.toUpperCase();
+              const c=getCached(cache.conv,key,TTL.conv); if(c) return c;
+              const sym1=asset.toUpperCase()+quote.toUpperCase();
+              const sym2=quote.toUpperCase()+asset.toUpperCase();
+              let px=null;
+              let bt=await getBookTickerCached(sym1);
+              if(bt?.askPrice) px=+bt.askPrice;
+              if(px==null){ bt=await getBookTickerCached(sym2); if(bt?.bidPrice) px=1/(+bt.bidPrice||1); }
+              if(px==null) return 1;
+              setCached(cache.conv,key,px);
+              return px;
+            }catch{ return 1; }
+          }
+
           // ---------- Secondary store stub (no-op) ----------
           async function pushAuditSecondary(path, payload){
             try{
