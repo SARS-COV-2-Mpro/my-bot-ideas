@@ -1,9 +1,9 @@
 name: Ideas Pusher (MEXC Ultimate 7.7.7)
 
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: "*/55 * * * *" # runs every 25 minutes
+  repository_dispatch:
+    types: [run_B]
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -162,6 +162,57 @@ jobs:
             const mk=(t.isMaker===true)?"M":(t.isMaker===false)?"T":"?";
             return [sym,side,oid,tid,q,p,cmA,mk].join(":");
           }catch{ return String(t?.id||t?.orderId||Math.random()); } };
+
+          const DROPPABLE_STATUSES = new Set(["planned","placed","pending","queued","ready"]);
+
+          async function cleanupPendingBeforePlanning(state, heartbeat) {
+            // Fetch open orders once
+            let openAll = null;
+            try { openAll = await fetchOpenOrders(); } catch (e) { log("openOrders err", e?.message || e); }
+
+            // If we can’t confirm open orders, skip cleanup (don’t risk deleting live orders)
+            if (!Array.isArray(openAll)) {
+              log("cleanup: openOrders unavailable; skipping this cycle");
+              return { dropped: 0, dropCIDs: [], scanned: state.pending?.length || 0, droppable: 0, orphans: 0 };
+            }
+
+            const byClient = new Map(openAll.map(o => [String(o.clientOrderId || o.clientOrderID || "").trim(), o]));
+            const zombieSet = new Set((heartbeat?.details || [])
+              .filter(d => d.type === "zombie")
+              .map(d => String(d.client_order_id || "").trim())
+              .filter(Boolean)
+            );
+
+            const keep = [];
+            const dropCIDs = [];
+            let scanned = 0, droppable = 0, orphans = 0;
+
+            const idOf = (p)=> String(p?.client_order_id || p?.clientOrderId || p?.idea_id || "").trim();
+
+            for (const p of (state.pending || [])) {
+              scanned++;
+              const cid = idOf(p);
+              const status = (p.status || "planned").toLowerCase();
+              const noEntryYet = !p.entry_ts_ms;
+              const onEx = cid && byClient.has(cid);
+              const orphan = !onEx || zombieSet.has(cid);
+              const canDrop = DROPPABLE_STATUSES.has(status) && noEntryYet;
+
+              if (canDrop) droppable++;
+              if (canDrop && orphan) { orphans++; dropCIDs.push(cid || p.idea_id || ""); continue; }
+              keep.push(p);
+            }
+
+            if (dropCIDs.length) {
+              state.pending = keep;
+              state.__drop_pending_cids = [...new Set([...(state.__drop_pending_cids || []), ...dropCIDs])];
+              log(`cleanup: scanned=${scanned} droppable=${droppable} orphans=${orphans} dropped=${dropCIDs.length}`);
+            } else {
+              log(`cleanup: scanned=${scanned} droppable=${droppable} orphans=${orphans} dropped=0`);
+            }
+            return { dropped: dropCIDs.length, dropCIDs, scanned, droppable, orphans };
+          }
+          
           // ---------- Microstructure / Heavy Features helpers ----------
           const computeOBI=(depth, topN=12)=>{ if(!depth?.asks?.length || !depth?.bids?.length) return 0; const w=(i)=>Math.exp(-i*0.18); let bidNot=0, askNot=0; for(let i=0;i<Math.min(topN, depth.bids.length); i++){ const p=+depth.bids[i][0], q=+depth.bids[i][1]; if(p>0&&q>0) bidNot += p*q*w(i); } for(let i=0;i<Math.min(topN, depth.asks.length); i++){ const p=+depth.asks[i][0], q=+depth.asks[i][1]; if(p>0&&q>0) askNot += p*q*w(i); } return (bidNot+askNot>0) ? (bidNot-askNot)/(bidNot+askNot) : 0; };
           const vwapFillLevels=(levels,targetUSD)=>{ let remain=targetUSD,val=0,qty=0; for(const [ps,qs] of levels){ const p=+ps, q=+qs; if(!(p>0&&q>0)) continue; const can=p*q, take=Math.min(remain,can), tq=take/p; val+=p*tq; qty+=tq; remain-=take; if(remain<=1e-6) break; } return { px: qty>0? val/qty : null, filledUSD: (targetUSD-remain) }; };
@@ -374,8 +425,21 @@ jobs:
             }catch(e){ log("loadState warn", e?.message||e); return { state:init, persist:null }; }
           }
           
-          function mergeStates(remote, local){
+          function mergeStates(remote, local) {
             const merged = { ...remote };
+
+            // Honor Pusher-requested drops so remote.pending doesn't reintroduce them
+            const dropSet = new Set((local.__drop_pending_cids || []).map(x => String(x).trim()).filter(Boolean));
+            const id = (p) => String(p?.client_order_id || p?.clientOrderId || p?.idea_id || "").trim();
+
+            // Pending: remote truth minus drops, plus any truly new local
+            const remotePending = (remote.pending || []).filter(p => !dropSet.has(id(p)));
+            const remoteIds = new Set(remotePending.map(id));
+            const newLocalPending = (local.pending || []).filter(p => {
+              const k = id(p);
+              return k && !remoteIds.has(k);
+            });
+            merged.pending = [...remotePending, ...newLocalPending];
 
             // Worker-owned: keep remote as truth
             merged.equity = Array.isArray(remote.equity) ? remote.equity : [];
@@ -405,19 +469,10 @@ jobs:
               return { ...rc, learned, learned_at_ts };
             });
 
-            // Pending: append only truly-new local plans (dedup by client_order_id or idea_id)
-            const id = (p) => (p?.client_order_id || p?.clientOrderId || p?.idea_id || "");
-            const remoteIds = new Set((remote.pending || []).map(id));
-            const newLocalPending = (local.pending || []).filter(p => {
-              const k = id(p);
-              return k && !remoteIds.has(k);
-            });
-            merged.pending = [...(remote.pending || []), ...newLocalPending];
-
             merged.version_ts = Date.now();
 
-            console.log("[gha] mergeStates: appended_new_pending", newLocalPending.length,
-                        "remote_pending", (remote.pending||[]).length,
+            log("[gha] mergeStates: remote_pending_after_drops", remotePending.length,
+                        "appended_new_local", newLocalPending.length,
                         "merged_pending", merged.pending.length);
 
             return merged;
@@ -670,6 +725,14 @@ jobs:
             // Heartbeat existing pending
             const heartbeat = await heartbeatCheck(state);
             if((heartbeat?.zombies||0)>0) log("heartbeat zombies", heartbeat.zombies, (heartbeat.details||[]).slice(0,5));
+
+            // Strict pre-clean of orphan pendings
+            const cleaned = await cleanupPendingBeforePlanning(state, heartbeat);
+            if (cleaned.dropped > 0) {
+              const auditOut = buildAuditOutputs(state);
+              await saveState(persist, state, auditOut, 2, true);
+              log("cleanup saved to Gist before planning.");
+            }
 
             const ALL24 = await fetchAll24hr();
             const booksRaw=await getJSON(api("/api/v3/ticker/bookTicker"),10000,2) || [];
