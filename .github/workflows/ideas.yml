@@ -969,8 +969,8 @@ jobs:
             const wEv=softmax(selected.map(x=>x.exp_lcb_bps),20);
 
             // Build full v2 ideas (all code2 semantics kept)
-            let picksV2 = selected.map((x,i)=>{
-              const bk = bookMap.get(x.symbol) || (DATA_SOURCE==="binance_futures"?await getBinanceBookTickerCached(x.symbol):null);
+            let picksV2 = await Promise.all(selected.map(async (x,i)=>{
+              const bk = bookMap.get(x.symbol) || (DATA_SOURCE==="binance_futures" ? await getBinanceBookTickerCached(x.symbol) : null);
               const mid = (bk?.bid && bk?.ask) ? ((+bk.bid + +bk.ask)/2) : null;
 
               // compute abs exits (also needed for v1 compat)
@@ -1052,7 +1052,7 @@ jobs:
                 // keep for state/debug parity
                 trend5m: x.trend5m
               };
-            });
+            }));
 
             // Convert v2 ideas to a v1‑compatible shape for the current Worker
             const toV1Compat = (pv2) => ({
