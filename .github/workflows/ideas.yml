@@ -45,7 +45,6 @@ jobs:
       ACTIVE_UTC_END: ${{ vars.ACTIVE_UTC_END }}
       MEXC_BASE: ${{ vars.MEXC_BASE }}
       FORCE_SIZE_BPS: ${{ vars.FORCE_SIZE_BPS }}
-      DATA_SOURCE: ${{ vars.DATA_SOURCE }}
 
       # New Confidence Model Knobs
       DIRECTION: ${{ vars.DIRECTION }}
@@ -193,9 +192,8 @@ jobs:
           const MARKET_TYPE     = "futures";
           const MARGIN_MODE     = "isolated";
           const LEVERAGE        = 1;
-          const DATA_SOURCE=(process.env.DATA_SOURCE||"mexc").toLowerCase().trim();
-          if(!["mexc","binance_futures"].includes(DATA_SOURCE)){ log("DATA_SOURCE must be 'mexc' or 'binance_futures'"); process.exit(1); }
-          const EXCHANGE="mexc";
+          const EXCHANGE=(process.env.EXCHANGE||"mexc").toLowerCase().replace("mexci","mexc");
+          if(EXCHANGE!=="mexc"){ log("This build targets MEXC. Set EXCHANGE=mexc"); process.exit(1); }
           const MEXC_API_KEY = process.env.MEXC_API_KEY || "";
           const MEXC_SECRET_KEY = process.env.MEXC_SECRET_KEY || "";
           const MEXC_BASES=[process.env.MEXC_BASE,"https://api.mexc.com","https://www.mexc.com"].filter(Boolean);
@@ -256,39 +254,6 @@ jobs:
           // ---------- MEXC Adapter ----------
           async function pickMexcBase(){ for(const b of MEXC_BASES){ try{ const r=await fetchWithTimeout(`${b}/api/v3/time`,{},4000); if(r?.ok) return b; }catch{} } throw new Error("No healthy MEXC base"); }
           const BASE=await pickMexcBase();
-
-          // ===== BINANCE FUTURES API =====
-          async function fetchBinance24hr(){
-            const url="https://fapi.binance.com/fapi/v1/ticker/24hr";
-            const data=await getJSON(url,10000,2);
-            if(!Array.isArray(data)) return [];
-            return data.map(t=>({
-              symbol:t.symbol,
-              s:t.symbol,
-              quoteVolume:+t.quoteVolume||0,
-              q:+t.quoteVolume||0
-            }));
-          }
-          async function fetchBinanceKlines(sym,interval,limit){
-            const url=`https://fapi.binance.com/fapi/v1/klines?symbol=${sym}&interval=${interval}&limit=${limit}`;
-            return await getJSON(url,10000,2);
-          }
-          async function fetchBinanceDepth(sym,limit=50){
-            const url=`https://fapi.binance.com/fapi/v1/depth?symbol=${sym}&limit=${limit}`;
-            const d=await getJSON(url,10000,2);
-            if(!d) return null;
-            return {bids:d.bids||[],asks:d.asks||[]};
-          }
-          async function fetchBinanceBookTicker(sym){
-            const url=`https://fapi.binance.com/fapi/v1/ticker/bookTicker?symbol=${sym}`;
-            const b=await getJSON(url,8000,1);
-            if(!b) return null;
-            return { symbol: b.symbol, bid: +b.bidPrice, ask: +b.askPrice, bidQty: +b.bidQty, askQty: +b.askQty };
-          }
-          async function getBinanceKCached(symbol,interval,limit){ const key=`BF|${symbol}|${interval}|${limit}`; const c=getCached(cache.k,key,TTL.k); if(c) return c; const v=await fetchBinanceKlines(symbol,interval,limit); if(v) setCached(cache.k,key,v); return v; }
-          async function getBinanceDepthCached(symbol){ const key=`BF|${symbol}`; const c=getCached(cache.depth,key,TTL.depth); if(c) return c; const v=await fetchBinanceDepth(symbol); if(v) setCached(cache.depth,key,v); return v; }
-          async function getBinanceBookTickerCached(symbol){ const key=`BF|${symbol}`; const c=getCached(cache.bt,key,TTL.bt); if(c) return c; const v=await fetchBinanceBookTicker(symbol); if(v) setCached(cache.bt,key,v); return v; }
-
           const api=(path,params={})=>{ const u=new URL(path,BASE); for(const [k,v] of Object.entries(params)){ if(v!==undefined&&v!==null) u.searchParams.set(k,String(v)); } return u.toString(); };
           async function mexcSignedRequest(path, params = {}, method = 'GET') {
               if (!MEXC_API_KEY || !MEXC_SECRET_KEY) return null;
@@ -322,7 +287,7 @@ jobs:
           async function getKCached(symbol,interval,limit,startTime,endTime){ const key=[symbol,interval,limit,startTime||"",endTime||""].join("|"); const c=getCached(cache.k,key,TTL.k); if(c) return c; const v=await fetchK(symbol,interval,limit,startTime,endTime); if(v) setCached(cache.k,key,v); return v; }
           async function getDepthCached(symbol){ const c=getCached(cache.depth,symbol,TTL.depth); if(c) return c; const v=await fetchDepth(symbol); if(v) setCached(cache.depth,symbol,v); return v; }
           async function getBookTickerCached(symbol){ const c=getCached(cache.bt,symbol,TTL.bt); if(c) return c; const v=await fetchBookTicker(symbol); if(v) setCached(cache.bt,symbol,v); return v; }
-          async function getKMultiTF(symbol){ const pairs=[["1m",300],["3m",300],["5m",K5M],["15m",K15M],["30m",300],["1h",K1H],["2h",200],["4h",K4H],["12h",120],["1d",90]]; const out={}; for(const [tf,lim] of pairs){ out[tf]=DATA_SOURCE==="binance_futures"?await getBinanceKCached(symbol,tf,lim):await getKCached(symbol,tf,lim); } return out; }
+          async function getKMultiTF(symbol){ const pairs=[["1m",300],["3m",300],["5m",K5M],["15m",K15M],["30m",300],["1h",K1H],["2h",200],["4h",K4H],["12h",120],["1d",90]]; const out={}; for(const [tf,lim] of pairs){ out[tf]=await getKCached(symbol, tf, lim); } return out; }
           const tfInd=(k)=>{ if(!k?.length) return null; const h=k.map(x=>+x[2]), l=k.map(x=>+x[3]), c=k.map(x=>+x[4]); const adxatr=computeADX_ATR(h,l,c,14)||{adx:0,atr:0}; const up=c.at(-1)>=ema(c,21)&&c.at(-1)>=ema(c,50); return {adx:adxatr.adx||0,atr:adxatr.atr||0,up}; };
 
           // ---------- Conversion rate helper for commissions ----------
@@ -706,15 +671,15 @@ jobs:
             const heartbeat = await heartbeatCheck(state);
             if((heartbeat?.zombies||0)>0) log("heartbeat zombies", heartbeat.zombies, (heartbeat.details||[]).slice(0,5));
 
-            const ALL24 = DATA_SOURCE==="binance_futures" ? await fetchBinance24hr() : await fetchAll24hr();
-            const booksRaw=DATA_SOURCE==="binance_futures" ? [] : (await getJSON(api("/api/v3/ticker/bookTicker"),10000,2) || []);
+            const ALL24 = await fetchAll24hr();
+            const booksRaw=await getJSON(api("/api/v3/ticker/bookTicker"),10000,2) || [];
             const bookMap=new Map(booksRaw.map(b=>[b.symbol,{ bid:+b.bidPrice, ask:+b.askPrice }]));
             if(!todOK) reason="tod_gate";
 
             // BTC regimes
             const BTC="BTCUSDT", ETH="ETHUSDT", SOL="SOLUSDT";
-            const kBTC1H=DATA_SOURCE==="binance_futures" ? await getBinanceKCached(BTC,"1h",K1H) : await getKCached(BTC,"1h",K1H);
-            const kBTC5=DATA_SOURCE==="binance_futures" ? await getBinanceKCached(BTC,"5m",K5M) : await getKCached(BTC,"5m",K5M);
+            const kBTC1H=await getKCached(BTC,"1h",K1H);
+            const kBTC5=await getKCached(BTC,"5m",K5M);
             const btcUp1h = (() => {
               if (!kBTC1H?.length) return false;
               const c = kBTC1H.map(x => +x[4]);
@@ -745,11 +710,11 @@ jobs:
             for(let i=0;i<(universe||[]).length;i+=B){
               const batch=await Promise.all(universe.slice(i,i+B).map(async c=>{ try{
                 const lastTs=state.cooldown?.[c.base]||0; if(lastTs && (Date.now()-lastTs)<COOLDOWN_MS) return null;
-                const book=bookMap.get(c.symbol) || (DATA_SOURCE==="binance_futures" ? await getBinanceBookTickerCached(c.symbol) : await getBookTickerCached(c.symbol)); if(!book?.bid||!book?.ask) return null;
+                const book=bookMap.get(c.symbol) || await getBookTickerCached(c.symbol); if(!book?.bid||!book?.ask) return null;
                 const mid=(+book.bid + +book.ask)/2; if(!(mid>0)) return null;
                 const spreadBps=Math.round(((book.ask-book.bid)/mid)*10000); // soft gate: keep, penalize in confidence
 
-                const k5=DATA_SOURCE==="binance_futures" ? await getBinanceKCached(c.symbol,"5m",K5M) : await getKCached(c.symbol,"5m",K5M); if(!k5||k5.length<Math.max(EMA_SLOW+5,ATR_P+5)) return null;
+                const k5=await getKCached(c.symbol,"5m",K5M); if(!k5||k5.length<Math.max(EMA_SLOW+5,ATR_P+5)) return null;
                 const c5_raw=k5.map(x=>+x[4]);
                 const c5=kalman1D(c5_raw,{q:1e-4,r:5e-4});
                 const h5=k5.map(x=>+x[2]), l5=k5.map(x=>+x[3]), v5=k5.map(x=>+x[5]);
@@ -803,10 +768,10 @@ jobs:
             for(let idx=0; idx<prelim.length; idx++){
               try{
                 const p=prelim[idx], c=p.c;
-                const book=bookMap.get(c.symbol)||(DATA_SOURCE==="binance_futures"?await getBinanceBookTickerCached(c.symbol):await getBookTickerCached(c.symbol)); if(!book?.bid||!book?.ask) continue;
+                const book=bookMap.get(c.symbol)||await getBookTickerCached(c.symbol); if(!book?.bid||!book?.ask) continue;
                 const mid=(+book.bid + +book.ask)/2; if(!(mid>0)) continue;
 
-                const depthA=DATA_SOURCE==="binance_futures"?await getBinanceDepthCached(c.symbol):await getDepthCached(c.symbol); await sleep(180+Math.floor(Math.random()*120)); const depthB=DATA_SOURCE==="binance_futures"?await fetchBinanceDepth(c.symbol):await fetchDepth(c.symbol);
+                const depthA=await getDepthCached(c.symbol); await sleep(180+Math.floor(Math.random()*120)); const depthB=await fetchDepth(c.symbol);
                 const depth=depthB||depthA; if(!depth?.bids?.length || !depth?.asks?.length) continue;
                 const obi=computeOBI(depth,OBI_TOPN);
                 const ofi30s=ofiProxy(depthA,depthB);
@@ -969,8 +934,8 @@ jobs:
             const wEv=softmax(selected.map(x=>x.exp_lcb_bps),20);
 
             // Build full v2 ideas (all code2 semantics kept)
-            let picksV2 = await Promise.all(selected.map(async (x,i)=>{
-              const bk = bookMap.get(x.symbol) || (DATA_SOURCE==="binance_futures" ? await getBinanceBookTickerCached(x.symbol) : null);
+            let picksV2 = selected.map((x,i)=>{
+              const bk = bookMap.get(x.symbol);
               const mid = (bk?.bid && bk?.ask) ? ((+bk.bid + +bk.ask)/2) : null;
 
               // compute abs exits (also needed for v1 compat)
@@ -1052,7 +1017,7 @@ jobs:
                 // keep for state/debug parity
                 trend5m: x.trend5m
               };
-            }));
+            });
 
             // Convert v2 ideas to a v1‑compatible shape for the current Worker
             const toV1Compat = (pv2) => ({
@@ -1193,7 +1158,7 @@ jobs:
             const meta = {
               origin:"github_actions",
               reason,
-              exchange:"mexc", exchange_base: BASE, data_source: DATA_SOURCE,
+              exchange:"mexc", exchange_base: BASE,
               strategy: STRATEGY_NAME, model_version: MODEL_VERSION, schema_version: SCHEMA_VERSION,
               git_sha: GIT_SHA, config_hash: CONFIG_HASH,
               counts:{universe:universe.length,refined:refined.length,selected:picks.length},
