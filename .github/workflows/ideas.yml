@@ -588,24 +588,35 @@ jobs:
             }
           }
           
+          const regFromKey = (k) => k?.includes("regime:trend") ? "trend" : k?.includes("regime:meanrevert") ? "meanrevert" : null;
           function learnFromGistRealFills(state){
             const learnable = (state.closed || []).filter(c =>
               c.reconciliation === "exchange_trade_history" &&
               !c.learned &&
-              c.p_raw != null &&
-              c.regime
+              c.p_raw != null
             );
+            let learnedCount = 0;
             for (const c of learnable) {
+              const reg = c.regime || regFromKey(c.calib_key);
+              if (!reg || !c.side) continue;
+
               const outcome = (c.pnl_bps || 0) > 0 ? 1 : 0;
-              try { updateCalibration(state, c.side, c.regime, c.p_raw, outcome); }
+              try { updateCalibration(state, c.side, reg, c.p_raw, outcome); }
               catch(e){ log("learnFromGistRealFills warn", e?.message||e); }
               c.learned = true;
               c.learned_at_ts = Date.now();
+              learnedCount++;
             }
-            if (learnable.length) log(`learnFromGistRealFills: updated from ${learnable.length} real fills.`);
+            if (learnedCount > 0) log(`learnFromGistRealFills: updated from ${learnedCount} real fills.`);
           }
 
-          const getCoeffs=(state, side, regime)=>{ const key=`${side}_${regime}`; if(!state.calibCoeffs) state.calibCoeffs={}; if(!state.calibCoeffs[key]) state.calibCoeffs[key]={a:0,b:1,n:0,l2:1e-4}; return state.calibCoeffs[key]; }
+          const getCoeffs = (state, side, regime) => {
+            const key = `${side}_${regime}`;
+            if (!state.calibCoeffs) state.calibCoeffs = {};
+            const def = { a: 0, b: 1, n: 0, l2: 1e-4 };
+            state.calibCoeffs[key] = { ...def, ...(state.calibCoeffs[key] || {}) };
+            return state.calibCoeffs[key];
+          };
           function updateCalibration(state, side, regime, pRaw, outcome){
             if(pRaw==null || !isFinite(pRaw)) return;
             const coeff = getCoeffs(state, side, regime);
@@ -883,8 +894,8 @@ jobs:
                 const regime=p.mrLocked?"trend":"meanrevert";
                 const coeffL = getCoeffs(state, "long", regime);
                 const coeffS = getCoeffs(state, "short", regime);
-                const nL = Math.max(10, Math.min(500, coeffL.n||0));
-                const nS = Math.max(10, Math.min(500, coeffS.n||0));
+                const nL = Math.max(1, Math.min(500, coeffL.n || 0));
+                const nS = Math.max(1, Math.min(500, coeffS.n || 0));
                 const pLong=calibrateP(state,"long",regime,p.pLong0);
                 const pShort=calibrateP(state,"short",regime,p.pShort0);
                 const pLong_lcb=wilsonLCB(pLong, nL, WILSON_Z);
