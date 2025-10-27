@@ -1011,12 +1011,13 @@ jobs:
                     let sl=Math.round(sl_multiplier * p.atr_bps);
                     sl = Math.min(sl, MAX_SL_BPS);
                     tp = Math.max(tp, Math.round(sl * 1.5));
-                  const sim=pathEVHeavy({entry:mid,tp_bps:tp,sl_bps:sl,side:"long",retSeries:yR,mu:mu5,sigma:sig5,steps:4,N:192,cost_bps:costLong});
-                  const evLCB=Math.round(pLong_lcb*tp-(1-pLong_lcb)*sl-costLong);
-                  const edgeL = tp/Math.max(1, LONG_EDGE_MULT_MIN*costLong);
-                  const evScoreL = evLCB/Math.max(8, EXP_LCB_MIN_BPS_BASE);
-                  const viabMultL = clamp(0.5*clamp(edgeL,0.3,1.4)+0.5*clamp(evScoreL,0.3,1.4), 0.3, 1.3);
-                  candLong={ side:"long", p_lcb:pLong_lcb,p_raw:p.pLong0, ev_bps:sim.ev_bps, exp_lcb_bps:evLCB, tp_bps:tp, sl_bps:sl, cost_bps:costLong, style:"mr", regime, viab_mult:viabMultL };
+                    
+                    const sim=pathEVHeavy({entry:mid,tp_bps:tp,sl_bps:sl,side:"long",retSeries:yR,mu:mu5,sigma:sig5,steps:4,N:192,cost_bps:costLong});
+                    const evLCB=Math.round(pLong_lcb*tp-(1-pLong_lcb)*sl-costLong);
+                    const edgeL = tp/Math.max(1, LONG_EDGE_MULT_MIN*costLong);
+                    const evScoreL = evLCB/Math.max(8, EXP_LCB_MIN_BPS_BASE);
+                    const viabMultL = clamp(0.5*clamp(edgeL,0.3,1.4)+0.5*clamp(evScoreL,0.3,1.4), 0.3, 1.3);
+                    candLong={ side:"long", p_lcb:pLong_lcb,p_raw:p.pLong0, ev_bps:sim.ev_bps, exp_lcb_bps:evLCB, tp_bps:tp, sl_bps:sl, cost_bps:costLong, style:"mr", regime, viab_mult:viabMultL };
                 }
                 if(DIRECTION!=="long"){
                   // Dynamic TP/SL based on market conditions (same as long)
@@ -1153,13 +1154,13 @@ jobs:
               let entry_limit = null, tp_abs = null, sl_abs = null;
               if (mid != null) {
                 const slF = x.sl_bps/10000, tpF = x.tp_bps/10000;
-                const entry_offset = Math.min(0.5, volatilityPercentile * 0.6);
+                const entry_offset_mult = Math.min(0.5, volatilityPercentile * 0.6); // Adaptive
                 if (x.side === "long") {
-                  entry_limit = mid * (1 - Math.max(0.001, slF*entry_offset));
+                  entry_limit = mid * (1 - Math.max(0.001, slF * entry_offset_mult));
                   tp_abs = entry_limit * (1 + tpF);
                   sl_abs = entry_limit * (1 - slF);
                 } else {
-                  entry_limit = mid * (1 + Math.max(0.001, slF*entry_offset));
+                  entry_limit = mid * (1 + Math.max(0.001, slF * entry_offset_mult));
                   tp_abs = entry_limit * (1 - tpF);
                   sl_abs = entry_limit * (1 + slF);
                 }
