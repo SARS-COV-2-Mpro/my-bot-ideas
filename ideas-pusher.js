@@ -262,7 +262,7 @@ jobs:
           const MAX_LEARNING_RATE = 0.08;
           const MOMENTUM_RATE = 0.9;
           const LEARNING_DECAY = 0.001;
-          const CALIBRATION_RESET_THRESHOLD = 0.45;
+          const CALIBRATION_RESET_THRESHOLD = 0.49;
           const COEFF_BOUND_A = 2.5;
           const COEFF_BOUND_B = 3.5;
           const CALIB_MIN_SAMPLES = 10;
@@ -612,19 +612,37 @@ jobs:
               !c.learned &&
               c.p_raw != null
             );
+            
+            if (learnable.length === 0) {
+              log("📚 No new fills to learn from this cycle.");
+              return;
+            }
+
+            log(`📚 Learning from ${learnable.length} real fills...`);
+            
             let learnedCount = 0;
             for (const c of learnable) {
               const reg = c.regime || regFromKey(c.calib_key);
               if (!reg || !c.side) continue;
 
               const outcome = (c.pnl_bps || 0) > 0 ? 1 : 0;
-              try { updateCalibration(state, c.side, reg, c.p_raw, outcome); }
-              catch(e){ log("learnFromGistRealFills warn", e?.message||e); }
+              const result = outcome ? "WIN" : "LOSS";
+              
+              log(`📊 Trade: ${c.symbolFull || c.symbol} ${c.side} ${result} pnl=${c.pnl_bps}bps p_raw=${c.p_raw?.toFixed(3)}`);
+              
+              try { 
+                updateCalibration(state, c.side, reg, c.p_raw, outcome); 
+              }
+              catch(e){ 
+                log("⚠️  learnFromGistRealFills error:", e?.message||e); 
+              }
+              
               c.learned = true;
               c.learned_at_ts = Date.now();
               learnedCount++;
             }
-            if (learnedCount > 0) log(`learnFromGistRealFills: updated from ${learnedCount} real fills.`);
+            
+            log(`✅ Learning complete: ${learnedCount} fills processed.`);
           }
 
           const getCoeffs = (state, side, regime) => {
@@ -672,6 +690,11 @@ jobs:
 
             const coeff = getCoeffs(state, side, regime);
 
+            // Store before state
+            const before_a = coeff.a;
+            const before_b = coeff.b;
+            const before_n = coeff.n;
+
             // 1. Adaptive learning rate
             const lr = ADAPTIVE_LEARNING
               ? Math.max(
@@ -694,7 +717,7 @@ jobs:
             coeff.momentum_b = MOMENTUM_RATE * coeff.momentum_b + lr * err * x;
 
             // 5. Clamp momentum to prevent explosion
-            const MOMENTUM_CLAMP = 0.5;
+            const MOMENTUM_CLAMP = 0.2;
             coeff.momentum_a = clamp(coeff.momentum_a, -MOMENTUM_CLAMP, MOMENTUM_CLAMP);
             coeff.momentum_b = clamp(coeff.momentum_b, -MOMENTUM_CLAMP, MOMENTUM_CLAMP);
 
@@ -707,8 +730,10 @@ jobs:
             coeff.b = clamp(b_next, -COEFF_BOUND_B, COEFF_BOUND_B);
 
             // 8. Reset momentum if bounds were hit
-            if (a_next !== coeff.a) coeff.momentum_a = 0;
-            if (b_next !== coeff.b) coeff.momentum_b = 0;
+            const hit_bound_a = (a_next !== coeff.a);
+            const hit_bound_b = (b_next !== coeff.b);
+            if (hit_bound_a) coeff.momentum_a = 0;
+            if (hit_bound_b) coeff.momentum_b = 0;
 
             // 9. Track recent errors for validation
             if (!coeff.recent_errors) coeff.recent_errors = [];
@@ -719,19 +744,30 @@ jobs:
 
             // 10. Auto-reset if performing worse than random
             const avg_error = mean(coeff.recent_errors);
-            if (avg_error > CALIBRATION_RESET_THRESHOLD && coeff.n > CALIB_MIN_RESET_N) {
-              log(
-                `Resetting calibration for ${side}_${regime} due to high error: ${avg_error.toFixed(3)}`
-              );
+            const will_reset = (avg_error > CALIBRATION_RESET_THRESHOLD && coeff.n > CALIB_MIN_RESET_N);
+
+            // ========== VERBOSE LOGGING ==========
+            log(`📚 LEARN [${side}_${regime}] n=${before_n}→${before_n+1} lr=${lr.toFixed(4)}`);
+            log(`   Input: p_raw=${pRaw.toFixed(3)} outcome=${outcome} | Predicted: p_hat=${pHat.toFixed(3)} error=${err.toFixed(3)}`);
+            log(`   Coeffs: a=${before_a.toFixed(4)}→${coeff.a.toFixed(4)} b=${before_b.toFixed(4)}→${coeff.b.toFixed(4)}`);
+            if (hit_bound_a || hit_bound_b) {
+              log(`   ⚠️  Hit bounds! a=${hit_bound_a} b=${hit_bound_b} (momentum reset)`);
+            }
+            log(`   Momentum: a=${coeff.momentum_a.toFixed(4)} b=${coeff.momentum_b.toFixed(4)}`);
+            log(`   Avg_error=${avg_error.toFixed(3)} (window=${coeff.recent_errors.length})`);
+
+            if (will_reset) {
+              log(`   🔄 AUTO-RESET triggered! avg_error=${avg_error.toFixed(3)} > threshold=${CALIBRATION_RESET_THRESHOLD}`);
               coeff.a = 0;
               coeff.b = 1;
               coeff.momentum_a = 0;
               coeff.momentum_b = 0;
               coeff.recent_errors = [];
               coeff.n = 0; // restart learning
+            } else {
+              coeff.n++;
             }
 
-            coeff.n++;
             state.calibCoeffs[`${side}_${regime}`] = coeff;
           }
           const calibrateP=(state, side, regime, pRaw)=>{
