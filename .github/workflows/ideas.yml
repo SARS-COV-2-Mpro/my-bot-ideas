@@ -267,7 +267,7 @@ jobs:
           const LEARNING_DECAY = Number(process.env.LEARNING_DECAY || "0.001");
           const MOMENTUM_RATE = Number(process.env.MOMENTUM_RATE || "0.9");
           const VOLATILITY_ADAPTIVE_SL = (process.env.VOLATILITY_ADAPTIVE_SL || "true").toLowerCase() === "true";
-          const CALIBRATION_RESET_THRESHOLD = Number(process.env.CALIBRATION_RESET_THRESHOLD || "0.7");
+          const CALIBRATION_RESET_THRESHOLD = Number(process.env.CALIBRATION_RESET_THRESHOLD || "0.45");
           const COEFF_BOUND_A = Number(process.env.COEFF_BOUND_A || "2");
           const COEFF_BOUND_B = Number(process.env.COEFF_BOUND_B || "3");
           const MIN_LEARNING_RATE = Number(process.env.MIN_LEARNING_RATE || "0.001");
@@ -626,17 +626,22 @@ jobs:
           
           function learnFromGistRealFills(state){
             const learnable = (state.closed || []).filter(c =>
-              c.reconciliation === "exchange_trade_history" &&
-              !c.learned &&
-              c.p_raw != null &&
-              c.regime
+                c.reconciliation === "exchange_trade_history" &&
+                !c.learned &&
+                c.regime
             );
             for (const c of learnable) {
-              const outcome = (c.pnl_bps || 0) > 0 ? 1 : 0;
-              try { updateCalibration(state, c.side, c.regime, c.p_raw, outcome); }
-              catch(e){ log("learnFromGistRealFills warn", e?.message||e); }
-              c.learned = true;
-              c.learned_at_ts = Date.now();
+                if (c.p_raw == null || c.p_raw < 0 || c.p_raw > 1) { // Validate p_raw before learning
+                    log(`learnFromGistRealFills: skipping invalid p_raw=${c.p_raw} for ${c.idea_id || '(no id)'}`);
+                    c.learned = true; // Mark as processed to avoid re-checking
+                    c.learned_at_ts = Date.now();
+                    continue;
+                }
+                const outcome = (c.pnl_bps || 0) > 0 ? 1 : 0;
+                try { updateCalibration(state, c.side, c.regime, c.p_raw, outcome); }
+                catch(e){ log("learnFromGistRealFills warn", e?.message||e); }
+                c.learned = true;
+                c.learned_at_ts = Date.now();
             }
             if (learnable.length) log(`learnFromGistRealFills: updated from ${learnable.length} real fills.`);
           }
@@ -649,8 +654,8 @@ jobs:
                   
                   const avg_error = mean(coeff.recent_errors || []);
                   const is_healthy = avg_error < 0.4 && 
-                                    Math.abs(coeff.a) < 1.5 && 
-                                    Math.abs(coeff.b) < 2.5;
+                                     Math.abs(coeff.a) < COEFF_BOUND_A * 0.75 &&
+                                     Math.abs(coeff.b) < COEFF_BOUND_B * 0.83;
                   
                   report[key] = {
                       n: coeff.n,
@@ -659,12 +664,6 @@ jobs:
                       avg_error: avg_error.toFixed(3),
                       status: is_healthy ? "healthy" : "degraded"
                   };
-                  
-                  // Auto-reset badly performing models
-                  if(!is_healthy && coeff.n > 50) {
-                      log(`Auto-resetting ${key} calibration due to poor performance`);
-                      state.calibCoeffs[key] = {a:0, b:1, n:0, momentum_a:0, momentum_b:0, recent_errors:[]};
-                  }
               }
               
               log("Calibration health:", JSON.stringify(report));
@@ -676,26 +675,37 @@ jobs:
               if(pRaw==null) return;
               const coeff=getCoeffs(state,side,regime);
               
-              // Use configuration constants
-              const lr = ADAPTIVE_LEARNING 
-                  ? Math.max(MIN_LEARNING_RATE, MAX_LEARNING_RATE / Math.sqrt(1 + coeff.n/10))
-                  : 0.05; // fallback to old fixed rate if disabled
+              const lr = ADAPTIVE_LEARNING
+                  ? Math.max(MIN_LEARNING_RATE, MIN_LEARNING_RATE + (MAX_LEARNING_RATE - MIN_LEARNING_RATE) / Math.sqrt(1 + coeff.n/10))
+                  : 0.05;
               
-              if(!coeff.momentum_a) coeff.momentum_a = 0;
-              if(!coeff.momentum_b) coeff.momentum_b = 0;
+              if(coeff.momentum_a === undefined) coeff.momentum_a = 0;
+              if(coeff.momentum_b === undefined) coeff.momentum_b = 0;
               
               const z=coeff.a+coeff.b*pRaw;
               const pHat=sigmoid(z);
               const err=outcome-pHat;
               
-              coeff.momentum_a = MOMENTUM_RATE*coeff.momentum_a + lr*err;
-              coeff.momentum_b = MOMENTUM_RATE*coeff.momentum_b + lr*err*pRaw;
+              // 1. Correctly update momentum
+              coeff.momentum_a = MOMENTUM_RATE * coeff.momentum_a + lr * err;
+              coeff.momentum_b = MOMENTUM_RATE * coeff.momentum_b + lr * err * pRaw;
+
+              // 2. Add momentum clamping
+              const MOMENTUM_CLAMP = 0.5;
+              coeff.momentum_a = clamp(coeff.momentum_a, -MOMENTUM_CLAMP, MOMENTUM_CLAMP);
+              coeff.momentum_b = clamp(coeff.momentum_b, -MOMENTUM_CLAMP, MOMENTUM_CLAMP);
+
+              // 3. Apply momentum and weight decay to coefficients
+              const a_next = (1 - LEARNING_DECAY) * coeff.a + coeff.momentum_a;
+              const b_next = (1 - LEARNING_DECAY) * coeff.b + coeff.momentum_b;
               
-              coeff.a += coeff.momentum_a - LEARNING_DECAY*coeff.a;
-              coeff.b += coeff.momentum_b - LEARNING_DECAY*coeff.b;
-              
-              coeff.a = clamp(coeff.a, -COEFF_BOUND_A, COEFF_BOUND_A);
-              coeff.b = clamp(coeff.b, -COEFF_BOUND_B, COEFF_BOUND_B);
+              // 4. Clamp the updated coefficients
+              coeff.a = clamp(a_next, -COEFF_BOUND_A, COEFF_BOUND_A);
+              coeff.b = clamp(b_next, -COEFF_BOUND_B, COEFF_BOUND_B);
+
+              // 5. Reset momentum if bounds were hit during clamping
+              if (a_next !== coeff.a) coeff.momentum_a = 0;
+              if (b_next !== coeff.b) coeff.momentum_b = 0;
               
               if(!coeff.recent_errors) coeff.recent_errors = [];
               coeff.recent_errors.push(Math.abs(err));
@@ -1011,13 +1021,12 @@ jobs:
                     let sl=Math.round(sl_multiplier * p.atr_bps);
                     sl = Math.min(sl, MAX_SL_BPS);
                     tp = Math.max(tp, Math.round(sl * 1.5));
-                    
-                    const sim=pathEVHeavy({entry:mid,tp_bps:tp,sl_bps:sl,side:"long",retSeries:yR,mu:mu5,sigma:sig5,steps:4,N:192,cost_bps:costLong});
-                    const evLCB=Math.round(pLong_lcb*tp-(1-pLong_lcb)*sl-costLong);
-                    const edgeL = tp/Math.max(1, LONG_EDGE_MULT_MIN*costLong);
-                    const evScoreL = evLCB/Math.max(8, EXP_LCB_MIN_BPS_BASE);
-                    const viabMultL = clamp(0.5*clamp(edgeL,0.3,1.4)+0.5*clamp(evScoreL,0.3,1.4), 0.3, 1.3);
-                    candLong={ side:"long", p_lcb:pLong_lcb,p_raw:p.pLong0, ev_bps:sim.ev_bps, exp_lcb_bps:evLCB, tp_bps:tp, sl_bps:sl, cost_bps:costLong, style:"mr", regime, viab_mult:viabMultL };
+                  const sim=pathEVHeavy({entry:mid,tp_bps:tp,sl_bps:sl,side:"long",retSeries:yR,mu:mu5,sigma:sig5,steps:4,N:192,cost_bps:costLong});
+                  const evLCB=Math.round(pLong_lcb*tp-(1-pLong_lcb)*sl-costLong);
+                  const edgeL = tp/Math.max(1, LONG_EDGE_MULT_MIN*costLong);
+                  const evScoreL = evLCB/Math.max(8, EXP_LCB_MIN_BPS_BASE);
+                  const viabMultL = clamp(0.5*clamp(edgeL,0.3,1.4)+0.5*clamp(evScoreL,0.3,1.4), 0.3, 1.3);
+                  candLong={ side:"long", p_lcb:pLong_lcb,p_raw:p.pLong0, ev_bps:sim.ev_bps, exp_lcb_bps:evLCB, tp_bps:tp, sl_bps:sl, cost_bps:costLong, style:"mr", regime, viab_mult:viabMultL };
                 }
                 if(DIRECTION!=="long"){
                   // Dynamic TP/SL based on market conditions (same as long)
@@ -1154,13 +1163,13 @@ jobs:
               let entry_limit = null, tp_abs = null, sl_abs = null;
               if (mid != null) {
                 const slF = x.sl_bps/10000, tpF = x.tp_bps/10000;
-                const entry_offset_mult = Math.min(0.5, volatilityPercentile * 0.6); // Adaptive
+                const entry_offset = Math.min(0.5, volatilityPercentile * 0.6);
                 if (x.side === "long") {
-                  entry_limit = mid * (1 - Math.max(0.001, slF * entry_offset_mult));
+                  entry_limit = mid * (1 - Math.max(0.001, slF*entry_offset));
                   tp_abs = entry_limit * (1 + tpF);
                   sl_abs = entry_limit * (1 - slF);
                 } else {
-                  entry_limit = mid * (1 + Math.max(0.001, slF * entry_offset_mult));
+                  entry_limit = mid * (1 + Math.max(0.001, slF*entry_offset));
                   tp_abs = entry_limit * (1 - tpF);
                   sl_abs = entry_limit * (1 + slF);
                 }
