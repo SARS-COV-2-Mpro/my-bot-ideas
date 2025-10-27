@@ -71,6 +71,20 @@ jobs:
       SCHEMA_VERSION: ${{ vars.SCHEMA_VERSION }}
       GIT_SHA: ${{ github.sha }}
 
+      # New Smart Learning & Calibration Defaults (optional overrides)
+      ADAPTIVE_LEARNING: ${{ vars.ADAPTIVE_LEARNING }}
+      LEARNING_DECAY: ${{ vars.LEARNING_DECAY }}
+      MOMENTUM_RATE: ${{ vars.MOMENTUM_RATE }}
+      VOLATILITY_ADAPTIVE_SL: ${{ vars.VOLATILITY_ADAPTIVE_SL }}
+      CALIBRATION_RESET_THRESHOLD: ${{ vars.CALIBRATION_RESET_THRESHOLD }}
+      COEFF_BOUND_A: ${{ vars.COEFF_BOUND_A }}
+      COEFF_BOUND_B: ${{ vars.COEFF_BOUND_B }}
+      MIN_LEARNING_RATE: ${{ vars.MIN_LEARNING_RATE }}
+      MAX_LEARNING_RATE: ${{ vars.MAX_LEARNING_RATE }}
+      KALMAN_AUTO_TUNE: ${{ vars.KALMAN_AUTO_TUNE }}
+      RISK_TOLERANCE_BASE: ${{ vars.RISK_TOLERANCE_BASE }}
+      RISK_TOLERANCE_WINNING: ${{ vars.RISK_TOLERANCE_WINNING }}
+
     steps:
       - name: Setup Node 20
         uses: actions/setup-node@v4
@@ -214,11 +228,18 @@ jobs:
           }
           
           // ---------- Microstructure / Heavy Features helpers ----------
-          const computeOBI=(depth, topN=12)=>{ if(!depth?.asks?.length || !depth?.bids?.length) return 0; const w=(i)=>Math.exp(-i*0.18); let bidNot=0, askNot=0; for(let i=0;i<Math.min(topN, depth.bids.length); i++){ const p=+depth.bids[i][0], q=+depth.bids[i][1]; if(p>0&&q>0) bidNot += p*q*w(i); } for(let i=0;i<Math.min(topN, depth.asks.length); i++){ const p=+depth.asks[i][0], q=+depth.asks[i][1]; if(p>0&&q>0) askNot += p*q*w(i); } return (bidNot+askNot>0) ? (bidNot-askNot)/(bidNot+askNot) : 0; };
+          const computeOBI=(depth, topN=12)=>{ if(!depth?.asks?.length || !depth?.bids?.length) return 0; const w=(i)=>Math.exp(-i*i/25); // Quadratic decay, emphasizes top of book
+ let bidNot=0, askNot=0; for(let i=0;i<Math.min(topN, depth.bids.length); i++){ const p=+depth.bids[i][0], q=+depth.bids[i][1]; if(p>0&&q>0) bidNot += p*q*w(i); } for(let i=0;i<Math.min(topN, depth.asks.length); i++){ const p=+depth.asks[i][0], q=+depth.asks[i][1]; if(p>0&&q>0) askNot += p*q*w(i); } return (bidNot+askNot>0) ? (bidNot-askNot)/(bidNot+askNot) : 0; };
           const vwapFillLevels=(levels,targetUSD)=>{ let remain=targetUSD,val=0,qty=0; for(const [ps,qs] of levels){ const p=+ps, q=+qs; if(!(p>0&&q>0)) continue; const can=p*q, take=Math.min(remain,can), tq=take/p; val+=p*tq; qty+=tq; remain-=take; if(remain<=1e-6) break; } return { px: qty>0? val/qty : null, filledUSD: (targetUSD-remain) }; };
           const slipFromDepth=(depth,mid,side,notionalUSD)=>{ if(!depth?.asks?.length || !depth?.bids?.length || !(mid>0)) return { slip_bps:null, fill_prob:null }; if(side==="long"){ const buy=vwapFillLevels(depth.asks, Math.max(50,notionalUSD)); const slip = buy.px? Math.max(0, Math.round((buy.px - mid)/mid*10000)) : null; const fill = Math.min(1, (buy.filledUSD||0)/Math.max(1,notionalUSD)); return { slip_bps: slip, fill_prob: +fill.toFixed(4) }; }else{ const sell=vwapFillLevels(depth.bids, Math.max(50,notionalUSD)); const slip = sell.px? Math.max(0, Math.round((mid - sell.px)/mid*10000)) : null; const fill = Math.min(1, (sell.filledUSD||0)/Math.max(1,notionalUSD)); return { slip_bps: slip, fill_prob: +fill.toFixed(4) }; } };
           const depthWithinPctUSD=(depth, mid, pct=0.01)=>{ if(!depth?.asks?.length || !depth?.bids?.length || !(mid>0)) return { bidsUSD:0, asksUSD:0 }; const askLim=mid*(1+pct), bidLim=mid*(1-pct); let asksUSD=0, bidsUSD=0; for(const [ps,qs] of depth.asks){ const p=+ps, q=+qs; if(!(p>0&&q>0)) continue; if(p<=askLim) asksUSD += p*q; else break; } for(const [ps,qs] of depth.bids){ const p=+ps, q=+qs; if(!(p>0&&q>0)) continue; if(p>=bidLim) bidsUSD += p*q; else break; } return { bidsUSD, asksUSD }; };
-          const confidenceScore=({ p_cal, ev_bps, atr_bps, micro, regime, reliability, riskAdj })=>{ const ev_norm = atr_bps>0? ev_bps/atr_bps : 0; const ev_sig = 1/(1+Math.exp(-ev_norm)); const base = 0.6*p_cal + 0.4*ev_sig; const mult = (micro||1)*(regime||1)*(reliability||1)*(riskAdj||1); return Math.round(100*base*mult); };
+          const confidenceScore=({ p_cal, ev_bps, atr_bps, micro, regime, reliability, riskAdj })=>{ 
+            // Kelly criterion-inspired weighting
+            const kelly_fraction = Math.max(0, (p_cal * (1 + ev_bps/10000) - 1) / (ev_bps/10000 || 1));
+            const base = sigmoid(2 * kelly_fraction);
+            const mult = (micro||1)*(regime||1)*(reliability||1)*(riskAdj||1); 
+            return Math.round(100*base*mult); 
+          };
           const microprice=(bid,ask,qb,qa)=>{ const d=(qb||1)+(qa||1); return (ask*qb + bid*qa)/d; };
           const ofiProxy=(d0,d1)=>{ const lev=(side,d)=>d?.[side]?.slice(0,3).map(x=>+x[1]||0)||[]; const sum=a=>a.reduce((x,y)=>x+y,0); if(!d0||!d1) return 0; return (sum(lev("bids",d1))-sum(lev("bids",d0))) - (sum(lev("asks",d1))-sum(lev("asks",d0))); };
           const bookSlope=(depth, mid)=>{ const toPts=(levels)=>{ let cum=0; const pts=[]; for(const [ps,qs] of (levels||[])){ const p=+ps,q=+qs; if(!(p>0&&q>0)) continue; cum+=p*q; const x=Math.log(Math.abs(p-mid)/mid + 1e-6), y=Math.log(cum+1); pts.push([x,y]); if(pts.length>=10) break; } return pts; }; if(!depth?.asks?.length||!depth?.bids?.length||!(mid>0)) return { slope:0, r2:0 }; const pts=toPts(depth.asks).concat(toPts(depth.bids)); if(pts.length<6) return { slope:0, r2:0 }; const xs=pts.map(p=>p[0]), ys=pts.map(p=>p[1]), mx=mean(xs), my=mean(ys); let num=0,den=0,vy=0; for(let i=0;i<xs.length;i++){ const dx=xs[i]-mx, dy=ys[i]-my; num+=dx*dy; den+=dx*dx; vy+=dy*dy; } return { slope: den>1e-9? num/den : 0, r2: den>1e-9 && vy>1e-9? (num*num)/(den*vy):0 }; };
@@ -241,6 +262,22 @@ jobs:
           // ---------- Config / ENV ----------
           const TARGET_EXCHANGE = "bybit_futures_testnet";
           const MARKET_TYPE     = "futures";
+          // ---------- Smart Learning & Calibration Defaults ----------
+          const ADAPTIVE_LEARNING = (process.env.ADAPTIVE_LEARNING || "true").toLowerCase() === "true";
+          const LEARNING_DECAY = Number(process.env.LEARNING_DECAY || "0.001");
+          const MOMENTUM_RATE = Number(process.env.MOMENTUM_RATE || "0.9");
+          const VOLATILITY_ADAPTIVE_SL = (process.env.VOLATILITY_ADAPTIVE_SL || "true").toLowerCase() === "true";
+          const CALIBRATION_RESET_THRESHOLD = Number(process.env.CALIBRATION_RESET_THRESHOLD || "0.7");
+          const COEFF_BOUND_A = Number(process.env.COEFF_BOUND_A || "2");
+          const COEFF_BOUND_B = Number(process.env.COEFF_BOUND_B || "3");
+          const MIN_LEARNING_RATE = Number(process.env.MIN_LEARNING_RATE || "0.001");
+          const MAX_LEARNING_RATE = Number(process.env.MAX_LEARNING_RATE || "0.1");
+          const KALMAN_AUTO_TUNE = (process.env.KALMAN_AUTO_TUNE || "true").toLowerCase() === "true";
+          const RISK_TOLERANCE_BASE = Number(process.env.RISK_TOLERANCE_BASE || "180");
+          const RISK_TOLERANCE_WINNING = Number(process.env.RISK_TOLERANCE_WINNING || "250");
+
+          log(`Learning Config: adaptive=${ADAPTIVE_LEARNING}, decay=${LEARNING_DECAY}, momentum=${MOMENTUM_RATE}`);
+          log(`Risk Config: vol_adaptive=${VOLATILITY_ADAPTIVE_SL}, base_risk=${RISK_TOLERANCE_BASE}`);
           const MARGIN_MODE     = "isolated";
           const LEVERAGE        = 1;
           const EXCHANGE=(process.env.EXCHANGE||"mexc").toLowerCase().replace("mexci","mexc");
@@ -604,8 +641,79 @@ jobs:
             if (learnable.length) log(`learnFromGistRealFills: updated from ${learnable.length} real fills.`);
           }
 
+          function validateCalibration(state) {
+              const report = {};
+              for(const key of Object.keys(state.calibCoeffs || {})) {
+                  const coeff = state.calibCoeffs[key];
+                  if(coeff.n < 10) continue;
+                  
+                  const avg_error = mean(coeff.recent_errors || []);
+                  const is_healthy = avg_error < 0.4 && 
+                                    Math.abs(coeff.a) < 1.5 && 
+                                    Math.abs(coeff.b) < 2.5;
+                  
+                  report[key] = {
+                      n: coeff.n,
+                      a: coeff.a.toFixed(3),
+                      b: coeff.b.toFixed(3),
+                      avg_error: avg_error.toFixed(3),
+                      status: is_healthy ? "healthy" : "degraded"
+                  };
+                  
+                  // Auto-reset badly performing models
+                  if(!is_healthy && coeff.n > 50) {
+                      log(`Auto-resetting ${key} calibration due to poor performance`);
+                      state.calibCoeffs[key] = {a:0, b:1, n:0, momentum_a:0, momentum_b:0, recent_errors:[]};
+                  }
+              }
+              
+              log("Calibration health:", JSON.stringify(report));
+              return report;
+          }
+
           const getCoeffs=(state, side, regime)=>{ const key=`${side}_${regime}`; if(!state.calibCoeffs) state.calibCoeffs={}; if(!state.calibCoeffs[key]) state.calibCoeffs[key]={a:0,b:1,n:0}; return state.calibCoeffs[key]; }
-          function updateCalibration(state, side, regime, pRaw, outcome){ if(pRaw==null) return; const coeff=getCoeffs(state,side,regime); const lr=0.05; const z=coeff.a+coeff.b*pRaw; const pHat=sigmoid(z); const err=outcome-pHat; coeff.a += lr*err; coeff.b += lr*err*pRaw; coeff.n++; state.calibCoeffs[`${side}_${regime}`]=coeff; }
+          function updateCalibration(state, side, regime, pRaw, outcome){
+              if(pRaw==null) return;
+              const coeff=getCoeffs(state,side,regime);
+              
+              // Use configuration constants
+              const lr = ADAPTIVE_LEARNING 
+                  ? Math.max(MIN_LEARNING_RATE, MAX_LEARNING_RATE / Math.sqrt(1 + coeff.n/10))
+                  : 0.05; // fallback to old fixed rate if disabled
+              
+              if(!coeff.momentum_a) coeff.momentum_a = 0;
+              if(!coeff.momentum_b) coeff.momentum_b = 0;
+              
+              const z=coeff.a+coeff.b*pRaw;
+              const pHat=sigmoid(z);
+              const err=outcome-pHat;
+              
+              coeff.momentum_a = MOMENTUM_RATE*coeff.momentum_a + lr*err;
+              coeff.momentum_b = MOMENTUM_RATE*coeff.momentum_b + lr*err*pRaw;
+              
+              coeff.a += coeff.momentum_a - LEARNING_DECAY*coeff.a;
+              coeff.b += coeff.momentum_b - LEARNING_DECAY*coeff.b;
+              
+              coeff.a = clamp(coeff.a, -COEFF_BOUND_A, COEFF_BOUND_A);
+              coeff.b = clamp(coeff.b, -COEFF_BOUND_B, COEFF_BOUND_B);
+              
+              if(!coeff.recent_errors) coeff.recent_errors = [];
+              coeff.recent_errors.push(Math.abs(err));
+              if(coeff.recent_errors.length > 20) coeff.recent_errors.shift();
+              
+              const avg_error = mean(coeff.recent_errors);
+              if(avg_error > CALIBRATION_RESET_THRESHOLD && coeff.n > 30) {
+                  log(`Resetting calibration for ${side}_${regime} due to high error: ${avg_error}`);
+                  coeff.a = 0;
+                  coeff.b = 1;
+                  coeff.momentum_a = 0;
+                  coeff.momentum_b = 0;
+                  coeff.recent_errors = [];
+              }
+              
+              coeff.n++;
+              state.calibCoeffs[`${side}_${regime}`]=coeff;
+          }
           const calibrateP=(state, side, regime, pRaw)=>{ const coeff=getCoeffs(state,side,regime); return sigmoid(coeff.a+coeff.b*pRaw); };
           const calibratorInfo=(state,side,regime)=>{ const coeff=getCoeffs(state,side,regime); return { type:"logistic", n:coeff.n, a:coeff.a, b:coeff.b }; };
           function getSymbolAdj(state, base) {
@@ -721,6 +829,7 @@ jobs:
           try{
             const { state, persist } = await loadState();
             learnFromGistRealFills(state);
+            const calibHealth = validateCalibration(state);
 
             // Heartbeat existing pending
             const heartbeat = await heartbeatCheck(state);
@@ -779,7 +888,17 @@ jobs:
 
                 const k5=await getKCached(c.symbol,"5m",K5M); if(!k5||k5.length<Math.max(EMA_SLOW+5,ATR_P+5)) return null;
                 const c5_raw=k5.map(x=>+x[4]);
-                const c5=kalman1D(c5_raw,{q:1e-4,r:5e-4});
+                // Auto-calibrate Kalman based on recent volatility
+                const recentVol = std(c5_raw.slice(-20));
+                const avgPrice = mean(c5_raw.slice(-20));
+                const noiseLevel = recentVol/avgPrice;
+
+                const c5=kalman1D(c5_raw,{
+                    q: Math.max(1e-6, Math.min(1e-3, noiseLevel*noiseLevel/100)), // Process noise
+                    r: Math.max(1e-5, Math.min(1e-2, noiseLevel*noiseLevel/10)),  // Measurement noise
+                    x0: c5_raw[0],
+                    p0: noiseLevel*noiseLevel
+                });
                 const h5=k5.map(x=>+x[2]), l5=k5.map(x=>+x[3]), v5=k5.map(x=>+x[5]);
                 const adxatr=computeADX_ATR(h5,l5,c5,ADX_P)||{};
                 const adx5=adxatr.adx||0, atr5=adxatr.atr||0;
@@ -801,10 +920,22 @@ jobs:
                 const noLongDown=NO_LONG_DOWN_ENABLE&&((rsi14||100)<LONG_DOWN_RSI_CUTOFF);
 
                 const adxF=clamp((adx5-16)/14,0,1);
-                const pTrend=clamp(0.5+0.27*(0.6*tanh(roc1/0.003)+0.4*tanh(roc3/0.0065))*adxF,0.32,0.93);
-                const pMR=clamp(0.5+0.23*(0.7*tanh(Math.abs(z_vwap))*Math.sign(-z_vwap)+0.3*(-(rsi14-50)/50))*(1-adxF),0.35,0.90);
-                const pLong0=clamp(0.45*pTrend+0.55*pMR,0.3,0.97);
-                const pShort0=clamp(0.45*(1-pTrend)+0.55*(1-pMR),0.3,0.97);
+                // Data-driven normalization based on actual market stats
+                const vol_norm = atr5/last; // Use actual volatility for normalization
+                const roc1_norm = roc1/(2*vol_norm); // Normalize by 2 standard deviations
+                const roc3_norm = roc3/(3.5*vol_norm);
+
+                // Symmetric and balanced probability
+                const momentum_signal = 0.6*tanh(roc1_norm) + 0.4*tanh(roc3_norm);
+                const mean_reversion_signal = -0.7*tanh(z_vwap/2) - 0.3*((rsi14-50)/50);
+
+                // Proper probability mixing with market regime
+                const pTrend=sigmoid(2*momentum_signal*adxF);
+                const pMR=sigmoid(2*mean_reversion_signal*(1-adxF));
+
+                // Final probabilities with symmetric bounds
+                const pLong0=clamp(0.5*pTrend+0.5*pMR, 0.25, 0.75); // More conservative range
+                const pShort0=1-pLong0; // Ensure they sum to 1
 
                 // 5m trend snapshot for provenance
                 const ema21=ema(c5,21), ema50=ema(c5,50);
@@ -863,14 +994,23 @@ jobs:
                 const yR=[]; for(let i=1;i<p.c5.length;i++) yR.push(Math.log(p.c5[i]/p.c5[i-1]));
                 const mu5=mean(yR)||0, sig5=Math.max(1e-4,std(yR));
 
-                const MAX_SL_BPS = 80;
+                // Adaptive stop loss based on volatility and market conditions
+                const recentATR = p.atr_bps;
+                const volatilityPercentile = Math.min(1, recentATR/100); // Normalize ATR
+                const MAX_SL_BPS = Math.round(40 + 60*volatilityPercentile); // 40-100 bps range
+
                 let candLong=null, candShort=null;
 
                 if(DIRECTION!=="short"){
-                  let tp=Math.round(LONG_BOUNCE_TP_ATR*p.atr_bps);
-                  let sl=Math.round(LONG_BOUNCE_SL_ATR*p.atr_bps);
-                  sl = Math.min(sl, MAX_SL_BPS);
-                  tp = Math.max(tp, Math.round(sl * 1.5));
+                    // Dynamic TP/SL based on market conditions
+                    const trend_strength = Math.abs(p.trend5m.ema_slope_bps)/Math.max(1, recentATR);
+                    const tp_multiplier = trend_strength > 0.5 ? 1.2 : 0.9; // Wider TP in trends
+                    const sl_multiplier = trend_strength > 0.5 ? 0.7 : 0.5; // Tighter SL in trends
+                    
+                    let tp=Math.round(tp_multiplier * p.atr_bps);
+                    let sl=Math.round(sl_multiplier * p.atr_bps);
+                    sl = Math.min(sl, MAX_SL_BPS);
+                    tp = Math.max(tp, Math.round(sl * 1.5));
                   const sim=pathEVHeavy({entry:mid,tp_bps:tp,sl_bps:sl,side:"long",retSeries:yR,mu:mu5,sigma:sig5,steps:4,N:192,cost_bps:costLong});
                   const evLCB=Math.round(pLong_lcb*tp-(1-pLong_lcb)*sl-costLong);
                   const edgeL = tp/Math.max(1, LONG_EDGE_MULT_MIN*costLong);
@@ -879,8 +1019,13 @@ jobs:
                   candLong={ side:"long", p_lcb:pLong_lcb,p_raw:p.pLong0, ev_bps:sim.ev_bps, exp_lcb_bps:evLCB, tp_bps:tp, sl_bps:sl, cost_bps:costLong, style:"mr", regime, viab_mult:viabMultL };
                 }
                 if(DIRECTION!=="long"){
-                  let tp=Math.round(p.atr_bps*1.0);
-                  let sl=Math.round(p.atr_bps*0.5);
+                  // Dynamic TP/SL based on market conditions (same as long)
+                  const trend_strength = Math.abs(p.trend5m.ema_slope_bps)/Math.max(1, recentATR);
+                  const tp_multiplier = trend_strength > 0.5 ? 1.2 : 1.0;
+                  const sl_multiplier = trend_strength > 0.5 ? 0.7 : 0.5;
+                  
+                  let tp=Math.round(tp_multiplier * p.atr_bps);
+                  let sl=Math.round(sl_multiplier * p.atr_bps);
                   sl = Math.min(sl, MAX_SL_BPS);
                   tp = Math.max(tp, Math.round(sl * 1.5));
                   const sim=pathEVHeavy({entry:mid,tp_bps:tp,sl_bps:sl,side:"short",retSeries:yR,mu:mu5,sigma:sig5,steps:4,N:192,cost_bps:costShort});
@@ -895,17 +1040,19 @@ jobs:
                 if(!chosen) continue;
 
                 const microQ=(Math.max(0,1-(p.spreadBps||0)/20))*(1-Math.min(0.6,(chosen.cost_bps-COST_BPS)/20))*(1+clamp(obi,-0.2,0.2));
-                // Soft TF alignment (no hard gate)
-                const gTF = clamp(0.4 + 0.8*tfAlign, 0.2, 1.2);
                 const regimeQ=0.7+0.4*tfAlign;
 
-                const gSpread = clamp(1 - Math.max(0,(p.spreadBps - MAX_SPREAD_BPS))/MAX_SPREAD_BPS, 0.2, 1.1);
-                const gCost   = clamp(1 - Math.max(0,(chosen.cost_bps - COST_BPS))/20, 0.2, 1.1);
-                const gVol    = clamp((p.vol1h_est_usd||0)/Math.max(1, MIN_VOL_1H_USD), 0.2, 1.1);
-                const gDepth  = clamp(depth1pUSD/Math.max(1, DEPTH_1P_MIN_USD), 0.2, 1.1);
-                const gMR     = p.mrLocked ? 0.7 : 1.05;
-                const gDir    = (chosen.side==="long" && p.noLongDown) ? 0.8 : 1.0;
-                const gBTC    = (chosen.side==="long" && !btcUp1h) ? 0.85 : 1.0;
+                // Smooth exponential penalties instead of arbitrary clamps
+                const gSpread = Math.exp(-Math.max(0, p.spreadBps - MAX_SPREAD_BPS)/MAX_SPREAD_BPS);
+                const gCost   = Math.exp(-Math.max(0, chosen.cost_bps - COST_BPS)/15);
+                const gVol    = 1 - Math.exp(-3*(p.vol1h_est_usd||0)/MIN_VOL_1H_USD); // Smooth growth
+
+                // Remove arbitrary clamps, use natural exponential shapes
+                const gDepth  = 1 - Math.exp(-2*depth1pUSD/DEPTH_1P_MIN_USD);
+                const gMR     = p.mrLocked ? 0.8 : 1.0; // Keep simple binary
+                const gDir    = (chosen.side==="long" && p.noLongDown) ? 0.7 : 1.0;
+                const gBTC    = (chosen.side==="long" && !btcUp1h) ? 0.9 : 1.0;
+                const gTF     = 0.7 + 0.3/(1 + Math.exp(-10*(tfAlign-0.6))); // Sigmoid shape
                 const gEV     = clamp(chosen.viab_mult||1, 0.3, 1.3);
 
                 const gateMult= clamp(gSpread * gCost * gVol * gDepth * gMR * gDir * gBTC * gTF * gEV, 0.2, 1.4);
@@ -1000,17 +1147,19 @@ jobs:
             let picksV2 = selected.map((x,i)=>{
               const bk = bookMap.get(x.symbol);
               const mid = (bk?.bid && bk?.ask) ? ((+bk.bid + +bk.ask)/2) : null;
+              const volatilityPercentile = Math.min(1, (x.atr_bps||50)/100);
 
               // compute abs exits (also needed for v1 compat)
               let entry_limit = null, tp_abs = null, sl_abs = null;
               if (mid != null) {
                 const slF = x.sl_bps/10000, tpF = x.tp_bps/10000;
+                const entry_offset = Math.min(0.5, volatilityPercentile * 0.6);
                 if (x.side === "long") {
-                  entry_limit = mid * (1 - Math.max(0.001, slF*0.5));
+                  entry_limit = mid * (1 - Math.max(0.001, slF*entry_offset));
                   tp_abs = entry_limit * (1 + tpF);
                   sl_abs = entry_limit * (1 - slF);
                 } else {
-                  entry_limit = mid * (1 + slF);
+                  entry_limit = mid * (1 + Math.max(0.001, slF*entry_offset));
                   tp_abs = entry_limit * (1 - tpF);
                   sl_abs = entry_limit * (1 + slF);
                 }
@@ -1147,10 +1296,15 @@ jobs:
             // Portfolio VaR/ES throttle on sizes
             try {
               const varStats = portfolioVaR_ES_tCopula(picks, 6);
-              if (varStats.ES95_bps < -220) {
-                const scale = clamp(-220 / Math.min(-1e-6, varStats.ES95_bps), 0.35, 1);
-                picks = picks.map(p => ({ ...p, size_bps: Math.max(4, Math.round(p.size_bps * scale)) }));
-                console.log("[gha] VaR/ES throttle", varStats, "scale", scale);
+              // Dynamic risk limit based on recent performance
+              const recentPnL = (state.equity||[]).slice(-20).reduce((s,e)=>s+e.pnl_bps,0);
+              const riskTolerance = recentPnL > 0 ? RISK_TOLERANCE_WINNING : RISK_TOLERANCE_BASE; // More risk when winning
+
+              if (varStats.ES95_bps < -riskTolerance) {
+                  // Smooth scaling function
+                  const scale = Math.exp((varStats.ES95_bps + riskTolerance)/100);
+                  picks = picks.map(p => ({ ...p, size_bps: Math.max(5, Math.round(p.size_bps * scale)) }));
+                  log(`[gha] VaR/ES throttle: ES95=${varStats.ES95_bps}, limit=${-riskTolerance}, scale=${scale.toFixed(3)}`);
               } else {
                 console.log("[gha] VaR/ES ok", varStats);
               }
@@ -1231,6 +1385,7 @@ jobs:
               tier: selectionTier,
               idea_logs: ideaLogs,
               tf_weights: TF_WEIGHTS,
+              calibration_health: calibHealth,
 
               // keep all code2 fields here so nothing is lost
               extras: {
