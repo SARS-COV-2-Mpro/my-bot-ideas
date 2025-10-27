@@ -562,8 +562,8 @@ jobs:
               if (idea.tp_abs <= 0) errors.push('Invalid TP price');
               if (idea.sl_abs <= 0) errors.push('Invalid SL price');
               
-              const maxLoss = idea.size_bps * (idea.sl_bps / 10000);
-              if (maxLoss > 100) errors.push(`Excessive risk per trade: ${maxLoss.toFixed(2)}bps`);
+              const maxLoss = idea.size_bps * idea.sl_bps / 100;
+              if (maxLoss > 100) errors.push(`Excessive risk per trade: ${maxLoss}bps`);
               
               const spread = market.bookMap.get(idea.symbol_full)?.spread_bps || 0;
               if (spread > idea.cost_bps * 2) warnings.push('Spread exceeds 2x expected cost');
@@ -578,8 +578,7 @@ jobs:
               const symbolPositions = state.pending.filter(p => p.symbolFull === idea.symbol_full);
               if (symbolPositions.length >= 2) warnings.push('Multiple positions on same symbol');
               
-              const key = `${idea.side}_${idea.regime}`;
-              const coeffs = state.calibCoeffs?.[key];
+              const coeffs = state.calibCoeffs?.[idea.calib_key];
               if (coeffs && coeffs.recent_errors?.length > 10) {
                 const avgError = mean(coeffs.recent_errors);
                 if (avgError > 0.4) warnings.push(`High calibration error: ${avgError.toFixed(2)}`);
@@ -704,7 +703,7 @@ jobs:
           
           // ========== ATOMIC STATE OPERATIONS ==========
           async function fetchCurrentState(persist) {
-            const token=persist?.token, id=persist?.id;
+            const token=persist.token, id=persist.id;
             const init={ v:"mexc-ultimate-7.0-safe", locks:{}, cooldown:{}, cooldown_side: {}, pending:[], equity:[], closed:[], calibCoeffs:{}, mr_lockout: {}, sym_stats: {}, sym_stats_real: {}, version:0 };
             if(!token||!id) return { state:init, etag: null };
             const r = await fetchWithTimeout(`https://api.github.com/gists/${id}`, { headers:{Authorization:`Bearer ${token}`,"Accept":"application/vnd.github+json","User-Agent":UA} });
@@ -757,10 +756,6 @@ jobs:
           }
 
           async function saveStateAtomic(persist, state, options = {}) {
-            if (!persist || !persist.id || !persist.token) {
-              log("Skipping state save: no Gist credentials.");
-              return false;
-            }
             const maxRetries = 5;
             let lastError = null;
             let currentEtag = options.etag;
@@ -1051,32 +1046,25 @@ jobs:
             log(`🚀 Starting run ${runId}`);
             let lock;
             const persist = { id: process.env.GIST_ID, token: process.env.GIST_TOKEN };
-            const hasGist = !!(persist.id && persist.token);
             const startTime = Date.now();
 
             try {
-              if (hasGist) {
-                  log("health GET", HEALTH_URL);
-                  try {
-                    const r = await fetchWithTimeout(HEALTH_URL, {
-                      headers: { "Authorization": `Bearer ${PUSH_TOKEN}`, "User-Agent": UA }
-                    }, 5000);
-                    let t = ""; try { t = await r.text(); } catch {}
-                    log("health status", r?.status || "ERR", (t || "").slice(0, 160));
-                  } catch (e) {
-                    log("health error", e?.message || e);
-                  }
+              log("health GET", HEALTH_URL);
+              try {
+                const r = await fetchWithTimeout(HEALTH_URL, {
+                  headers: { "Authorization": `Bearer ${PUSH_TOKEN}`, "User-Agent": UA }
+                }, 5000);
+                let t = ""; try { t = await r.text(); } catch {}
+                log("health status", r?.status || "ERR", (t || "").slice(0, 160));
+              } catch (e) {
+                log("health error", e?.message || e);
               }
               
               await pickMexcBase();
 
               // 1. Acquire distributed lock
-              if (hasGist) {
-                lock = await acquireLock(persist, 'pusher_main', 120000);
-                log(`🔒 Lock acquired: ${lock.lockId}`);
-              } else {
-                 log('No Gist creds—skipping lock/state operations.');
-              }
+              lock = await acquireLock(persist, 'pusher_main', 120000);
+              log(`🔒 Lock acquired: ${lock.lockId}`);
               
               // 2. Health check
               const health = await monitor.healthCheck();
@@ -1089,7 +1077,7 @@ jobs:
               
               // 3. Load and validate state
               const { state } = await CircuitBreaker.execute('load_state', 
-                () => loadState(hasGist ? persist : null), 
+                () => loadState(persist), 
                 { maxFailures: 3 }
               );
               
@@ -1118,14 +1106,14 @@ jobs:
               const heartbeat = await heartbeatCheck(state);
               if((heartbeat?.zombies||0)>0) log("heartbeat zombies", heartbeat.zombies);
               const cleaned = await cleanupPendingBeforePlanning(state, heartbeat);
-              if (hasGist && cleaned.dropped > 0) {
+              if (cleaned.dropped > 0) {
                 await saveStateAtomic(persist, state, { changes: `Cleaned ${cleaned.dropped} orders`});
               }
 
               const ALL24 = await fetchAll24hr();
               const booksRaw=await getJSON(api("/api/v3/ticker/bookTicker"),10000,2) || [];
               const bookMap=new Map(booksRaw.map(b=>[b.symbol,{ bid:+b.bidPrice, ask:+b.askPrice, spread_bps: Math.round(((+b.askPrice - +b.bidPrice) / ((+b.bidPrice + +b.askPrice)/2)) * 10000) }]));
-              if(!todOK) { log("TOD gate is closed."); if(lock) await lock.release(); return; }
+              if(!todOK) { log("TOD gate is closed."); return; }
 
               const kBTC1H=await getKCached("BTCUSDT","1h",K1H);
               const kBTC5 = await getKCached("BTCUSDT", "5m", K5M);
@@ -1148,7 +1136,7 @@ jobs:
               const equityStats=(eq)=>{ const day=Date.now()-24*3600*1000; let pnl24=0,cum=0,peak=0,dd=0; for(const e of eq||[]){ if(e.ts_ms>=day) pnl24+=e.pnl_bps; cum+=e.pnl_bps; if(cum>peak) peak=cum; dd=Math.min(dd,cum-peak); } return { pnl24_bps:Math.round(pnl24), peak_dd_bps:Math.round(dd) }; };
               const { pnl24_bps, peak_dd_bps } = equityStats(state.equity);
               const throttle=(pnl24_bps<=DD_24H_LIMIT_BPS) || (peak_dd_bps<=DD_PEAK_LIMIT_BPS);
-              if (throttle) { log("DD throttle is active."); if(lock) await lock.release(); return; }
+              if (throttle) { log("DD throttle is active."); return; }
 
               const liqPct=new Map(); for(let i=0;i<universe.length;i++) liqPct.set(universe[i].symbol,(universe.length===1)?1:1-i/(universe.length-1));
 
@@ -1291,7 +1279,7 @@ jobs:
                 validatedPicks.forEach(p => p.size_bps = Math.max(4, Math.round(p.size_bps * scale)));
                 log("[gha] VaR/ES throttle", varStats, "scale", scale);
               }
-              
+
               // 8. Final portfolio risk check
               const calculatePortfolioRisk = (picks) => ({ total_risk_bps: picks.reduce((acc, p) => acc + (p.size_bps * p.sl_bps / 10000), 0) });
               const portfolioRisk = calculatePortfolioRisk(validatedPicks);
@@ -1308,12 +1296,10 @@ jobs:
               }
               
               // 9. Save state atomically
-              if (hasGist) {
-                await saveStateAtomic(persist, state, { 
-                  changes: `Added ${validatedPicks.length} ideas`,
-                  requireEtag: true 
-                });
-              }
+              await saveStateAtomic(persist, state, { 
+                changes: `Added ${validatedPicks.length} ideas`,
+                requireEtag: true 
+              });
               
               // 10. Push to worker with circuit breaker
               const meta = { origin:"github_actions", runId, calibration_health: calibHealth };
@@ -1336,7 +1322,7 @@ jobs:
               
             } finally {
               // Always release lock
-              if (hasGist && lock) {
+              if (lock) {
                 await lock.release();
                 log(`🔓 Lock released`);
               }
