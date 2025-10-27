@@ -93,6 +93,8 @@ jobs:
           (async ()=>{
           'use strict';
           const crypto = require('crypto');
+          const MODEL_VERSION=(process.env.MODEL_VERSION||"6.4");
+          const UA = `gh-actions-ideas-mexc-ultimate/${MODEL_VERSION} (+https://github.com/)`;
 
           // ---------------- Utils ----------------
           const clamp=(x,a,b)=>Math.max(a,Math.min(b,x));
@@ -230,7 +232,6 @@ jobs:
           const portfolioVaR_ES_tCopula=(picks, df=6)=>{ if(!picks.length) return { VaR95_bps:0, ES95_bps:0 }; const n=picks.length, mu=Array(n).fill(0), sd=Array(n).fill(0); for(let i=0;i<n;i++){ const r5=picks[i].ret5||[]; const rMean=mean(r5), rStd=std(r5)||1e-4; const steps=Math.max(1, Math.round((picks[i].ttl_sec||600)/300)); mu[i]=rMean*steps*10000; sd[i]=rStd*Math.sqrt(steps)*10000; } const R=Array.from({length:n},()=>Array(n).fill(0)); for(let i=0;i<n;i++){ for(let j=i;j<n;j++) R[i][j]=corr(picks[i].ret5||[], picks[j].ret5||[]); R[i][i]=1; } const Sigma=Array.from({length:n},()=>Array(n).fill(0)); for(let i=0;i<n;i++) for(let j=0;j<n;j++) Sigma[i][j]=R[i][j]*sd[i]*sd[j]; const draws=sampleMultiT(mu,Sigma,df,1200); if(!draws.length) return { VaR95_bps:0, ES95_bps:0 }; const w0=picks.map(p=> p.size_bps||0); const ws=sum(w0)||1; const w=w0.map(x=> x/ws); const port=draws.map(d=> d.reduce((acc,di,ii)=> acc + w[ii]*di, 0)); port.sort((a,b)=>a-b); const idx=Math.floor(0.05*port.length); const VaR95=port[idx]||0; const ES=mean(port.slice(0,idx+1)); return { VaR95_bps:Math.round(VaR95), ES95_bps:Math.round(ES) }; };
 
           // ---------- HTTP + Concurrency ----------
-          const UA="gh-actions-ideas-mexc-ultimate/6.4-audit-mtf (+https://github.com/)";
           async function fetchWithTimeout(url,opts={},ms=12000){ const ac=new AbortController(); const t=setTimeout(()=>ac.abort(),ms); try{ return await fetch(url,{...opts,signal:ac.signal,headers:{"User-Agent":UA,...(opts?.headers||{})}});} finally{ clearTimeout(t);} }
           async function getJSON(url,ms=12000,tries=2){ for(let a=0;a<tries;a++){ try{ const r=await fetchWithTimeout(url,{},ms); if(r?.ok){ return await r.json(); } }catch{} await sleep(jitter(220)); } return null; }
           const cache={ k:new Map(), depth:new Map(), bt:new Map(), conv:new Map() };
@@ -252,7 +253,6 @@ jobs:
           const MIN_TF_ALIGN=(Number(process.env.MIN_TF_ALIGN||"0.60"));
           let TF_WEIGHTS={}; try{ TF_WEIGHTS=JSON.parse(process.env.TF_WEIGHTS||"{}"); }catch{ TF_WEIGHTS={}; }
           const STRATEGY_NAME=(process.env.STRATEGY_NAME||"mexc-ultimate");
-          const MODEL_VERSION=(process.env.MODEL_VERSION||"6.4");
           const SCHEMA_VERSION=(process.env.SCHEMA_VERSION||"1");
           const GIT_SHA=(process.env.GIT_SHA||"unknown");
 
@@ -326,7 +326,10 @@ jobs:
               }
           }
           async function fetchMyTrades(symbol, startTime) { return await mexcSignedRequest('/api/v3/myTrades', { symbol, startTime, limit: 1000 }); }
-          async function fetchOpenOrders(symbol) { return await mexcSignedRequest('/api/v3/openOrders', symbol?{ symbol }:{}) || []; }
+          async function fetchOpenOrders(symbol) {
+            const r = await mexcSignedRequest('/api/v3/openOrders', symbol?{symbol}:{});
+            return Array.isArray(r) ? r : null; // null => unavailable
+          }
           async function fetchK(sym,interval,limit,startTime,endTime){ const u=api("/api/v3/klines",{symbol:sym,interval,limit,startTime,endTime}); const r=await getJSON(u,10000,2); return Array.isArray(r)?r:null; }
           async function fetchDepth(symbol){ return await getJSON(api("/api/v3/depth",{symbol,limit:DEPTH_LIMIT}), 10000, 2); }
           async function fetchAll24hr(){
@@ -374,10 +377,11 @@ jobs:
             const res={ mismatches:0, zombies:0, details:[] };
             if(!MEXC_API_KEY||!MEXC_SECRET_KEY) return res;
             try{
-              const syms=[...new Set((state.pending||[]).map(p=>p.symbolFull))];
-              const openAll=await fetchOpenOrders(); // array
+              const openAll=await fetchOpenOrders();
+              if (!Array.isArray(openAll)) return res; // don’t mark zombies on unavailable data
+
               const byClient=new Map();
-              for(const o of openAll||[]){ const cid=(o.clientOrderId||o.clientOrderID||"").trim(); if(cid) byClient.set(cid,o); }
+              for(const o of openAll){ const cid=(o.clientOrderId||o.clientOrderID||"").trim(); if(cid) byClient.set(cid,o); }
               for(const p of state.pending||[]){
                 const cid=(p.client_order_id||p.clientOrderId||"").trim();
                 if(!cid) continue;
@@ -976,7 +980,7 @@ jobs:
                   cost_bps:chosen.cost_bps,
                   adx:+(p.adx5||0).toFixed(1), atr_bps:p.atr_bps,
                   regime:chosen.regime, style:chosen.style,
-                  hold_sec:clamp(1200,TTL_MIN,TTL_MAX),
+                  hold_sec:clamp(720,TTL_MIN,TTL_MAX),
                   liq_pct:+(liqPct.get(c.symbol)||0.5).toFixed(3),
                   ret5:(()=>{const r=[];for(let i=1;i<p.c5.length;i++)r.push(Math.log(p.c5[i]/p.c5[i-1]));return r.slice(-36);})(),
                   confidence: Math.round(conf),
