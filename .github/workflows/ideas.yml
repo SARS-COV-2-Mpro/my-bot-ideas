@@ -111,7 +111,6 @@ jobs:
           const log=(...a)=>console.log("[gha]",...a);
           const softmax=(arr,t=20)=>{ const m=Math.max(...arr,0); const ex=arr.map(x=>Math.exp((x-m)/t)); const s=ex.reduce((a,b)=>a+b,0)||1; return ex.map(x=>x/s); };
           const sigmoid=(z)=>1/(1+Math.exp(-z));
-          const logit=(p)=>{ const eps=1e-6; const pp=Math.min(1-eps,Math.max(eps,p)); return Math.log(pp/(1-pp)); };
           let bmSpare=null;
           const randn=()=>{ if(bmSpare!=null){ const v=bmSpare; bmSpare=null; return v; } let u=0,v=0; while(u===0) u=Math.random(); while(v===0) v=Math.random(); const r=Math.sqrt(-2*Math.log(u)); const th=2*Math.PI*v; bmSpare=r*Math.sin(th); return r*Math.cos(th); };
           const randt=(df)=>{ if(df<=2) df=2.01; const z=randn(); let x2=0; for(let i=0;i<Math.floor(df);i++){ const z2=randn(); x2+=z2*z2; } const frac=df-Math.floor(df); if(frac>0){ const zf=randn(); x2+=frac*zf*zf; } const chi=x2||1e-6; return z / Math.sqrt(chi/df); };
@@ -588,60 +587,26 @@ jobs:
             }
           }
           
-          const regFromKey = (k) => k?.includes("regime:trend") ? "trend" : k?.includes("regime:meanrevert") ? "meanrevert" : null;
           function learnFromGistRealFills(state){
             const learnable = (state.closed || []).filter(c =>
               c.reconciliation === "exchange_trade_history" &&
               !c.learned &&
-              c.p_raw != null
+              c.p_raw != null &&
+              c.regime
             );
-            let learnedCount = 0;
             for (const c of learnable) {
-              const reg = c.regime || regFromKey(c.calib_key);
-              if (!reg || !c.side) continue;
-
               const outcome = (c.pnl_bps || 0) > 0 ? 1 : 0;
-              try { updateCalibration(state, c.side, reg, c.p_raw, outcome); }
+              try { updateCalibration(state, c.side, c.regime, c.p_raw, outcome); }
               catch(e){ log("learnFromGistRealFills warn", e?.message||e); }
               c.learned = true;
               c.learned_at_ts = Date.now();
-              learnedCount++;
             }
-            if (learnedCount > 0) log(`learnFromGistRealFills: updated from ${learnedCount} real fills.`);
+            if (learnable.length) log(`learnFromGistRealFills: updated from ${learnable.length} real fills.`);
           }
 
-          const getCoeffs = (state, side, regime) => {
-            const key = `${side}_${regime}`;
-            if (!state.calibCoeffs) state.calibCoeffs = {};
-            const def = { a: 0, b: 1, n: 0, l2: 1e-4 };
-            state.calibCoeffs[key] = { ...def, ...(state.calibCoeffs[key] || {}) };
-            return state.calibCoeffs[key];
-          };
-          function updateCalibration(state, side, regime, pRaw, outcome){
-            if(pRaw==null || !isFinite(pRaw)) return;
-            const coeff = getCoeffs(state, side, regime);
-            const x = Math.max(-5, Math.min(5, logit(pRaw)));  // clip feature
-            const lr = 0.01;
-
-            const z = coeff.a + coeff.b * x;
-            const pHat = sigmoid(z); // sigmoid is invLogit
-
-            // Gradient ascent on log-likelihood with light L2
-            const gradA = (outcome - pHat) - (coeff.l2||0)*coeff.a;
-            const gradB = (outcome - pHat) * x - (coeff.l2||0)*coeff.b;
-
-            coeff.a += lr * gradA;
-            coeff.b += lr * gradB;
-            coeff.n++;
-
-            state.calibCoeffs[`${side}_${regime}`] = coeff;
-          }
-          const calibrateP=(state, side, regime, pRaw)=>{
-            const coeff = getCoeffs(state, side, regime);
-            if(pRaw==null || !isFinite(pRaw)) return 0.5; // safe fallback
-            const x = Math.max(-5, Math.min(5, logit(pRaw)));
-            return sigmoid(coeff.a + coeff.b * x);
-          };
+          const getCoeffs=(state, side, regime)=>{ const key=`${side}_${regime}`; if(!state.calibCoeffs) state.calibCoeffs={}; if(!state.calibCoeffs[key]) state.calibCoeffs[key]={a:0,b:1,n:0}; return state.calibCoeffs[key]; }
+          function updateCalibration(state, side, regime, pRaw, outcome){ if(pRaw==null) return; const coeff=getCoeffs(state,side,regime); const lr=0.05; const z=coeff.a+coeff.b*pRaw; const pHat=sigmoid(z); const err=outcome-pHat; coeff.a += lr*err; coeff.b += lr*err*pRaw; coeff.n++; state.calibCoeffs[`${side}_${regime}`]=coeff; }
+          const calibrateP=(state, side, regime, pRaw)=>{ const coeff=getCoeffs(state,side,regime); return sigmoid(coeff.a+coeff.b*pRaw); };
           const calibratorInfo=(state,side,regime)=>{ const coeff=getCoeffs(state,side,regime); return { type:"logistic", n:coeff.n, a:coeff.a, b:coeff.b }; };
           function getSymbolAdj(state, base) {
             const real = state.sym_stats_real?.[base];
@@ -892,14 +857,8 @@ jobs:
                 const depth1pUSD=(d1.asksUSD||0)+(d1.bidsUSD||0);
 
                 const regime=p.mrLocked?"trend":"meanrevert";
-                const coeffL = getCoeffs(state, "long", regime);
-                const coeffS = getCoeffs(state, "short", regime);
-                const nL = Math.max(1, Math.min(500, coeffL.n || 0));
-                const nS = Math.max(1, Math.min(500, coeffS.n || 0));
-                const pLong=calibrateP(state,"long",regime,p.pLong0);
-                const pShort=calibrateP(state,"short",regime,p.pShort0);
-                const pLong_lcb=wilsonLCB(pLong, nL, WILSON_Z);
-                const pShort_lcb=wilsonLCB(pShort, nS, WILSON_Z);
+                const pLong=calibrateP(state,"long",regime,p.pLong0), pShort=calibrateP(state,"short",regime,p.pShort0);
+                const pLong_lcb=wilsonLCB(pLong,80,WILSON_Z), pShort_lcb=wilsonLCB(pShort,80,WILSON_Z);
 
                 const yR=[]; for(let i=1;i<p.c5.length;i++) yR.push(Math.log(p.c5[i]/p.c5[i-1]));
                 const mu5=mean(yR)||0, sig5=Math.max(1e-4,std(yR));
