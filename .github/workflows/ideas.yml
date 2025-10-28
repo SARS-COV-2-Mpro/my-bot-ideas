@@ -89,7 +89,7 @@ jobs:
           fi
 
           set +e
-          node - <<-'NODE'
+          node - <<'NODE'
           (async ()=>{
           'use strict';
           const crypto = require('crypto');
@@ -525,7 +525,7 @@ jobs:
                 const start = Date.now();
                 const r = await fetchWithTimeout(api("/api/v3/time"), {}, 2000);
                 const latency = Date.now() - start;
-                return { healthy: r?.ok && latency < 2500, latency };
+                return { healthy: r?.ok && latency < 1000, latency };
               } catch {
                 return { healthy: false, error: 'API unreachable' };
               }
@@ -707,7 +707,7 @@ jobs:
             const token=persist?.token, id=persist?.id;
             const init={ v:"mexc-ultimate-7.0-safe", locks:{}, cooldown:{}, cooldown_side: {}, pending:[], equity:[], closed:[], calibCoeffs:{}, mr_lockout: {}, sym_stats: {}, sym_stats_real: {}, version:0 };
             if(!token||!id) return { state:init, etag: null };
-            const r = await fetchWithTimeout(`https://api.github.com/gists/${id}`, { headers:{Authorization:`Bearer ${token}`,"Accept":"application/vnd.github+json","User-Agent":UA} }, 15000);
+            const r = await fetchWithTimeout(`https://api.github.com/gists/${id}`, { headers:{Authorization:`Bearer ${token}`,"Accept":"application/vnd.github+json","User-Agent":UA} });
             if(!r.ok) throw new Error(`Failed to fetch state: ${r.status}`);
             const etag = r.headers.get("etag");
             const g = await r.json();
@@ -1072,12 +1072,8 @@ jobs:
 
               // 1. Acquire distributed lock
               if (hasGist) {
-                try {
-                  lock = await acquireLock(persist, 'pusher_main', 120000);
-                  log(`🔒 Lock acquired: ${lock.lockId}`);
-                } catch (e) {
-                  log('Lock acquire failed; continuing without lock:', e.message);
-                }
+                lock = await acquireLock(persist, 'pusher_main', 120000);
+                log(`🔒 Lock acquired: ${lock.lockId}`);
               } else {
                  log('No Gist creds—skipping lock/state operations.');
               }
@@ -1085,18 +1081,16 @@ jobs:
               // 2. Health check
               const health = await monitor.healthCheck();
               if (!health.healthy) {
-                log('⚠️ System unhealthy (non-fatal):', JSON.stringify(health.checks));
+                log('⚠️ System unhealthy:', JSON.stringify(health.checks));
                 if (health.checks.api?.healthy === false) {
-                  await sendSafeEmptyPayload('api_health');
-                  if (lock) await lock.release();
-                  return;
+                  throw new Error('API health check failed - aborting');
                 }
               }
               
               // 3. Load and validate state
               const { state } = await CircuitBreaker.execute('load_state', 
                 () => loadState(hasGist ? persist : null), 
-                { maxFailures: 3, timeout: 20000 }
+                { maxFailures: 3 }
               );
               
               const stateValidation = SafetyValidator.validateSystemState(state, health);
@@ -1115,7 +1109,6 @@ jobs:
               // 5. Check if paused
               if (state.pause_new_orders && Date.now() < state.pause_new_orders) {
                 log('⏸️ New orders paused until', new Date(state.pause_new_orders).toISOString());
-                await sendSafeEmptyPayload('paused');
                 return;
               }
               
@@ -1126,22 +1119,13 @@ jobs:
               if((heartbeat?.zombies||0)>0) log("heartbeat zombies", heartbeat.zombies);
               const cleaned = await cleanupPendingBeforePlanning(state, heartbeat);
               if (hasGist && cleaned.dropped > 0) {
-                try {
-                  await saveStateAtomic(persist, state, { changes: `Cleaned ${cleaned.dropped} orders`, requireEtag: true });
-                } catch (e) {
-                  log('saveStateAtomic (cleanup) failed:', e.message);
-                }
+                await saveStateAtomic(persist, state, { changes: `Cleaned ${cleaned.dropped} orders`});
               }
 
               const ALL24 = await fetchAll24hr();
               const booksRaw=await getJSON(api("/api/v3/ticker/bookTicker"),10000,2) || [];
               const bookMap=new Map(booksRaw.map(b=>[b.symbol,{ bid:+b.bidPrice, ask:+b.askPrice, spread_bps: Math.round(((+b.askPrice - +b.bidPrice) / ((+b.bidPrice + +b.askPrice)/2)) * 10000) }]));
-              if (!todOK) {
-                log('TOD gate is closed.');
-                await sendSafeEmptyPayload('tod_gate');
-                if (lock) await lock.release();
-                return;
-              }
+              if(!todOK) { log("TOD gate is closed."); if(lock) await lock.release(); return; }
 
               const kBTC1H=await getKCached("BTCUSDT","1h",K1H);
               const kBTC5 = await getKCached("BTCUSDT", "5m", K5M);
@@ -1164,12 +1148,7 @@ jobs:
               const equityStats=(eq)=>{ const day=Date.now()-24*3600*1000; let pnl24=0,cum=0,peak=0,dd=0; for(const e of eq||[]){ if(e.ts_ms>=day) pnl24+=e.pnl_bps; cum+=e.pnl_bps; if(cum>peak) peak=cum; dd=Math.min(dd,cum-peak); } return { pnl24_bps:Math.round(pnl24), peak_dd_bps:Math.round(dd) }; };
               const { pnl24_bps, peak_dd_bps } = equityStats(state.equity);
               const throttle=(pnl24_bps<=DD_24H_LIMIT_BPS) || (peak_dd_bps<=DD_PEAK_LIMIT_BPS);
-              if (throttle) {
-                log('DD throttle is active.');
-                await sendSafeEmptyPayload('dd_throttle');
-                if (lock) await lock.release();
-                return;
-              }
+              if (throttle) { log("DD throttle is active."); if(lock) await lock.release(); return; }
 
               const liqPct=new Map(); for(let i=0;i<universe.length;i++) liqPct.set(universe[i].symbol,(universe.length===1)?1:1-i/(universe.length-1));
 
@@ -1330,14 +1309,10 @@ jobs:
               
               // 9. Save state atomically
               if (hasGist) {
-                try {
-                  await saveStateAtomic(persist, state, {
-                    changes: `Added ${validatedPicks.length} ideas`,
-                    requireEtag: true
-                  });
-                } catch (e) {
-                  log('saveStateAtomic (add ideas) failed:', e.message);
-                }
+                await saveStateAtomic(persist, state, { 
+                  changes: `Added ${validatedPicks.length} ideas`,
+                  requireEtag: true 
+                });
               }
               
               // 10. Push to worker with circuit breaker
@@ -1350,17 +1325,10 @@ jobs:
                     body: JSON.stringify(payload)
                   });
               };
-              try {
-                await CircuitBreaker.execute(
-                  'push_to_worker',
-                  () => pushToWorker(validatedPicks, meta),
-                  { maxFailures: 3, timeout: 45000 }
-                );
-              } catch (e) {
-                log('push_to_worker failed:', e.message);
-                await sendSafeEmptyPayload('push_timeout');
-                // do not rethrow
-              }
+              await CircuitBreaker.execute('push_to_worker', 
+                () => pushToWorker(validatedPicks, meta),
+                { maxFailures: 3, timeout: 15000 }
+              );
               
               // 11. Post-execution monitoring
               monitor.recordApiCall('push_complete', true, Date.now() - startTime);
@@ -1378,22 +1346,22 @@ jobs:
         // Execute with global error handlers
         process.on('uncaughtException', (error) => {
           console.error('💀 Uncaught exception:', error);
-          sendSafeEmptyPayload('uncaught_exception').then(() => process.exit(0));
+          sendSafeEmptyPayload('uncaught_exception').then(() => process.exit(1));
         });
 
         process.on('unhandledRejection', (reason, promise) => {
           console.error('💀 Unhandled rejection at:', promise, 'reason:', reason);
-          sendSafeEmptyPayload('unhandled_rejection').then(() => process.exit(0));
+          sendSafeEmptyPayload('unhandled_rejection').then(() => process.exit(1));
         });
 
         main().catch(e => {
             log("FATAL MAIN ERROR", e.stack);
             monitor.alert('RUN_FAILED', e.message, 'HIGH');
-            sendSafeEmptyPayload("main_catch_all").then(() => process.exit(0));
+            sendSafeEmptyPayload("main_catch_all").then(() => process.exit(1));
         });
         
         })();
-          NODE
+        NODE
 
           EXIT_CODE=$?
 
