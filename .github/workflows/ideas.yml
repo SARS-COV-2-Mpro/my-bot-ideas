@@ -89,7 +89,7 @@ jobs:
           fi
 
           set +e
-          node - <<'NODE'
+          node - <<-'NODE'
           (async ()=>{
           'use strict';
           const crypto = require('crypto');
@@ -707,7 +707,7 @@ jobs:
             const token=persist?.token, id=persist?.id;
             const init={ v:"mexc-ultimate-7.0-safe", locks:{}, cooldown:{}, cooldown_side: {}, pending:[], equity:[], closed:[], calibCoeffs:{}, mr_lockout: {}, sym_stats: {}, sym_stats_real: {}, version:0 };
             if(!token||!id) return { state:init, etag: null };
-            const r = await fetchWithTimeout(`https://api.github.com/gists/${id}`, { headers:{Authorization:`Bearer ${token}`,"Accept":"application/vnd.github+json","User-Agent":UA}, timeout: 15000 });
+            const r = await fetchWithTimeout(`https://api.github.com/gists/${id}`, { headers:{Authorization:`Bearer ${token}`,"Accept":"application/vnd.github+json","User-Agent":UA} }, 15000);
             if(!r.ok) throw new Error(`Failed to fetch state: ${r.status}`);
             const etag = r.headers.get("etag");
             const g = await r.json();
@@ -1393,7 +1393,7 @@ jobs:
         });
         
         })();
-NODE
+          NODE
 
           EXIT_CODE=$?
 
