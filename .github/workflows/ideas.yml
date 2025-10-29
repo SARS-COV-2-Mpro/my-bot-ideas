@@ -93,8 +93,6 @@ jobs:
           (async ()=>{
           'use strict';
           const crypto = require('crypto');
-          const MODEL_VERSION=(process.env.MODEL_VERSION||"6.4");
-          const UA = `gh-actions-ideas-mexc-ultimate/${MODEL_VERSION} (+https://github.com/)`;
 
           // ---------------- Utils ----------------
           const clamp=(x,a,b)=>Math.max(a,Math.min(b,x));
@@ -113,7 +111,6 @@ jobs:
           const log=(...a)=>console.log("[gha]",...a);
           const softmax=(arr,t=20)=>{ const m=Math.max(...arr,0); const ex=arr.map(x=>Math.exp((x-m)/t)); const s=ex.reduce((a,b)=>a+b,0)||1; return ex.map(x=>x/s); };
           const sigmoid=(z)=>1/(1+Math.exp(-z));
-          const logit=(p)=>{ const eps=1e-6; const pp=Math.min(1-eps,Math.max(eps,p)); return Math.log(pp/(1-pp)); };
           let bmSpare=null;
           const randn=()=>{ if(bmSpare!=null){ const v=bmSpare; bmSpare=null; return v; } let u=0,v=0; while(u===0) u=Math.random(); while(v===0) v=Math.random(); const r=Math.sqrt(-2*Math.log(u)); const th=2*Math.PI*v; bmSpare=r*Math.sin(th); return r*Math.cos(th); };
           const randt=(df)=>{ if(df<=2) df=2.01; const z=randn(); let x2=0; for(let i=0;i<Math.floor(df);i++){ const z2=randn(); x2+=z2*z2; } const frac=df-Math.floor(df); if(frac>0){ const zf=randn(); x2+=frac*zf*zf; } const chi=x2||1e-6; return z / Math.sqrt(chi/df); };
@@ -232,6 +229,7 @@ jobs:
           const portfolioVaR_ES_tCopula=(picks, df=6)=>{ if(!picks.length) return { VaR95_bps:0, ES95_bps:0 }; const n=picks.length, mu=Array(n).fill(0), sd=Array(n).fill(0); for(let i=0;i<n;i++){ const r5=picks[i].ret5||[]; const rMean=mean(r5), rStd=std(r5)||1e-4; const steps=Math.max(1, Math.round((picks[i].ttl_sec||600)/300)); mu[i]=rMean*steps*10000; sd[i]=rStd*Math.sqrt(steps)*10000; } const R=Array.from({length:n},()=>Array(n).fill(0)); for(let i=0;i<n;i++){ for(let j=i;j<n;j++) R[i][j]=corr(picks[i].ret5||[], picks[j].ret5||[]); R[i][i]=1; } const Sigma=Array.from({length:n},()=>Array(n).fill(0)); for(let i=0;i<n;i++) for(let j=0;j<n;j++) Sigma[i][j]=R[i][j]*sd[i]*sd[j]; const draws=sampleMultiT(mu,Sigma,df,1200); if(!draws.length) return { VaR95_bps:0, ES95_bps:0 }; const w0=picks.map(p=> p.size_bps||0); const ws=sum(w0)||1; const w=w0.map(x=> x/ws); const port=draws.map(d=> d.reduce((acc,di,ii)=> acc + w[ii]*di, 0)); port.sort((a,b)=>a-b); const idx=Math.floor(0.05*port.length); const VaR95=port[idx]||0; const ES=mean(port.slice(0,idx+1)); return { VaR95_bps:Math.round(VaR95), ES95_bps:Math.round(ES) }; };
 
           // ---------- HTTP + Concurrency ----------
+          const UA="gh-actions-ideas-mexc-ultimate/6.4-audit-mtf (+https://github.com/)";
           async function fetchWithTimeout(url,opts={},ms=12000){ const ac=new AbortController(); const t=setTimeout(()=>ac.abort(),ms); try{ return await fetch(url,{...opts,signal:ac.signal,headers:{"User-Agent":UA,...(opts?.headers||{})}});} finally{ clearTimeout(t);} }
           async function getJSON(url,ms=12000,tries=2){ for(let a=0;a<tries;a++){ try{ const r=await fetchWithTimeout(url,{},ms); if(r?.ok){ return await r.json(); } }catch{} await sleep(jitter(220)); } return null; }
           const cache={ k:new Map(), depth:new Map(), bt:new Map(), conv:new Map() };
@@ -253,21 +251,9 @@ jobs:
           const MIN_TF_ALIGN=(Number(process.env.MIN_TF_ALIGN||"0.60"));
           let TF_WEIGHTS={}; try{ TF_WEIGHTS=JSON.parse(process.env.TF_WEIGHTS||"{}"); }catch{ TF_WEIGHTS={}; }
           const STRATEGY_NAME=(process.env.STRATEGY_NAME||"mexc-ultimate");
+          const MODEL_VERSION=(process.env.MODEL_VERSION||"6.4");
           const SCHEMA_VERSION=(process.env.SCHEMA_VERSION||"1");
           const GIT_SHA=(process.env.GIT_SHA||"unknown");
-          
-          // Calibration tuning
-          const ADAPTIVE_LEARNING = true;
-          const MIN_LEARNING_RATE = 0.001;
-          const MAX_LEARNING_RATE = 0.08;
-          const MOMENTUM_RATE = 0.9;
-          const LEARNING_DECAY = 0.001;
-          const CALIBRATION_RESET_THRESHOLD = 0.49;
-          const COEFF_BOUND_A = 2.5;
-          const COEFF_BOUND_B = 3.5;
-          const CALIB_MIN_SAMPLES = 10;
-          const CALIB_ERROR_WINDOW = 20;
-          const CALIB_MIN_RESET_N = 30;
 
           const PUSHER_MODE=(process.env.PUSHER_MODE||"plan_only").toLowerCase();
 
@@ -339,10 +325,7 @@ jobs:
               }
           }
           async function fetchMyTrades(symbol, startTime) { return await mexcSignedRequest('/api/v3/myTrades', { symbol, startTime, limit: 1000 }); }
-          async function fetchOpenOrders(symbol) {
-            const r = await mexcSignedRequest('/api/v3/openOrders', symbol?{symbol}:{});
-            return Array.isArray(r) ? r : null; // null => unavailable
-          }
+          async function fetchOpenOrders(symbol) { return await mexcSignedRequest('/api/v3/openOrders', symbol?{ symbol }:{}) || []; }
           async function fetchK(sym,interval,limit,startTime,endTime){ const u=api("/api/v3/klines",{symbol:sym,interval,limit,startTime,endTime}); const r=await getJSON(u,10000,2); return Array.isArray(r)?r:null; }
           async function fetchDepth(symbol){ return await getJSON(api("/api/v3/depth",{symbol,limit:DEPTH_LIMIT}), 10000, 2); }
           async function fetchAll24hr(){
@@ -390,11 +373,10 @@ jobs:
             const res={ mismatches:0, zombies:0, details:[] };
             if(!MEXC_API_KEY||!MEXC_SECRET_KEY) return res;
             try{
-              const openAll=await fetchOpenOrders();
-              if (!Array.isArray(openAll)) return res; // don’t mark zombies on unavailable data
-
+              const syms=[...new Set((state.pending||[]).map(p=>p.symbolFull))];
+              const openAll=await fetchOpenOrders(); // array
               const byClient=new Map();
-              for(const o of openAll){ const cid=(o.clientOrderId||o.clientOrderID||"").trim(); if(cid) byClient.set(cid,o); }
+              for(const o of openAll||[]){ const cid=(o.clientOrderId||o.clientOrderID||"").trim(); if(cid) byClient.set(cid,o); }
               for(const p of state.pending||[]){
                 const cid=(p.client_order_id||p.clientOrderId||"").trim();
                 if(!cid) continue;
@@ -605,177 +587,26 @@ jobs:
             }
           }
           
-          const regFromKey = (k) => k?.includes("regime:trend") ? "trend" : k?.includes("regime:meanrevert") ? "meanrevert" : null;
           function learnFromGistRealFills(state){
             const learnable = (state.closed || []).filter(c =>
               c.reconciliation === "exchange_trade_history" &&
               !c.learned &&
-              c.p_raw != null
+              c.p_raw != null &&
+              c.regime
             );
-            
-            if (learnable.length === 0) {
-              log("📚 No new fills to learn from this cycle.");
-              return;
-            }
-
-            log(`📚 Learning from ${learnable.length} real fills...`);
-            
-            let learnedCount = 0;
             for (const c of learnable) {
-              const reg = c.regime || regFromKey(c.calib_key);
-              if (!reg || !c.side) continue;
-
               const outcome = (c.pnl_bps || 0) > 0 ? 1 : 0;
-              const result = outcome ? "WIN" : "LOSS";
-              
-              log(`📊 Trade: ${c.symbolFull || c.symbol} ${c.side} ${result} pnl=${c.pnl_bps}bps p_raw=${c.p_raw?.toFixed(3)}`);
-              
-              try { 
-                updateCalibration(state, c.side, reg, c.p_raw, outcome); 
-              }
-              catch(e){ 
-                log("⚠️  learnFromGistRealFills error:", e?.message||e); 
-              }
-              
+              try { updateCalibration(state, c.side, c.regime, c.p_raw, outcome); }
+              catch(e){ log("learnFromGistRealFills warn", e?.message||e); }
               c.learned = true;
               c.learned_at_ts = Date.now();
-              learnedCount++;
             }
-            
-            log(`✅ Learning complete: ${learnedCount} fills processed.`);
+            if (learnable.length) log(`learnFromGistRealFills: updated from ${learnable.length} real fills.`);
           }
 
-          const getCoeffs = (state, side, regime) => {
-            const key = `${side}_${regime}`;
-            if (!state.calibCoeffs) state.calibCoeffs = {};
-            const def = {
-              a: 0,
-              b: 1,
-              n: 0,
-              momentum_a: 0,
-              momentum_b: 0,
-              recent_errors: []
-            };
-            state.calibCoeffs[key] = { ...def, ...(state.calibCoeffs[key] || {}) };
-            return state.calibCoeffs[key];
-          };
-          function validateCalibration(state) {
-            const report = {};
-            for (const key of Object.keys(state.calibCoeffs || {})) {
-              const coeff = state.calibCoeffs[key];
-              if (coeff.n < CALIB_MIN_SAMPLES) continue;
-
-              const avg_error = mean(coeff.recent_errors || []);
-              const is_healthy =
-                avg_error < 0.4 &&
-                Math.abs(coeff.a) < COEFF_BOUND_A * 0.75 &&
-                Math.abs(coeff.b) < COEFF_BOUND_B * 0.75;
-
-              report[key] = {
-                n: coeff.n,
-                a: coeff.a.toFixed(3),
-                b: coeff.b.toFixed(3),
-                avg_error: avg_error.toFixed(3),
-                status: is_healthy ? "healthy" : "degraded"
-              };
-            }
-
-            if (Object.keys(report).length > 0) {
-              log("Calibration health:", JSON.stringify(report));
-            }
-            return report;
-          }
-          function updateCalibration(state, side, regime, pRaw, outcome) {
-            if (pRaw == null || !isFinite(pRaw)) return;
-
-            const coeff = getCoeffs(state, side, regime);
-
-            // Store before state
-            const before_a = coeff.a;
-            const before_b = coeff.b;
-            const before_n = coeff.n;
-
-            // 1. Adaptive learning rate
-            const lr = ADAPTIVE_LEARNING
-              ? Math.max(
-                  MIN_LEARNING_RATE,
-                  MIN_LEARNING_RATE +
-                    (MAX_LEARNING_RATE - MIN_LEARNING_RATE) / Math.sqrt(1 + coeff.n / 10)
-                )
-              : 0.05;
-
-            // 2. Logit transform for better numerical properties
-            const x = Math.max(-5, Math.min(5, logit(pRaw)));
-
-            // 3. Compute prediction and error
-            const z = coeff.a + coeff.b * x;
-            const pHat = sigmoid(z);
-            const err = outcome - pHat;
-
-            // 4. Update momentum
-            coeff.momentum_a = MOMENTUM_RATE * coeff.momentum_a + lr * err;
-            coeff.momentum_b = MOMENTUM_RATE * coeff.momentum_b + lr * err * x;
-
-            // 5. Clamp momentum to prevent explosion
-            const MOMENTUM_CLAMP = 0.2;
-            coeff.momentum_a = clamp(coeff.momentum_a, -MOMENTUM_CLAMP, MOMENTUM_CLAMP);
-            coeff.momentum_b = clamp(coeff.momentum_b, -MOMENTUM_CLAMP, MOMENTUM_CLAMP);
-
-            // 6. Apply momentum and weight decay to coefficients
-            const a_next = (1 - LEARNING_DECAY) * coeff.a + coeff.momentum_a;
-            const b_next = (1 - LEARNING_DECAY) * coeff.b + coeff.momentum_b;
-
-            // 7. Clamp coefficients to bounds
-            coeff.a = clamp(a_next, -COEFF_BOUND_A, COEFF_BOUND_A);
-            coeff.b = clamp(b_next, -COEFF_BOUND_B, COEFF_BOUND_B);
-
-            // 8. Reset momentum if bounds were hit
-            const hit_bound_a = (a_next !== coeff.a);
-            const hit_bound_b = (b_next !== coeff.b);
-            if (hit_bound_a) coeff.momentum_a = 0;
-            if (hit_bound_b) coeff.momentum_b = 0;
-
-            // 9. Track recent errors for validation
-            if (!coeff.recent_errors) coeff.recent_errors = [];
-            coeff.recent_errors.push(Math.abs(err));
-            if (coeff.recent_errors.length > CALIB_ERROR_WINDOW) {
-              coeff.recent_errors.shift();
-            }
-
-            // 10. Auto-reset if performing worse than random
-            const avg_error = mean(coeff.recent_errors);
-            const will_reset = (avg_error > CALIBRATION_RESET_THRESHOLD && coeff.n > CALIB_MIN_RESET_N);
-
-            // ========== VERBOSE LOGGING ==========
-            log(`📚 LEARN [${side}_${regime}] n=${before_n}→${before_n+1} lr=${lr.toFixed(4)}`);
-            log(`   Input: p_raw=${pRaw.toFixed(3)} outcome=${outcome} | Predicted: p_hat=${pHat.toFixed(3)} error=${err.toFixed(3)}`);
-            log(`   Coeffs: a=${before_a.toFixed(4)}→${coeff.a.toFixed(4)} b=${before_b.toFixed(4)}→${coeff.b.toFixed(4)}`);
-            if (hit_bound_a || hit_bound_b) {
-              log(`   ⚠️  Hit bounds! a=${hit_bound_a} b=${hit_bound_b} (momentum reset)`);
-            }
-            log(`   Momentum: a=${coeff.momentum_a.toFixed(4)} b=${coeff.momentum_b.toFixed(4)}`);
-            log(`   Avg_error=${avg_error.toFixed(3)} (window=${coeff.recent_errors.length})`);
-
-            if (will_reset) {
-              log(`   🔄 AUTO-RESET triggered! avg_error=${avg_error.toFixed(3)} > threshold=${CALIBRATION_RESET_THRESHOLD}`);
-              coeff.a = 0;
-              coeff.b = 1;
-              coeff.momentum_a = 0;
-              coeff.momentum_b = 0;
-              coeff.recent_errors = [];
-              coeff.n = 0; // restart learning
-            } else {
-              coeff.n++;
-            }
-
-            state.calibCoeffs[`${side}_${regime}`] = coeff;
-          }
-          const calibrateP=(state, side, regime, pRaw)=>{
-            const coeff = getCoeffs(state, side, regime);
-            if(pRaw==null || !isFinite(pRaw)) return 0.5; // safe fallback
-            const x = Math.max(-5, Math.min(5, logit(pRaw)));
-            return sigmoid(coeff.a + coeff.b * x);
-          };
+          const getCoeffs=(state, side, regime)=>{ const key=`${side}_${regime}`; if(!state.calibCoeffs) state.calibCoeffs={}; if(!state.calibCoeffs[key]) state.calibCoeffs[key]={a:0,b:1,n:0}; return state.calibCoeffs[key]; }
+          function updateCalibration(state, side, regime, pRaw, outcome){ if(pRaw==null) return; const coeff=getCoeffs(state,side,regime); const lr=0.05; const z=coeff.a+coeff.b*pRaw; const pHat=sigmoid(z); const err=outcome-pHat; coeff.a += lr*err; coeff.b += lr*err*pRaw; coeff.n++; state.calibCoeffs[`${side}_${regime}`]=coeff; }
+          const calibrateP=(state, side, regime, pRaw)=>{ const coeff=getCoeffs(state,side,regime); return sigmoid(coeff.a+coeff.b*pRaw); };
           const calibratorInfo=(state,side,regime)=>{ const coeff=getCoeffs(state,side,regime); return { type:"logistic", n:coeff.n, a:coeff.a, b:coeff.b }; };
           function getSymbolAdj(state, base) {
             const real = state.sym_stats_real?.[base];
@@ -890,7 +721,6 @@ jobs:
           try{
             const { state, persist } = await loadState();
             learnFromGistRealFills(state);
-            const calibHealth = validateCalibration(state);
 
             // Heartbeat existing pending
             const heartbeat = await heartbeatCheck(state);
@@ -1027,14 +857,8 @@ jobs:
                 const depth1pUSD=(d1.asksUSD||0)+(d1.bidsUSD||0);
 
                 const regime=p.mrLocked?"trend":"meanrevert";
-                const coeffL = getCoeffs(state, "long", regime);
-                const coeffS = getCoeffs(state, "short", regime);
-                const nL = Math.max(1, Math.min(500, coeffL.n || 0));
-                const nS = Math.max(1, Math.min(500, coeffS.n || 0));
-                const pLong=calibrateP(state,"long",regime,p.pLong0);
-                const pShort=calibrateP(state,"short",regime,p.pShort0);
-                const pLong_lcb=wilsonLCB(pLong, nL, WILSON_Z);
-                const pShort_lcb=wilsonLCB(pShort, nS, WILSON_Z);
+                const pLong=calibrateP(state,"long",regime,p.pLong0), pShort=calibrateP(state,"short",regime,p.pShort0);
+                const pLong_lcb=wilsonLCB(pLong,80,WILSON_Z), pShort_lcb=wilsonLCB(pShort,80,WILSON_Z);
 
                 const yR=[]; for(let i=1;i<p.c5.length;i++) yR.push(Math.log(p.c5[i]/p.c5[i-1]));
                 const mu5=mean(yR)||0, sig5=Math.max(1e-4,std(yR));
@@ -1111,7 +935,7 @@ jobs:
                   cost_bps:chosen.cost_bps,
                   adx:+(p.adx5||0).toFixed(1), atr_bps:p.atr_bps,
                   regime:chosen.regime, style:chosen.style,
-                  hold_sec:clamp(720,TTL_MIN,TTL_MAX),
+                  hold_sec:clamp(1200,TTL_MIN,TTL_MAX),
                   liq_pct:+(liqPct.get(c.symbol)||0.5).toFixed(3),
                   ret5:(()=>{const r=[];for(let i=1;i<p.c5.length;i++)r.push(Math.log(p.c5[i]/p.c5[i-1]));return r.slice(-36);})(),
                   confidence: Math.round(conf),
@@ -1407,7 +1231,6 @@ jobs:
               tier: selectionTier,
               idea_logs: ideaLogs,
               tf_weights: TF_WEIGHTS,
-              calibration_health: calibHealth,
 
               // keep all code2 fields here so nothing is lost
               extras: {
