@@ -1,4 +1,4 @@
-name: Ideas Pusher (MEXC Ultimate 7.7.7++)
+name: Ideas Pusher (MEXC Ultimate 7.7.7)
 
 on:
   repository_dispatch:
@@ -93,7 +93,7 @@ jobs:
           (async ()=>{
           'use strict';
           const crypto = require('crypto');
-          const MODEL_VERSION=(process.env.MODEL_VERSION||"7.7.7++");
+          const MODEL_VERSION=(process.env.MODEL_VERSION||"6.4");
           const UA = `gh-actions-ideas-mexc-ultimate/${MODEL_VERSION} (+https://github.com/)`;
 
           // ---------------- Utils ----------------
@@ -114,73 +114,6 @@ jobs:
           const softmax=(arr,t=20)=>{ const m=Math.max(...arr,0); const ex=arr.map(x=>Math.exp((x-m)/t)); const s=ex.reduce((a,b)=>a+b,0)||1; return ex.map(x=>x/s); };
           const sigmoid=(z)=>1/(1+Math.exp(-z));
           const logit=(p)=>{ const eps=1e-6; const pp=Math.min(1-eps,Math.max(eps,p)); return Math.log(pp/(1-pp)); };
-
-          // ============================================================
-          // v7.7.7++ ADDITIONS (FIXED): New helper functions
-          // ============================================================
-
-          // 1. MICROPRICE - Volume-weighted mid price
-          const microprice=(bid,ask,qb,qa)=>{ 
-            const d=(qb||1)+(qa||1); 
-            return (ask*qb + bid*qa)/d; 
-          };
-
-          // 2. REGIME-BASED BOOST (No equity dependency)
-          const metaBoostRegime = (state, side, regime, p_cal, mtfAgg) => {
-            // Use MARKET signals, not equity curve ✅
-            const volatilityRegime = mtfAgg.atr_bps > 100 ? "high_vol" : "low_vol";
-            const trendStrength = Math.abs(mtfAgg.rsi - 50);
-            
-            // In high volatility, be MORE conservative (not less)
-            if (volatilityRegime === "high_vol" && trendStrength < 15) {
-              return clamp(p_cal * 0.90, 0.05, 0.95); // Cut 10% in choppy high-vol ✅
-            }
-            
-            // In strong trends with normal vol, be confident
-            if (volatilityRegime === "low_vol" && trendStrength > 20) {
-              return clamp(p_cal * 1.08, 0.05, 0.95); // Boost 8% in clean trends ✅
-            }
-            
-            return p_cal;
-          };
-
-          // 3. SMART BEAR DETECTOR - Returns action based on severity
-          const smartBearHandler=(equity)=>{
-            const recent20=equity.slice(-20).map(e=>e.pnl_bps);
-            if(recent20.length<20) return {isBear:false,action:"normal",severity:"none"};
-            
-            const winRate=recent20.filter(x=>x>0).length/20;
-            const avgPnL=mean(recent20);
-            
-            // Strong bear: WR < 30% or avg < -25 bps (severe)
-            const strongBear=(winRate<0.30)||(avgPnL<-25);
-            
-            // Moderate bear: WR < 35% or avg < -15 bps
-            const moderateBear=(winRate<0.35)||(avgPnL<-15);
-            
-            if(strongBear){
-              return {
-                isBear:true,
-                severity:"strong",
-                action:"shorts_only",
-                metrics:{winRate,avgPnL}
-              };
-            }else if(moderateBear){
-              return {
-                isBear:true,
-                severity:"moderate",
-                action:"shorts_preferred",
-                metrics:{winRate,avgPnL}
-              };
-            }else{
-              return {
-                isBear:false,
-                severity:"none",
-                action:"normal",
-                metrics:{winRate,avgPnL}
-              };
-            }
-          };
           let bmSpare=null;
           const randn=()=>{ if(bmSpare!=null){ const v=bmSpare; bmSpare=null; return v; } let u=0,v=0; while(u===0) u=Math.random(); while(v===0) v=Math.random(); const r=Math.sqrt(-2*Math.log(u)); const th=2*Math.PI*v; bmSpare=r*Math.sin(th); return r*Math.cos(th); };
           const randt=(df)=>{ if(df<=2) df=2.01; const z=randn(); let x2=0; for(let i=0;i<Math.floor(df);i++){ const z2=randn(); x2+=z2*z2; } const frac=df-Math.floor(df); if(frac>0){ const zf=randn(); x2+=frac*zf*zf; } const chi=x2||1e-6; return z / Math.sqrt(chi/df); };
@@ -289,6 +222,7 @@ jobs:
           const slipFromDepth=(depth,mid,side,notionalUSD)=>{ if(!depth?.asks?.length || !depth?.bids?.length || !(mid>0)) return { slip_bps:null, fill_prob:null }; if(side==="long"){ const buy=vwapFillLevels(depth.asks, Math.max(50,notionalUSD)); const slip = buy.px? Math.max(0, Math.round((buy.px - mid)/mid*10000)) : null; const fill = Math.min(1, (buy.filledUSD||0)/Math.max(1,notionalUSD)); return { slip_bps: slip, fill_prob: +fill.toFixed(4) }; }else{ const sell=vwapFillLevels(depth.bids, Math.max(50,notionalUSD)); const slip = sell.px? Math.max(0, Math.round((mid - sell.px)/mid*10000)) : null; const fill = Math.min(1, (sell.filledUSD||0)/Math.max(1,notionalUSD)); return { slip_bps: slip, fill_prob: +fill.toFixed(4) }; } };
           const depthWithinPctUSD=(depth, mid, pct=0.01)=>{ if(!depth?.asks?.length || !depth?.bids?.length || !(mid>0)) return { bidsUSD:0, asksUSD:0 }; const askLim=mid*(1+pct), bidLim=mid*(1-pct); let asksUSD=0, bidsUSD=0; for(const [ps,qs] of depth.asks){ const p=+ps, q=+qs; if(!(p>0&&q>0)) continue; if(p<=askLim) asksUSD += p*q; else break; } for(const [ps,qs] of depth.bids){ const p=+ps, q=+qs; if(!(p>0&&q>0)) continue; if(p>=bidLim) bidsUSD += p*q; else break; } return { bidsUSD, asksUSD }; };
           const confidenceScore=({ p_cal, ev_bps, atr_bps, micro, regime, reliability, riskAdj })=>{ const ev_norm = atr_bps>0? ev_bps/atr_bps : 0; const ev_sig = 1/(1+Math.exp(-ev_norm)); const base = 0.6*p_cal + 0.4*ev_sig; const mult = (micro||1)*(regime||1)*(reliability||1)*(riskAdj||1); return Math.round(100*base*mult); };
+          const microprice=(bid,ask,qb,qa)=>{ const d=(qb||1)+(qa||1); return (ask*qb + bid*qa)/d; };
           const ofiProxy=(d0,d1)=>{ const lev=(side,d)=>d?.[side]?.slice(0,3).map(x=>+x[1]||0)||[]; const sum=a=>a.reduce((x,y)=>x+y,0); if(!d0||!d1) return 0; return (sum(lev("bids",d1))-sum(lev("bids",d0))) - (sum(lev("asks",d1))-sum(lev("asks",d0))); };
           const bookSlope=(depth, mid)=>{ const toPts=(levels)=>{ let cum=0; const pts=[]; for(const [ps,qs] of (levels||[])){ const p=+ps,q=+qs; if(!(p>0&&q>0)) continue; cum+=p*q; const x=Math.log(Math.abs(p-mid)/mid + 1e-6), y=Math.log(cum+1); pts.push([x,y]); if(pts.length>=10) break; } return pts; }; if(!depth?.asks?.length||!depth?.bids?.length||!(mid>0)) return { slope:0, r2:0 }; const pts=toPts(depth.asks).concat(toPts(depth.bids)); if(pts.length<6) return { slope:0, r2:0 }; const xs=pts.map(p=>p[0]), ys=pts.map(p=>p[1]), mx=mean(xs), my=mean(ys); let num=0,den=0,vy=0; for(let i=0;i<xs.length;i++){ const dx=xs[i]-mx, dy=ys[i]-my; num+=dx*dy; den+=dx*dx; vy+=dy*dy; } return { slope: den>1e-9? num/den : 0, r2: den>1e-9 && vy>1e-9? (num*num)/(den*vy):0 }; };
           const reasonBuilder=(ctx)=>{ const out=[]; if((ctx.adx1h||0)>22) out.push({ factor:"ADX_1h", value:+(ctx.adx1h||0).toFixed(1), contribution:+Math.min(12,(ctx.adx1h-22)*0.6).toFixed(1) }); if((ctx.ofi30s||0)>0) out.push({ factor:"OFI_30s", value:+(ctx.ofi30s||0).toFixed(3), contribution:+Math.min(10, ctx.ofi30s*10).toFixed(1) }); if((ctx.spread_bps||0)>8) out.push({ factor:"Spread_bps", value:ctx.spread_bps, contribution:-Math.min(8,(ctx.spread_bps-8)) }); if((ctx.slip_bps_est||0)>4) out.push({ factor:"Slip_est_bps", value:ctx.slip_bps_est, contribution:-Math.min(6,(ctx.slip_bps_est-4)) }); if((ctx.tfAlign||0)>=0.7) out.push({ factor:"TF_alignment", value:+(ctx.tfAlign||0).toFixed(2), contribution:+6.0 }); if((ctx.mtf_rsi||0)>55) out.push({ factor:"MTF_RSI", value:+(ctx.mtf_rsi||0).toFixed(1), contribution:+3.0 }); return out.sort((a,b)=>Math.abs(b.contribution)-Math.abs(a.contribution)).slice(0,5); };
@@ -986,67 +920,20 @@ jobs:
             })();
             const btcR5=(()=>{ const c=(kBTC5||[]).map(x=>+x[4]); const r=[]; for(let i=1;i<c.length;i++) r.push(Math.log(c[i]/c[i-1])); return r.slice(-120); })();
 
-            // ============================================================
-            // v7.7.7++ MODIFIED: Fixed 120 coin universe for stability
-            // ============================================================
-            const FIXED_120_BASES=[
-              "BTC","ETH","BNB","SOL","XRP","ADA","AVAX","DOGE","DOT","MATIC",
-              "LTC","SHIB","TRX","LINK","ATOM","UNI","XLM","ETC","BCH","NEAR",
-              "APT","ARB","OP","LDO","STX","IMX","INJ","VET","FIL","HBAR",
-              "MKR","AAVE","QNT","GRT","ALGO","RUNE","SAND","MANA","XTZ","AXS",
-              "EOS","THETA","FTM","ICP","EGLD","FLOW","XMR","APE","CHZ","KLAY",
-              "GALA","SNX","CRV","ZEC","ENJ","DASH","NEO","COMP","KCS","ZIL",
-              "BAT","WAVES","IOTA","1INCH","LRC","SUSHI","YFI","RVN","CELO","HOT",
-              "OMG","ZRX","ICX","ONT","QTUM","SKL","AR","GMT","JST","RSR",
-              "ONE","AUDIO","ANKR","CKB","MASK","DYDX","BLUR","SUI","SEI","TIA",
-              "JUP","WLD","PEPE","FET","RENDER","AGIX","ORDI","WIF","BONK","FLOKI",
-              "PYTH","JTO","STRK","MEME","DYM","PORTAL","XAI","ALT","PIXEL","AEVO",
-              "NFP","ACE","RDNT","MAV","PENDLE","AI","ID","JOE"
-            ];
+            // Universe build
             const QUOTES=["USDT","USDC","USD"];
             const split=(sym)=>{ for(const q of QUOTES) if(sym.endsWith(q)) return { base:sym.slice(0,-q.length), quote:q }; return null; };
-            const all24Map=new Map(); 
-            for(const t of ALL24||[]){ 
-              const sym=t.symbol||t.s; 
-              if(sym) all24Map.set(sym,t); 
-            }
-            const universe=[];
-            for(const base of FIXED_120_BASES){
-              let found=false;
-              for(const q of QUOTES){
-                const sym=base+q;
-                const t=all24Map.get(sym);
-                if(t){
-                  const qv=+(t.quoteVolume||t.q||0);
-                  if(qv>0){
-                    universe.push({symbol:sym,base,quote:q,qv});
-                    found=true;
-                    break;
-                  }
-                }
-              }
-              if(!found && universe.length<120){
-                universe.push({symbol:base+"USDT",base,quote:"USDT",qv:1000000});
-              }
-            }
-            log("universe (fixed 120)",universe.length);
+            const all=[]; for(const t of ALL24||[]){ const sym=t.symbol||t.s; if(!sym) continue; const sq=split(sym); if(!sq) continue; if(STABLES.has(sq.base)) continue; const qv=+(t.quoteVolume||t.q||0); if(!isFinite(qv)||qv<=0) continue; all.push({ symbol:sym, base:sq.base, quote:sq.quote, qv }); }
+            all.sort((a,b)=>b.qv-a.qv);
+            let dynMinQV=Math.max(MIN_QV_ENV||0,DYN_QV_MIN), filt=all.filter(x=>x.qv>=dynMinQV);
+            while(filt.length<UNIV_TARGET_MIN && dynMinQV>1_000_000){ dynMinQV=Math.max(1_000_000, dynMinQV-DYN_QV_STEP); filt=all.filter(x=>x.qv>=dynMinQV); }
+            const universe=filt.slice(0,UNIV_TARGET_MAX);
+            log("universe", universe.length, "dyn_min_qv", dynMinQV);
 
             // DD/throttle
             const equityStats=(eq)=>{ const day=Date.now()-24*3600*1000; let pnl24=0,cum=0,peak=0,dd=0; for(const e of eq||[]){ if(e.ts_ms>=day) pnl24+=e.pnl_bps; cum+=e.pnl_bps; if(cum>peak) peak=cum; dd=Math.min(dd,cum-peak); } return { pnl24_bps:Math.round(pnl24), peak_dd_bps:Math.round(dd) }; };
             const { pnl24_bps, peak_dd_bps } = equityStats(state.equity);
             const throttle=(pnl24_bps<=DD_24H_LIMIT_BPS) || (peak_dd_bps<=DD_PEAK_LIMIT_BPS);
-
-            // ============================================================
-            // v7.7.7++ NEW: Smart bear market handler (shorts in bears!)
-            // ============================================================
-            const bearStatus=smartBearHandler(state.equity);
-
-            if(bearStatus.isBear){
-              log(`🐻 Bear market detected:`);
-              log(`   Severity: ${bearStatus.severity}`);
-              log(`   Action: ${bearStatus.action}`);
-              log(`   Metrics: WR=${(bearStatus.metrics.winRate*100).toFixed(1)}%, Avg=${bearStatus.metrics.avgPnL.toFixed(1)}bps`);
-            }
 
             // Liquidity rank
             const liqPct=new Map(); for(let i=0;i<universe.length;i++) liqPct.set(universe[i].symbol,(universe.length===1)?1:1-i/(universe.length-1));
@@ -1115,28 +1002,14 @@ jobs:
               try{
                 const p=prelim[idx], c=p.c;
                 const book=bookMap.get(c.symbol)||await getBookTickerCached(c.symbol); if(!book?.bid||!book?.ask) continue;
-
-                // ============================================================
-                // v7.7.7++ MODIFIED: Use microprice instead of simple mid
-                // ============================================================
-                const depthForMicro=await getDepthCached(c.symbol);
-                const bidQ=depthForMicro?.bids?.[0]?.[1]||1;
-                const askQ=depthForMicro?.asks?.[0]?.[1]||1;
-                const mid=microprice(+book.bid,+book.ask,bidQ,askQ);
-                if(!(mid>0)) continue;
+                const mid=(+book.bid + +book.ask)/2; if(!(mid>0)) continue;
 
                 const depthA=await getDepthCached(c.symbol); await sleep(180+Math.floor(Math.random()*120)); const depthB=await fetchDepth(c.symbol);
                 const depth=depthB||depthA; if(!depth?.bids?.length || !depth?.asks?.length) continue;
                 const obi=computeOBI(depth,OBI_TOPN);
                 const ofi30s=ofiProxy(depthA,depthB);
-                // ============================================================
-                // v7.7.7++ NEW: Order Flow Imbalance gate
-                // ============================================================
-                const bidVolTop10=depth.bids.slice(0,10).reduce((s,[p,q])=>s+(+p)*(+q),0);
-                const askVolTop10=depth.asks.slice(0,10).reduce((s,[p,q])=>s+(+p)*(+q),0);
-                const ofi_strong=(bidVolTop10-askVolTop10)/(bidVolTop10+askVolTop10||1);
                 const slopeObj=bookSlope(depth,mid);
-                const bestBid=+depth?.bids?.[0]?.[0], bestAsk=+depth?.asks?.[0]?.[0];
+                const bestBid=+depth?.bids?.[0]?.[0], bestAsk=+depth?.asks?.[0]?.[0], bidQ=+depth?.bids?.[0]?.[1], askQ=+depth?.asks?.[0]?.[1];
                 const mp=(bestBid&&bestAsk&&bidQ&&askQ)?microprice(bestBid,bestAsk,bidQ,askQ):null;
                 const micro_bias_bps=(mp&&mid)?Math.round((mp-mid)/mid*10000):null;
 
@@ -1158,18 +1031,10 @@ jobs:
                 const coeffS = getCoeffs(state, "short", regime);
                 const nL = Math.max(1, Math.min(500, coeffL.n || 0));
                 const nS = Math.max(1, Math.min(500, coeffS.n || 0));
-
-                // ============================================================
-                // v7.7.7++ MODIFIED: Apply regime-based boost after calibration
-                // ============================================================
-                let pLong=calibrateP(state,"long",regime,p.pLong0);
-                pLong=metaBoostRegime(state,"long",regime,pLong, mtfAgg);
-
-                let pShort=calibrateP(state,"short",regime,p.pShort0);
-                pShort=metaBoostRegime(state,"short",regime,pShort, mtfAgg);
-
-                const pLong_lcb=wilsonLCB(pLong,nL,WILSON_Z);
-                const pShort_lcb=wilsonLCB(pShort,nS,WILSON_Z);
+                const pLong=calibrateP(state,"long",regime,p.pLong0);
+                const pShort=calibrateP(state,"short",regime,p.pShort0);
+                const pLong_lcb=wilsonLCB(pLong, nL, WILSON_Z);
+                const pShort_lcb=wilsonLCB(pShort, nS, WILSON_Z);
 
                 const yR=[]; for(let i=1;i<p.c5.length;i++) yR.push(Math.log(p.c5[i]/p.c5[i-1]));
                 const mu5=mean(yR)||0, sig5=Math.max(1e-4,std(yR));
@@ -1205,18 +1070,6 @@ jobs:
                 const chosen=candLong&&candShort?(candLong.exp_lcb_bps>=candShort.exp_lcb_bps?candLong:candShort):(candLong||candShort||null);
                 if(!chosen) continue;
 
-                // ============================================================
-                // v7.7.7++ NEW: Skip if order flow opposes trade direction
-                // ============================================================
-                if(chosen.side==="long" && ofi_strong<-0.20){
-                  log(`Skip ${c.symbol} LONG: strong sell pressure OFI=${ofi_strong.toFixed(2)}`);
-                  continue;
-                }
-                if(chosen.side==="short" && ofi_strong>0.20){
-                  log(`Skip ${c.symbol} SHORT: strong buy pressure OFI=${ofi_strong.toFixed(2)}`);
-                  continue;
-                }
-
                 const microQ=(Math.max(0,1-(p.spreadBps||0)/20))*(1-Math.min(0.6,(chosen.cost_bps-COST_BPS)/20))*(1+clamp(obi,-0.2,0.2));
                 // Soft TF alignment (no hard gate)
                 const gTF = clamp(0.4 + 0.8*tfAlign, 0.2, 1.2);
@@ -1233,26 +1086,19 @@ jobs:
 
                 const gateMult= clamp(gSpread * gCost * gVol * gDepth * gMR * gDir * gBTC * gTF * gEV, 0.2, 1.4);
 
-                const slipEst=chosen.side==="long"?slipL:slipS;
-                const btcCorr=corr((()=>{const r=[];for(let i=1;i<p.c5.length;i++) r.push(Math.log(p.c5[i]/p.c5[i-1])); return r.slice(-120);})(), btcR5);
-                
-                // REPLACE Granger with simple btcCorr threshold:
-                const btcPenalty = (Math.abs(btcCorr) < 0.4 ? 0.94 : 1.0); // Low correlation = penalty
-
-                const reasons=reasonBuilder({adx1h:ind1h?.adx||0,ofi30s,tfAlign,spread_bps:p.spreadBps,slip_bps_est:slipEst,mtf_rsi:mtfAgg.rsi});
-
-                // ============================================================
-                // v7.7.7++ MODIFIED: Use simple correlation penalty
-                // ============================================================
                 const conf = confidenceScore({
                   p_cal: chosen.p_lcb,
                   ev_bps: chosen.ev_bps,
                   atr_bps: p.atr_bps,
                   micro: microQ,
                   regime: regimeQ,
-                  reliability: btcPenalty,
+                  reliability: 1,
                   riskAdj: 1
                 }) * gateMult;
+
+                const slipEst=chosen.side==="long"?slipL:slipS;
+                const btcCorr=corr((()=>{const r=[];for(let i=1;i<p.c5.length;i++) r.push(Math.log(p.c5[i]/p.c5[i-1])); return r.slice(-120);})(), btcR5);
+                const reasons=reasonBuilder({adx1h:ind1h?.adx||0,ofi30s,tfAlign,spread_bps:p.spreadBps,slip_bps_est:slipEst,mtf_rsi:mtfAgg.rsi});
 
                 refined.push({
                   symbol:c.symbol, base:c.base, quote:c.quote, qv:c.qv,
@@ -1301,35 +1147,9 @@ jobs:
 
             const TARGET_TOP_N = Math.max(1, TOP_N || 3);
 
-            // ============================================================
-            // v7.7.7++ MODIFIED: Smart bear market filtering by side
-            // ============================================================
             const selected=[];
             for (const cand of refined) {
               if (selected.length >= TARGET_TOP_N) break;
-              
-              // Bear market side filter
-              if(bearStatus.action==="shorts_only"){
-                if(cand.side==="long"){
-                  log(`Skip ${cand.symbol} LONG: strong bear market (shorts only mode)`);
-                  continue;
-                }
-                // Boost short confidence in strong bear
-                cand.confidence=Math.round(cand.confidence*1.15);
-              }
-              
-              if(bearStatus.action==="shorts_preferred"){
-                if(cand.side==="long" && cand.confidence<65){
-                  log(`Skip ${cand.symbol} LONG: moderate bear (conf ${cand.confidence}<65)`);
-                  continue;
-                }
-                // Moderate boost for shorts
-                if(cand.side==="short"){
-                  cand.confidence=Math.round(cand.confidence*1.08);
-                }
-              }
-              
-              // Correlation filter
               let ok=true;
               for (const s of selected) {
                 const r=corr(cand.ret5||[], s.ret5||[]);
@@ -1358,23 +1178,15 @@ jobs:
               const mid = (bk?.bid && bk?.ask) ? ((+bk.bid + +bk.ask)/2) : null;
 
               // compute abs exits (also needed for v1 compat)
-              // ============================================================
-              // v7.7.7++ MODIFIED: Almgren-Chriss entry with market impact
-              // ============================================================
               let entry_limit = null, tp_abs = null, sl_abs = null;
               if (mid != null) {
                 const slF = x.sl_bps/10000, tpF = x.tp_bps/10000;
-                const spreadBps=x.spread_bps||10;
-                const impactBps=Math.min(spreadBps*0.3,8); // Market impact model
-                
                 if (x.side === "long") {
-                  // Enter below mid to reduce cost
-                  entry_limit = mid * (1 - (slF*0.4 + impactBps/10000));
+                  entry_limit = mid * (1 - Math.max(0.001, slF*0.5));
                   tp_abs = entry_limit * (1 + tpF);
                   sl_abs = entry_limit * (1 - slF);
                 } else {
-                  // Enter above mid
-                  entry_limit = mid * (1 + (slF*0.4 + impactBps/10000));
+                  entry_limit = mid * (1 + slF);
                   tp_abs = entry_limit * (1 - tpF);
                   sl_abs = entry_limit * (1 + slF);
                 }
@@ -1595,7 +1407,6 @@ jobs:
               tier: selectionTier,
               idea_logs: ideaLogs,
               tf_weights: TF_WEIGHTS,
-              bear_status: bearStatus,
               calibration_health: calibHealth,
 
               // keep all code2 fields here so nothing is lost
