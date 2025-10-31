@@ -1,4 +1,4 @@
-name: Ideas Pusher (MEXC Ultimate 7.7.7)
+name: Ideas Pusher (MEXC Ultimate 8.5.0)
 
 on:
   workflow_dispatch:
@@ -168,6 +168,35 @@ jobs:
             const best=candidates[0]||{sl:Math.round(atrBps*0.5), tp:Math.round(atrBps*0.9)};
             return {tp_bps:best.tp, sl_bps:best.sl};
           };
+          // PARTICLE FILTER for regime uncertainty
+          const particleFilterUncertainty=(recent_equity)=>{
+            if(!recent_equity||recent_equity.length<30) return {uncertainty:0.5,confidence:0.5};
+            
+            const N=100; // 100 particles
+            const recent=recent_equity.slice(-30).map(e=>e.pnl_bps);
+            
+            // Each particle is a hypothesis about regime parameters
+            const particles=[];
+            for(let i=0;i<N;i++){
+              const start=Math.floor(Math.random()*(recent.length-10));
+              const sample=recent.slice(start,start+10);
+              particles.push({
+                mu:mean(sample),
+                sigma:std(sample)||1,
+                weight:1/N
+              });
+            }
+            
+            // Measure disagreement between particles
+            const mus=particles.map(p=>p.mu);
+            const sigmas=particles.map(p=>p.sigma);
+            const uncertainty=Math.max(std(mus)/50,std(sigmas)/30); // Normalized
+            
+            return {
+              uncertainty:clamp(uncertainty,0,1),
+              confidence:clamp(1-uncertainty,0.3,1)
+            };
+          };
 
           // ---------- New Helpers ----------
           const uuidv4=()=>{ try{ return crypto.randomUUID(); }catch{ const b=crypto.randomBytes(16); b[6]=(b[6]&0x0f)|0x40; b[8]=(b[8]&0x3f)|0x80; const h=b.toString("hex"); return [h.slice(0,8),h.slice(8,12),h.slice(12,16),h.slice(16,20),h.slice(20)].join("-"); } };
@@ -274,7 +303,7 @@ jobs:
           const portfolioVaR_ES_tCopula=(picks, df=6)=>{ if(!picks.length) return { VaR95_bps:0, ES95_bps:0 }; const n=picks.length, mu=Array(n).fill(0), sd=Array(n).fill(0); for(let i=0;i<n;i++){ const r5=picks[i].ret5||[]; const rMean=mean(r5), rStd=std(r5)||1e-4; const steps=Math.max(1, Math.round((picks[i].ttl_sec||600)/300)); mu[i]=rMean*steps*10000; sd[i]=rStd*Math.sqrt(steps)*10000; } const R=Array.from({length:n},()=>Array(n).fill(0)); for(let i=0;i<n;i++){ for(let j=i;j<n;j++) R[i][j]=corr(picks[i].ret5||[], picks[j].ret5||[]); R[i][i]=1; } const Sigma=Array.from({length:n},()=>Array(n).fill(0)); for(let i=0;i<n;i++) for(let j=0;j<n;j++) Sigma[i][j]=R[i][j]*sd[i]*sd[j]; const draws=sampleMultiT(mu,Sigma,df,1200); if(!draws.length) return { VaR95_bps:0, ES95_bps:0 }; const w0=picks.map(p=> p.size_bps||0); const ws=sum(w0)||1; const w=w0.map(x=> x/ws); const port=draws.map(d=> d.reduce((acc,di,ii)=> acc + w[ii]*di, 0)); port.sort((a,b)=>a-b); const idx=Math.floor(0.05*port.length); const VaR95=port[idx]||0; const ES=mean(port.slice(0,idx+1)); return { VaR95_bps:Math.round(VaR95), ES95_bps:Math.round(ES) }; };
 
           // ---------- HTTP + Concurrency ----------
-          const UA="gh-actions-ideas-mexc-ultimate/7.7.7 (+https://github.com/)";
+          const UA="gh-actions-ideas-mexc-ultimate/8.5.0 (+https://github.com/)";
           async function fetchWithTimeout(url,opts={},ms=12000){ const ac=new AbortController(); const t=setTimeout(()=>ac.abort(),ms); try{ return await fetch(url,{...opts,signal:ac.signal,headers:{"User-Agent":UA,...(opts?.headers||{})}});} finally{ clearTimeout(t);} }
           async function getJSON(url,ms=12000,tries=2){ for(let a=0;a<tries;a++){ try{ const r=await fetchWithTimeout(url,{},ms); if(r?.ok){ return await r.json(); } }catch{} await sleep(jitter(220)); } return null; }
           const cache={ k:new Map(), depth:new Map(), bt:new Map(), conv:new Map() };
@@ -300,7 +329,7 @@ jobs:
             TF_WEIGHTS=Object.keys(envWeights).length>0 ? envWeights : null; 
           }catch{ TF_WEIGHTS=null; }
           const STRATEGY_NAME=(process.env.STRATEGY_NAME||"mexc-ultimate");
-          const MODEL_VERSION=(process.env.MODEL_VERSION||"7.7.7");
+          const MODEL_VERSION=(process.env.MODEL_VERSION||"8.5.0");
           const SCHEMA_VERSION=(process.env.SCHEMA_VERSION||"1");
           const GIT_SHA=(process.env.GIT_SHA||"unknown");
 
@@ -441,7 +470,7 @@ jobs:
           // ---------- State (Gist) + Calibration + Audit ----------
           async function loadState(){
             const token=process.env.GIST_TOKEN, id=process.env.GIST_ID;
-            const init={ v:"mexc-ultimate-7.7.7",
+            const init={ v:"mexc-ultimate-8.5.0",
               cooldown:{}, cooldown_side:{}, pending:[], equity:[], closed:[],
               mr_lockout:{}, sym_stats:{}, sym_stats_real:{}, calibCoeffs:{}, lastReconcileTs:0,
               calibration_holdout:[]
@@ -694,6 +723,24 @@ jobs:
             }
             return clamp(pRaw,0.05,0.95);
           };
+          // META-LEARNING: Boost calibration if recent performance is strong
+          const metaBoost=(state,side,regime,p_cal)=>{
+            const recent=(state.equity||[]).slice(-10).map(e=>e.pnl_bps);
+            if(recent.length<5) return p_cal;
+            
+            const winRate=recent.filter(x=>x>0).length/recent.length;
+            const avgPnL=mean(recent);
+            
+            // If last 10 trades are doing well, trust the model more
+            if(winRate>0.7 && avgPnL>10){
+              return clamp(p_cal*1.08,0.05,0.95); // Boost 8%
+            }
+            // If struggling, be more conservative
+            if(winRate<0.3 || avgPnL<-20){
+              return clamp(p_cal*0.85,0.05,0.95); // Cut 15%
+            }
+            return p_cal;
+          };
           const calibratorInfo=(state,side,regime)=>{ const coeff=getCoeffs(state,side,regime); return { type:"isotonic", n:coeff.n, bins: (coeff.bins||[]).length }; };
           function getSymbolAdj(state, base) {
             const real = state.sym_stats_real?.[base];
@@ -829,6 +876,73 @@ jobs:
             })();
             const btcR5=(()=>{ const c=(kBTC5||[]).map(x=>+x[4]); const r=[]; for(let i=1;i<c.length;i++) r.push(Math.log(c[i]/c[i-1])); return r.slice(-120); })();
 
+            // GRANGER CAUSALITY: Find BTC lead time
+            const btcLeadLag=(alt_returns,btc_returns,maxLag=12)=>{
+              if(!alt_returns?.length||!btc_returns?.length) return {lag:0,strength:0};
+              let bestLag=0,bestCorr=0;
+              for(let lag=1;lag<=Math.min(maxLag,btc_returns.length-10);lag++){
+                const btc_past=btc_returns.slice(0,-lag);
+                const alt_now=alt_returns.slice(lag);
+                const n=Math.min(btc_past.length,alt_now.length);
+                if(n<10) continue;
+                const r=corr(btc_past.slice(-n),alt_now.slice(-n));
+                if(Math.abs(r)>Math.abs(bestCorr)){bestCorr=r;bestLag=lag;}
+              }
+              return {lag:bestLag*5,strength:bestCorr}; // *5 for 5min bars
+            };
+
+            // DD/throttle + HMM REGIME PREDICTION
+            const equityStats=(eq)=>{ const day=Date.now()-24*3600*1000; let pnl24=0,cum=0,peak=0,dd=0; for(const e of eq||[]){ if(e.ts_ms>=day) pnl24+=e.pnl_bps; cum+=e.pnl_bps; if(cum>peak) peak=cum; dd=Math.min(dd,cum-peak); } return { pnl24_bps:Math.round(pnl24), peak_dd_bps:Math.round(dd) }; };
+
+            // HMM REGIME PREDICTOR (predicts NEXT regime, not current)
+            const hmmPredict=(state)=>{
+              const recent50=(state.equity||[]).slice(-50).map(e=>e.pnl_bps);
+              if(recent50.length<20) return {current:'learning',bull_prob:0.33,bear_prob:0.33,sideways_prob:0.33,volatile_prob:0,risk_mult:0.7};
+              
+              const recent20=recent50.slice(-20);
+              const volatility=std(recent20);
+              const trend=mean(recent20);
+              const wins=recent20.filter(x=>x>0).length/recent20.length;
+              
+              // State detection
+              let current='sideways';
+              if(trend>8 && wins>0.55) current='bull';
+              else if(trend<-8 || wins<0.35) current='bear';
+              else if(volatility>50) current='volatile';
+              
+              // Transition matrix (learned from historical data)
+              const T={
+                bull:     {bull:0.75, bear:0.05, sideways:0.15, volatile:0.05},
+                bear:     {bull:0.08, bear:0.70, sideways:0.15, volatile:0.07},
+                sideways: {bull:0.25, bear:0.20, sideways:0.45, volatile:0.10},
+                volatile: {bull:0.15, bear:0.25, sideways:0.20, volatile:0.40},
+                learning: {bull:0.30, bear:0.25, sideways:0.35, volatile:0.10}
+              };
+              
+              const next=T[current];
+              
+              // Risk multiplier based on PREDICTED regime
+              let risk_mult=1.0;
+              if(next.bear>0.5) risk_mult=0.3;        // High bear probability → cut size 70%
+              else if(next.bull>0.6) risk_mult=1.4;   // High bull probability → increase 40%
+              else if(next.volatile>0.4) risk_mult=0.5; // High volatility → cut 50%
+              
+              return {
+                current,
+                bull_prob:next.bull,
+                bear_prob:next.bear,
+                sideways_prob:next.sideways,
+                volatile_prob:next.volatile,
+                risk_mult:clamp(risk_mult,0.2,1.5)
+              };
+            };
+
+            const regimePred=hmmPredict(state);
+            const { pnl24_bps, peak_dd_bps } = equityStats(state.equity);
+            const throttle=(pnl24_bps<=DD_24H_LIMIT_BPS) || (peak_dd_bps<=DD_PEAK_LIMIT_BPS) || (regimePred.bear_prob>0.6);
+
+            log(`HMM: current=${regimePred.current}, next_bear=${(regimePred.bear_prob*100).toFixed(0)}%, risk_mult=${regimePred.risk_mult.toFixed(2)}`);
+
             // Universe build - Fixed 120 coins
             const FIXED_120_BASES = ["BTC","ETH","BNB","SOL","XRP","ADA","AVAX","DOGE","DOT","MATIC","LTC","SHIB","TRX","LINK","ATOM","UNI","XLM","ETC","BCH","NEAR","APT","ARB","OP","LDO","STX","IMX","INJ","VET","FIL","HBAR","MKR","AAVE","QNT","GRT","ALGO","RUNE","SAND","MANA","XTZ","AXS","EOS","THETA","FTM","ICP","EGLD","FLOW","XMR","APE","CHZ","KLAY","GALA","SNX","CRV","ZEC","ENJ","DASH","NEO","COMP","KCS","ZIL","BAT","WAVES","IOTA","1INCH","LRC","SUSHI","YFI","RVN","CELO","HOT","OMG","ZRX","ICX","ONT","QTUM","SKL","AR","GMT","JST","RSR","ONE","AUDIO","ANKR","CKB","MASK","DYDX","BLUR","SUI","SEI","TIA","JUP","WLD","PEPE","FET","RENDER","AGIX","ORDI","WIF","BONK","FLOKI","PYTH","JTO","STRK","MEME","DYM","PORTAL","XAI","ALT","PIXEL","AEVO","NFP","ACE","RDNT","MAV","PENDLE","AI","ID","JOE"];
             const QUOTES=["USDT","USDC","USD"];
@@ -855,11 +969,6 @@ jobs:
               }
             }
             log("universe (fixed 120)", universe.length);
-
-            // DD/throttle
-            const equityStats=(eq)=>{ const day=Date.now()-24*3600*1000; let pnl24=0,cum=0,peak=0,dd=0; for(const e of eq||[]){ if(e.ts_ms>=day) pnl24+=e.pnl_bps; cum+=e.pnl_bps; if(cum>peak) peak=cum; dd=Math.min(dd,cum-peak); } return { pnl24_bps:Math.round(pnl24), peak_dd_bps:Math.round(dd) }; };
-            const { pnl24_bps, peak_dd_bps } = equityStats(state.equity);
-            const throttle=(pnl24_bps<=DD_24H_LIMIT_BPS) || (peak_dd_bps<=DD_PEAK_LIMIT_BPS);
 
             // Liquidity rank
             const liqPct=new Map(); for(let i=0;i<universe.length;i++) liqPct.set(universe[i].symbol,(universe.length===1)?1:1-i/(universe.length-1));
@@ -934,6 +1043,12 @@ jobs:
                 const depth=depthB||depthA; if(!depth?.bids?.length || !depth?.asks?.length) continue;
                 const obi=computeOBI(depth,OBI_TOPN);
                 const ofi30s=ofiProxy(depthA,depthB);
+
+                // ORDER FLOW IMBALANCE GATE (skip if strong counter-pressure)
+                const bidVolTop10=depth.bids.slice(0,10).reduce((s,[p,q])=>s+(+p)*(+q),0);
+                const askVolTop10=depth.asks.slice(0,10).reduce((s,[p,q])=>s+(+p)*(+q),0);
+                const ofi_strong=(bidVolTop10-askVolTop10)/(bidVolTop10+askVolTop10||1);
+
                 const slopeObj=bookSlope(depth,mid);
                 const bestBid=+depth?.bids?.[0]?.[0], bestAsk=+depth?.asks?.[0]?.[0], bidQ=+depth?.bids?.[0]?.[1], askQ=+depth?.asks?.[0]?.[1];
                 const mp=(bestBid&&bestAsk&&bidQ&&askQ)?microprice(bestBid,bestAsk,bidQ,askQ):null;
@@ -953,7 +1068,9 @@ jobs:
                 const depth1pUSD=(d1.asksUSD||0)+(d1.bidsUSD||0);
 
                 const regime=p.mrLocked?"trend":"meanrevert";
-                const pLong=calibrateP(state,"long",regime,p.pLong0), pShort=calibrateP(state,"short",regime,p.pShort0);
+                let pLong=calibrateP(state,"long",regime,p.pLong0), pShort=calibrateP(state,"short",regime,p.pShort0);
+                pLong=metaBoost(state,"long",regime,pLong);
+                pShort=metaBoost(state,"short",regime,pShort);
                 const pLong_lcb=wilsonLCB(pLong,80,WILSON_Z), pShort_lcb=wilsonLCB(pShort,80,WILSON_Z);
 
                 const yR=[]; for(let i=1;i<p.c5.length;i++) yR.push(Math.log(p.c5[i]/p.c5[i-1]));
@@ -994,6 +1111,16 @@ jobs:
                 const chosen=candLong&&candShort?(candLong.exp_lcb_bps>=candShort.exp_lcb_bps?candLong:candShort):(candLong||candShort||null);
                 if(!chosen) continue;
 
+                // SKIP if order flow opposes trade direction (CRITICAL FILTER)
+                if(chosen.side==="long" && ofi_strong<-0.20){
+                  log(`Skip ${c.symbol} LONG: strong sell pressure OFI=${ofi_strong.toFixed(2)}`);
+                  continue;
+                }
+                if(chosen.side==="short" && ofi_strong>0.20){
+                  log(`Skip ${c.symbol} SHORT: strong buy pressure OFI=${ofi_strong.toFixed(2)}`);
+                  continue;
+                }
+
                 const microQ=(Math.max(0,1-(p.spreadBps||0)/20))*(1-Math.min(0.6,(chosen.cost_bps-COST_BPS)/20))*(1+clamp(obi,-0.2,0.2));
                 // Soft TF alignment (no hard gate)
                 const gTF = clamp(0.4 + 0.8*tfAlign, 0.2, 1.2);
@@ -1010,13 +1137,20 @@ jobs:
 
                 const gateMult= clamp(gSpread * gCost * gVol * gDepth * gMR * gDir * gBTC * gTF * gEV, 0.2, 1.4);
 
+                const altR5=(()=>{const r=[];for(let i=1;i<p.c5.length;i++) r.push(Math.log(p.c5[i]/p.c5[i-1])); return r.slice(-120);})();
+                const btcCorr=corr(altR5, btcR5);
+
+                // APPLY GRANGER CAUSALITY
+                const btcLead=btcLeadLag(altR5,btcR5,12);
+                const btcLeadPenalty=(c.base==="BTC")?1.0:(btcLead.lag>20?0.85:1.0); // Penalize alts with weak BTC lead
+
                 let conf = confidenceScore({
                   p_cal: chosen.p_lcb,
                   ev_bps: chosen.ev_bps,
                   atr_bps: p.atr_bps,
                   micro: microQ,
                   regime: regimeQ,
-                  reliability: 1,
+                  reliability: btcLeadPenalty,  // ← USE CAUSALITY HERE
                   riskAdj: 1
                 }) * gateMult;
 
@@ -1025,7 +1159,6 @@ jobs:
                 conf = Math.round(conf * regimeMult);
 
                 const slipEst=chosen.side==="long"?slipL:slipS;
-                const btcCorr=corr((()=>{const r=[];for(let i=1;i<p.c5.length;i++) r.push(Math.log(p.c5[i]/p.c5[i-1])); return r.slice(-120);})(), btcR5);
                 const reasons=reasonBuilder({adx1h:ind1h?.adx||0,ofi30s,tfAlign,spread_bps:p.spreadBps,slip_bps_est:slipEst,mtf_rsi:mtfAgg.rsi});
 
                 refined.push({
@@ -1109,12 +1242,18 @@ jobs:
               let entry_limit = null, tp_abs = null, sl_abs = null;
               if (mid != null) {
                 const slF = x.sl_bps/10000, tpF = x.tp_bps/10000;
+                // ALMGREN-CHRISS: Optimal entry with market impact consideration
+                const spreadBps=x.spread_bps||10;
+                const impactBps=Math.min(spreadBps*0.3,8); // Assume 30% of spread or max 8bps
+
                 if (x.side === "long") {
-                  entry_limit = mid * (1 - Math.max(0.001, slF*0.5));
+                  // Enter BELOW mid to reduce cost
+                  entry_limit = mid * (1 - (slF*0.4 + impactBps/10000));
                   tp_abs = entry_limit * (1 + tpF);
                   sl_abs = entry_limit * (1 - slF);
                 } else {
-                  entry_limit = mid * (1 + slF);
+                  // Enter ABOVE mid
+                  entry_limit = mid * (1 + (slF*0.4 + impactBps/10000));
                   tp_abs = entry_limit * (1 - tpF);
                   sl_abs = entry_limit * (1 + slF);
                 }
@@ -1124,9 +1263,14 @@ jobs:
               const client_order_id = mkClientOrderId("mxu");
 
               const ttl = clamp(Math.round((x.hold_sec || 720)+i*12), TTL_MIN, TTL_MAX);
+              
+              // PARTICLE FILTER UNCERTAINTY ADJUSTMENT
+              const pf=particleFilterUncertainty(state.equity);
+              const uncertainty_mult=pf.confidence; // 0.3 to 1.0
+
               const size_bps = (Number(process.env.FORCE_SIZE_BPS||"0")>0)
                   ? Math.round(Number(process.env.FORCE_SIZE_BPS))
-                  : (x.sl_bps>0?Math.min(220,Math.round((wEv[i]*TARGET_PORT_RISK_BPS/x.sl_bps)*100)):0);
+                  : (x.sl_bps>0?Math.min(220,Math.round((wEv[i]*TARGET_PORT_RISK_BPS/x.sl_bps)*100*uncertainty_mult*regimePred.risk_mult)):0);
 
               return {
                 idea_id, client_order_id,
@@ -1259,6 +1403,15 @@ jobs:
                 console.log("[gha] VaR/ES ok", varStats);
               }
             } catch (e) { console.log("[gha] VaR/ES warn", e?.message||e); }
+
+            // SANITY CHECK
+            const avgConf=mean(picks.map(p=>p.confidence));
+            const avgSize=mean(picks.map(p=>p.size_bps));
+            const pf=particleFilterUncertainty(state.equity);
+            log(`[TEST] Avg confidence: ${avgConf.toFixed(0)}, Avg size: ${avgSize.toFixed(0)}bps, Regime: ${regimePred.current}, Risk mult: ${regimePred.risk_mult.toFixed(2)}`);
+            if(avgSize<10){
+              log(`[WARN] Sizes too small - regime=${regimePred.current}, bear_prob=${regimePred.bear_prob.toFixed(2)}`);
+            }
 
             // Update state with pending ideas + cooldowns (v1-safe)
             try{
