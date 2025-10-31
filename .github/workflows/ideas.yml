@@ -114,9 +114,9 @@ jobs:
           const softmax=(arr,t=20)=>{ const m=Math.max(...arr,0); const ex=arr.map(x=>Math.exp((x-m)/t)); const s=ex.reduce((a,b)=>a+b,0)||1; return ex.map(x=>x/s); };
           const sigmoid=(z)=>1/(1+Math.exp(-z));
           const logit=(p)=>{ const eps=1e-6; const pp=Math.min(1-eps,Math.max(eps,p)); return Math.log(pp/(1-pp)); };
-          
+
           // ============================================================
-          // v7.7.7++ ADDITIONS: New helper functions
+          // v7.7.7++ ADDITIONS (FIXED): New helper functions
           // ============================================================
 
           // 1. MICROPRICE - Volume-weighted mid price
@@ -125,7 +125,7 @@ jobs:
             return (ask*qb + bid*qa)/d; 
           };
 
-          // 2. META-LEARNING BOOST - Regime-based (no equity feedback loop)
+          // 2. REGIME-BASED BOOST (No equity dependency)
           const metaBoostRegime = (state, side, regime, p_cal, mtfAgg) => {
             // Use MARKET signals, not equity curve ✅
             const volatilityRegime = mtfAgg.atr_bps > 100 ? "high_vol" : "low_vol";
@@ -1129,7 +1129,6 @@ jobs:
                 const depth=depthB||depthA; if(!depth?.bids?.length || !depth?.asks?.length) continue;
                 const obi=computeOBI(depth,OBI_TOPN);
                 const ofi30s=ofiProxy(depthA,depthB);
-
                 // ============================================================
                 // v7.7.7++ NEW: Order Flow Imbalance gate
                 // ============================================================
@@ -1161,7 +1160,7 @@ jobs:
                 const nS = Math.max(1, Math.min(500, coeffS.n || 0));
 
                 // ============================================================
-                // v7.7.7++ MODIFIED: Apply regime-based meta-learning boost
+                // v7.7.7++ MODIFIED: Apply regime-based boost after calibration
                 // ============================================================
                 let pLong=calibrateP(state,"long",regime,p.pLong0);
                 pLong=metaBoostRegime(state,"long",regime,pLong, mtfAgg);
@@ -1236,13 +1235,15 @@ jobs:
 
                 const slipEst=chosen.side==="long"?slipL:slipS;
                 const btcCorr=corr((()=>{const r=[];for(let i=1;i<p.c5.length;i++) r.push(Math.log(p.c5[i]/p.c5[i-1])); return r.slice(-120);})(), btcR5);
+                
+                // REPLACE Granger with simple btcCorr threshold:
+                const btcPenalty = (Math.abs(btcCorr) < 0.4 ? 0.94 : 1.0); // Low correlation = penalty
+
                 const reasons=reasonBuilder({adx1h:ind1h?.adx||0,ofi30s,tfAlign,spread_bps:p.spreadBps,slip_bps_est:slipEst,mtf_rsi:mtfAgg.rsi});
 
                 // ============================================================
-                // v7.7.7++ MODIFIED: Replace Granger with simple btcCorr penalty
+                // v7.7.7++ MODIFIED: Use simple correlation penalty
                 // ============================================================
-                const btcPenalty = (Math.abs(btcCorr) < 0.4 ? 0.94 : 1.0); // Low correlation = penalty
-
                 const conf = confidenceScore({
                   p_cal: chosen.p_lcb,
                   ev_bps: chosen.ev_bps,
