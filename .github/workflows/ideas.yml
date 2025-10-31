@@ -125,41 +125,26 @@ jobs:
             return (ask*qb + bid*qa)/d; 
           };
 
-          // 2. META-LEARNING BOOST - Adapts to recent performance
-          const metaBoost=(state,side,regime,p_cal)=>{
-            const recent=(state.equity||[]).slice(-10).map(e=>e.pnl_bps);
-            if(recent.length<5) return p_cal;
+          // 2. META-LEARNING BOOST - Regime-based (no equity feedback loop)
+          const metaBoostRegime = (state, side, regime, p_cal, mtfAgg) => {
+            // Use MARKET signals, not equity curve ✅
+            const volatilityRegime = mtfAgg.atr_bps > 100 ? "high_vol" : "low_vol";
+            const trendStrength = Math.abs(mtfAgg.rsi - 50);
             
-            const winRate=recent.filter(x=>x>0).length/recent.length;
-            const avgPnL=mean(recent);
+            // In high volatility, be MORE conservative (not less)
+            if (volatilityRegime === "high_vol" && trendStrength < 15) {
+              return clamp(p_cal * 0.90, 0.05, 0.95); // Cut 10% in choppy high-vol ✅
+            }
             
-            // If last 10 trades doing well, trust model more
-            if(winRate>0.7 && avgPnL>10){
-              return clamp(p_cal*1.08,0.05,0.95); // Boost 8%
+            // In strong trends with normal vol, be confident
+            if (volatilityRegime === "low_vol" && trendStrength > 20) {
+              return clamp(p_cal * 1.08, 0.05, 0.95); // Boost 8% in clean trends ✅
             }
-            // If struggling, be conservative
-            if(winRate<0.3 || avgPnL<-20){
-              return clamp(p_cal*0.85,0.05,0.95); // Cut 15%
-            }
+            
             return p_cal;
           };
 
-          // 3. GRANGER CAUSALITY - Finds BTC lead time for altcoins
-          const btcLeadLag=(alt_returns,btc_returns,maxLag=12)=>{
-            if(!alt_returns?.length||!btc_returns?.length) return {lag:0,strength:0};
-            let bestLag=0,bestCorr=0;
-            for(let lag=1;lag<=Math.min(maxLag,btc_returns.length-10);lag++){
-              const btc_past=btc_returns.slice(0,-lag);
-              const alt_now=alt_returns.slice(lag);
-              const n=Math.min(btc_past.length,alt_now.length);
-              if(n<10) continue;
-              const r=corr(btc_past.slice(-n),alt_now.slice(-n));
-              if(Math.abs(r)>Math.abs(bestCorr)){bestCorr=r;bestLag=lag;}
-            }
-            return {lag:bestLag*5,strength:bestCorr}; // *5 for 5min bars
-          };
-
-          // 4. SMART BEAR DETECTOR - Returns action based on severity
+          // 3. SMART BEAR DETECTOR - Returns action based on severity
           const smartBearHandler=(equity)=>{
             const recent20=equity.slice(-20).map(e=>e.pnl_bps);
             if(recent20.length<20) return {isBear:false,action:"normal",severity:"none"};
@@ -1176,13 +1161,13 @@ jobs:
                 const nS = Math.max(1, Math.min(500, coeffS.n || 0));
 
                 // ============================================================
-                // v7.7.7++ MODIFIED: Apply meta-learning boost after calibration
+                // v7.7.7++ MODIFIED: Apply regime-based meta-learning boost
                 // ============================================================
                 let pLong=calibrateP(state,"long",regime,p.pLong0);
-                pLong=metaBoost(state,"long",regime,pLong);
+                pLong=metaBoostRegime(state,"long",regime,pLong, mtfAgg);
 
                 let pShort=calibrateP(state,"short",regime,p.pShort0);
-                pShort=metaBoost(state,"short",regime,pShort);
+                pShort=metaBoostRegime(state,"short",regime,pShort, mtfAgg);
 
                 const pLong_lcb=wilsonLCB(pLong,nL,WILSON_Z);
                 const pShort_lcb=wilsonLCB(pShort,nS,WILSON_Z);
@@ -1251,26 +1236,20 @@ jobs:
 
                 const slipEst=chosen.side==="long"?slipL:slipS;
                 const btcCorr=corr((()=>{const r=[];for(let i=1;i<p.c5.length;i++) r.push(Math.log(p.c5[i]/p.c5[i-1])); return r.slice(-120);})(), btcR5);
-
-                // ============================================================
-                // v7.7.7++ NEW: Granger causality for BTC lead time
-                // ============================================================
-                const altR5=(()=>{const r=[];for(let i=1;i<p.c5.length;i++) r.push(Math.log(p.c5[i]/p.c5[i-1])); return r.slice(-120);})();
-                const btcLead=btcLeadLag(altR5,btcR5,12);
-                const btcLeadPenalty=(c.base==="BTC")?1.0:(btcLead.lag>20?0.92:1.0);
-
                 const reasons=reasonBuilder({adx1h:ind1h?.adx||0,ofi30s,tfAlign,spread_bps:p.spreadBps,slip_bps_est:slipEst,mtf_rsi:mtfAgg.rsi});
 
                 // ============================================================
-                // v7.7.7++ MODIFIED: Use Granger penalty in reliability
+                // v7.7.7++ MODIFIED: Replace Granger with simple btcCorr penalty
                 // ============================================================
+                const btcPenalty = (Math.abs(btcCorr) < 0.4 ? 0.94 : 1.0); // Low correlation = penalty
+
                 const conf = confidenceScore({
                   p_cal: chosen.p_lcb,
                   ev_bps: chosen.ev_bps,
                   atr_bps: p.atr_bps,
                   micro: microQ,
                   regime: regimeQ,
-                  reliability: btcLeadPenalty,
+                  reliability: btcPenalty,
                   riskAdj: 1
                 }) * gateMult;
 
