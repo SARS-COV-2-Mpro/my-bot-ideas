@@ -1,7 +1,8 @@
-name: Ideas Pusher (MEXC Ultimate 7.7.7 - FIXED)
+name: Ideas Pusher (MEXC Ultimate 7.7.7 - FIXED+PRO)
 
 on:
-  
+  schedule:
+    - cron: "0 */3 * * *"
   repository_dispatch:
     types: [run_B]
   workflow_dispatch: {}
@@ -81,6 +82,9 @@ jobs:
       ENABLE_OFI_GATE: ${{ vars.ENABLE_OFI_GATE }}
       OFI_THRESHOLD: ${{ vars.OFI_THRESHOLD }}
       BEAR_CONF_PENALTY: ${{ vars.BEAR_CONF_PENALTY }}
+      
+      # Fixed Position Sizing Override (e.g., set to 10 for 10% fixed size)
+      FIXED_POSITION_SIZE_PCT: ${{ vars.FIXED_POSITION_SIZE_PCT }}
 
     steps:
       - name: Setup Node 20
@@ -104,7 +108,7 @@ jobs:
           (async ()=>{
           'use strict';
           const crypto = require('crypto');
-          const MODEL_VERSION=(process.env.MODEL_VERSION||"7.7.7");
+          const MODEL_VERSION=(process.env.MODEL_VERSION||"7.7.7-PRO");
           const UA = `gh-actions-ideas-mexc-ultimate/${MODEL_VERSION} (+https://github.com/)`;
 
           // ---------------- Utils ----------------
@@ -256,6 +260,105 @@ jobs:
           const portfolioVaR_ES_tCopula=(picks, df=6)=>{ if(!picks.length) return { VaR95_bps:0, ES95_bps:0 }; const n=picks.length, mu=Array(n).fill(0), sd=Array(n).fill(0); for(let i=0;i<n;i++){ const r5=picks[i].ret5||[]; const rMean=mean(r5), rStd=std(r5)||1e-4; const steps=Math.max(1, Math.round((picks[i].ttl_sec||600)/300)); mu[i]=rMean*steps*10000; sd[i]=rStd*Math.sqrt(steps)*10000; } const R=Array.from({length:n},()=>Array(n).fill(0)); for(let i=0;i<n;i++){ for(let j=i;j<n;j++) R[i][j]=corr(picks[i].ret5||[], picks[j].ret5||[]); R[i][i]=1; } const Sigma=Array.from({length:n},()=>Array(n).fill(0)); for(let i=0;i<n;i++) for(let j=0;j<n;j++) Sigma[i][j]=R[i][j]*sd[i]*sd[j]; const draws=sampleMultiT(mu,Sigma,df,1200); if(!draws.length) return { VaR95_bps:0, ES95_bps:0 }; const w0=picks.map(p=> p.size_bps||0); const ws=sum(w0)||1; const w=w0.map(x=> x/ws); const port=draws.map(d=> d.reduce((acc,di,ii)=> acc + w[ii]*di, 0)); port.sort((a,b)=>a-b); const idx=Math.floor(0.05*port.length); const VaR95=port[idx]||0; const ES=mean(port.slice(0,idx+1)); return { VaR95_bps:Math.round(VaR95), ES95_bps:Math.round(ES) }; };
           const metaBoostRegime=(state,side,regime,p_cal,mtfAgg)=>{const volatilityRegime=mtfAgg.atr_bps>100?"high_vol":"low_vol";const trendStrength=Math.abs(mtfAgg.rsi-50);if(volatilityRegime==="high_vol"&&trendStrength<15){return clamp(p_cal*0.90,0.05,0.95);}if(volatilityRegime==="low_vol"&&trendStrength>20){return clamp(p_cal*1.08,0.05,0.95);}return p_cal;};
           const smartBearHandler=(equity)=>{const recent20=(equity||[]).slice(-20).map(e=>e.pnl_bps);if(recent20.length<20)return{isBear:false,action:"normal",severity:"none"};const winRate=recent20.filter(x=>x>0).length/20;const avgPnL=mean(recent20);const strongBear=(winRate<0.30)||(avgPnL<-25);const moderateBear=(winRate<0.35)||(avgPnL<-15);if(strongBear){return{isBear:true,severity:"strong",action:"shorts_only",metrics:{winRate,avgPnL}};}else if(moderateBear){return{isBear:true,severity:"moderate",action:"shorts_preferred",metrics:{winRate,avgPnL}};}else{return{isBear:false,severity:"none",action:"normal",metrics:{winRate,avgPnL}};}};
+          
+          // +++++ NEW: PRO DASHBOARD HELPERS (v7.7.7-PRO) +++++
+          async function calculateMarketBreadth(universe, getKCached) {
+            const emaPeriod = 50;
+            let above_ema_1h = 0, above_ema_4h = 0, total = 0;
+            const promises = universe.map(async (u) => {
+              try {
+                const k1h = await getKCached(u.symbol, "1h", emaPeriod + 2);
+                const k4h = await getKCached(u.symbol, "4h", emaPeriod + 2);
+                if (!k1h || !k4h) return;
+
+                const c1h = k1h.map(k => +k[4]);
+                const c4h = k4h.map(k => +k[4]);
+
+                const ema1h = ema(c1h, emaPeriod);
+                const ema4h = ema(c4h, emaPeriod);
+                
+                if (ema1h && c1h.at(-1) > ema1h) above_ema_1h++;
+                if (ema4h && c4h.at(-1) > ema4h) above_ema_4h++;
+                total++;
+              } catch {}
+            });
+            await Promise.all(promises);
+            return {
+              pct_above_ema50_1h: total > 0 ? +(100 * above_ema_1h / total).toFixed(1) : 50,
+              pct_above_ema50_4h: total > 0 ? +(100 * above_ema_4h / total).toFixed(1) : 50,
+              count: total
+            };
+          }
+
+          function analyzeBtcContext(k1h, k4h) {
+              if (!k1h || !k4h) return { momentumDivergence: 'neutral', volatilityClustering: 'normal', volumeProfile: 'normal' };
+              const c1h = k1h.map(k => +k[4]), v1h = k1h.map(k => +k[5]);
+              const c4h = k4h.map(k => +k[4]);
+              // Momentum Divergence (4h)
+              const rsi_4h = rsi(c4h, 14);
+              const price_slope_4h = slopeBps(c4h, 14);
+              const rsi_slope_4h = slopeBps(kalman1D(c4h.map((c, i) => rsi(c4h.slice(0, i + 1), 14) || 50)), 14);
+              let momentumDivergence = 'neutral';
+              if (price_slope_4h > 0.1 && rsi_slope_4h < -0.1) momentumDivergence = 'bearish_divergence';
+              if (price_slope_4h < -0.1 && rsi_slope_4h > 0.1) momentumDivergence = 'bullish_divergence';
+              // Volatility Clustering (1h)
+              const rets1h = c1h.slice(-24).map((c, i, a) => i > 0 ? Math.log(c / a[i-1]) : 0).slice(1);
+              const vol1h = std(rets1h) * 100; // as percentage
+              let volatilityClustering = vol1h > 1.0 ? 'high' : (vol1h < 0.4 ? 'low' : 'normal');
+              // Volume Profile (1h)
+              const vol_ma = mean(v1h.slice(-24, -1));
+              const vol_spike = v1h.at(-1) > vol_ma * 2.5;
+              let volumeProfile = vol_spike ? 'spike' : 'normal';
+              return { momentumDivergence, volatilityClustering, volumeProfile, vol_pct: vol1h };
+          }
+          
+          async function analyzeSectorRotation(universe, getKCached) {
+            const sectors = {
+              DEFI: new Set(['UNI', 'AAVE', 'LDO', 'MKR', 'SNX', 'CRV']),
+              L1: new Set(['SOL', 'AVAX', 'SUI', 'APT', 'NEAR', 'ADA']),
+              MEME: new Set(['DOGE', 'SHIB', 'PEPE', 'WIF', 'BONK']),
+            };
+            const perf = { DEFI: 0, L1: 0, MEME: 0, OTHER: 0};
+            let counts = { DEFI: 0, L1: 0, MEME: 0, OTHER: 0};
+            
+            const promises = universe.map(async u => {
+              try {
+                const k = await getKCached(u.symbol, "1h", 25);
+                if (!k || k.length < 25) return;
+                const roc = (k.at(-1)[4] / k.at(-25)[4]) - 1;
+
+                let sector = 'OTHER';
+                if(sectors.DEFI.has(u.base)) sector = 'DEFI';
+                else if(sectors.L1.has(u.base)) sector = 'L1';
+                else if(sectors.MEME.has(u.base)) sector = 'MEME';
+
+                perf[sector] += roc;
+                counts[sector]++;
+              } catch {}
+            });
+            await Promise.all(promises);
+
+            const avgPerf = {};
+            for(const sec in perf) {
+              avgPerf[sec] = counts[sec] > 0 ? perf[sec] / counts[sec] : 0;
+            }
+            
+            const sorted = Object.entries(avgPerf).sort((a, b) => b[1] - a[1]);
+            return {
+              winning_sector: sorted[0][0],
+              strength: +(sorted[0][1] - sorted[1][1]).toFixed(4),
+              performance: avgPerf,
+            };
+          }
+          
+          // Stub functions for concepts that are hard to implement in a GHA
+          const analyzeTermStructure = () => ({ status: 'neutral', detail: 'not_implemented' });
+          const monitorOptionsSkew = () => ({ status: 'neutral', detail: 'not_implemented' });
+          const trackFundingAnomalies = () => ({ status: 'neutral', detail: 'not_implemented' }); // Not applicable for spot
+          const gaugeMarketSentiment = () => ({ status: 'neutral', detail: 'not_implemented' });
+          const calculateCryptoBeta = () => ({ beta: 1.0, detail: 'not_implemented' });
+          const monitorCapitalMovements = () => ({ flow: 'neutral', detail: 'not_implemented' });
+          const trackMarketLeverage = () => ({ ratio: 'normal', detail: 'not_implemented' }); // Not applicable for spot
 
           // ---------- HTTP + Concurrency ----------
           async function fetchWithTimeout(url,opts={},ms=12000){ const ac=new AbortController(); const t=setTimeout(()=>ac.abort(),ms); try{ return await fetch(url,{...opts,signal:ac.signal,headers:{"User-Agent":UA,...(opts?.headers||{})}});} finally{ clearTimeout(t);} }
@@ -340,7 +443,8 @@ jobs:
               LONG_BOUNCE_SL_ATR, LONG_BOUNCE_TP_ATR, LONG_SIMILARITY_RHO, TOP_N, MAX_SPREAD_BPS,
               EXP_LCB_MIN_BPS_BASE, COST_BPS, NOTIONAL, DEPTH_LIMIT, OBI_TOPN, MIN_TF_ALIGN, TF_WEIGHTS,
               MIN_CONFIDENCE, ENABLE_MICROPRICE, ENABLE_IMPACT_PRICING, ENABLE_REGIME_BOOST,
-              ENABLE_BEAR_DETECTION, ENABLE_OFI_GATE, OFI_THRESHOLD, BEAR_CONF_PENALTY
+              ENABLE_BEAR_DETECTION, ENABLE_OFI_GATE, OFI_THRESHOLD, BEAR_CONF_PENALTY,
+              FIXED_POSITION_SIZE_PCT: process.env.FIXED_POSITION_SIZE_PCT
             };
             return hashObj(knobs);
           }catch{ return "cfg-unknown"; } })();
@@ -962,6 +1066,7 @@ jobs:
             // BTC regimes
             const BTC="BTCUSDT", ETH="ETHUSDT", SOL="SOLUSDT";
             const kBTC1H=await getKCached(BTC,"1h",K1H);
+            const kBTC4H=await getKCached(BTC,"4h",K4H);
             const kBTC5=await getKCached(BTC,"5m",K5M);
             const btcUp1h = (() => {
               if (!kBTC1H?.length) return false;
@@ -979,6 +1084,33 @@ jobs:
             while(filt.length<UNIV_TARGET_MIN && dynMinQV>1_000_000){ dynMinQV=Math.max(1_000_000, dynMinQV-DYN_QV_STEP); filt=all.filter(x=>x.qv>=dynMinQV); }
             const universe=filt.slice(0,UNIV_TARGET_MAX);
             log("universe", universe.length, "dyn_min_qv", dynMinQV);
+
+            // +++++ NEW: PRO DASHBOARDS (v7.7.7-PRO) +++++
+            const btc_context = analyzeBtcContext(kBTC1H, kBTC4H);
+
+            const regimeForecast = {
+              termStructure: analyzeTermStructure(),
+              optionsSkew: monitorOptionsSkew(),
+              fundingRates: trackFundingAnomalies(),
+              socialSentiment: gaugeMarketSentiment(),
+              risk_on: btc_context.volatilityClustering === 'low' && btc_context.momentumDivergence !== 'bearish_divergence',
+            };
+            const marketHealth = {
+              breadth: await calculateMarketBreadth(universe, getKCached),
+              momentumDivergence: btc_context.momentumDivergence,
+              volumeProfile: btc_context.volumeProfile,
+              volatilityClustering: btc_context.volatilityClustering,
+            };
+            const crossAssetContext = {
+              cryptoBeta: calculateCryptoBeta(),
+              defiVsCeFi: await analyzeSectorRotation(universe, getKCached),
+              stablecoinFlows: monitorCapitalMovements(),
+              leverageRatio: trackMarketLeverage(),
+            };
+            log("📈 Market Health:", marketHealth.breadth, `BTC_Vol: ${marketHealth.volatilityClustering}`, `BTC_Div: ${marketHealth.momentumDivergence}`);
+            log("🔭 Regime Forecast:", `Risk-On: ${regimeForecast.risk_on}`);
+            log("💸 Cross-Asset:", `Winning Sector: ${crossAssetContext.defiVsCeFi.winning_sector} (str: ${crossAssetContext.defiVsCeFi.strength})`);
+            // +++++ END PRO DASHBOARDS +++++
 
             // DD/throttle
             const equityStats=(eq)=>{ const day=Date.now()-24*3600*1000; let pnl24=0,cum=0,peak=0,dd=0; for(const e of eq||[]){ if(e.ts_ms>=day) pnl24+=e.pnl_bps; cum+=e.pnl_bps; if(cum>peak) peak=cum; dd=Math.min(dd,cum-peak); } return { pnl24_bps:Math.round(pnl24), peak_dd_bps:Math.round(dd) }; };
@@ -1225,6 +1357,35 @@ jobs:
               const symMult = getSymbolAdj(state, x.base);
               x.confidence = Math.round(x.confidence * uniqMult * symMult);
             }
+            
+            // +++++ NEW: PRO DASHBOARD CONFIDENCE ADJUSTMENT (v7.7.7-PRO) +++++
+            const winning_sector = crossAssetContext.defiVsCeFi.winning_sector;
+            const sectors = { DEFI: new Set(['UNI', 'AAVE', 'LDO', 'MKR', 'SNX', 'CRV']), L1: new Set(['SOL', 'AVAX', 'SUI', 'APT', 'NEAR', 'ADA']), MEME: new Set(['DOGE', 'SHIB', 'PEPE', 'WIF', 'BONK']) };
+            
+            for (const x of refined) {
+              // 1. Regime Forecast Adjustment
+              if (!regimeForecast.risk_on && x.side === 'long') {
+                x.confidence = Math.round(x.confidence * 0.88);
+                x.context_adj = (x.context_adj || "") + "risk-off_long_penalty(-12%);";
+              }
+              // 2. Market Health Adjustment
+              if (marketHealth.breadth.pct_above_ema50_1h < 30 && x.side === 'long') {
+                x.confidence = Math.round(x.confidence * 0.90);
+                x.context_adj = (x.context_adj || "") + "low_breadth_penalty(-10%);";
+              }
+              if (marketHealth.momentumDivergence === 'bearish_divergence' && x.side === 'long') {
+                x.confidence = Math.round(x.confidence * 0.92);
+                x.context_adj = (x.context_adj || "") + "btc_div_penalty(-8%);";
+              }
+              // 3. Cross-Asset Context Adjustment
+              if (winning_sector && winning_sector !== 'OTHER' && crossAssetContext.defiVsCeFi.strength > 0.01) {
+                  if (sectors[winning_sector]?.has(x.base)) {
+                      x.confidence = Math.round(x.confidence * 1.07);
+                      x.context_adj = (x.context_adj || "") + `sector_boost(${winning_sector},+7%);`;
+                  }
+              }
+            }
+            // +++++ END PRO ADJUSTMENT +++++
 
             // Bear Market and Calibration Health Penalties
             for (const x of refined) {
@@ -1305,8 +1466,15 @@ jobs:
               if (avgCorr > 0.85) { log(`⚠️  High correlation portfolio - consider manual review`); }
             }
 
-            // Risk weights via softmax of EV
-            const wEv=softmax(viable.map(x=>x.exp_lcb_bps),20);
+            // Risk weights via softmax of EV, or equal weights if using fixed sizing
+            const FIXED_POSITION_PCT_CHECK = Number(process.env.FIXED_POSITION_SIZE_PCT);
+            let wEv;
+            if (!isNaN(FIXED_POSITION_PCT_CHECK) && FIXED_POSITION_PCT_CHECK > 0) {
+              wEv = Array(viable.length).fill(1/Math.max(1, viable.length));
+              log(`[gha] Fixed position sizing enabled (${FIXED_POSITION_PCT_CHECK}%): Using equal weights.`);
+            } else {
+              wEv = softmax(viable.map(x=>x.exp_lcb_bps),20);
+            }
 
             // Build full v2 ideas
             let picksV2 = viable.map((x,i)=>{
@@ -1340,9 +1508,16 @@ jobs:
               const idea_id = uuidv4();
               const client_order_id = mkClientOrderId("mxu");
               const ttl = clamp(Math.round((x.hold_sec || 720)+i*12), TTL_MIN, TTL_MAX);
-              const size_bps = (Number(process.env.FORCE_SIZE_BPS||"0")>0)
-                  ? Math.round(Number(process.env.FORCE_SIZE_BPS))
-                  : (x.sl_bps>0?Math.min(220,Math.round((wEv[i]*TARGET_PORT_RISK_BPS/x.sl_bps)*100)):0);
+              
+              const FIXED_POSITION_PCT = Number(process.env.FIXED_POSITION_SIZE_PCT);
+              let size_bps;
+              if (!isNaN(FIXED_POSITION_PCT) && FIXED_POSITION_PCT > 0) {
+                size_bps = Math.round(FIXED_POSITION_PCT * 100);
+              } else {
+                size_bps = (Number(process.env.FORCE_SIZE_BPS||"0")>0)
+                    ? Math.round(Number(process.env.FORCE_SIZE_BPS))
+                    : (x.sl_bps>0?Math.min(220,Math.round((wEv[i]*TARGET_PORT_RISK_BPS/x.sl_bps)*100)):0);
+              }
 
               return {
                 idea_id, client_order_id, symbol: x.base, symbol_full: x.symbol, symbolFull: x.symbol, quote: x.quote, side: x.side, rank: i+1,
@@ -1355,7 +1530,8 @@ jobs:
                 predicted: { ts_ms: Date.now(), p_cal: x.p_lcb, ev_bps: x.exp_lcb_bps ?? x.exp_bps, confidence_score: x.confidence },
                 confidence: x.confidence, reasons: x.reasons,
                 reasons_text: (x.reasons||[]).slice(0,3).map(r=>`${r.factor}:${r.value}(${r.contribution>=0?"+":""}${r.contribution})`),
-                trend5m: x.trend5m, bear_status: x.bear_status, max_correlation_in_portfolio: x.max_correlation_in_portfolio
+                trend5m: x.trend5m, bear_status: x.bear_status, max_correlation_in_portfolio: x.max_correlation_in_portfolio,
+                context_adj: x.context_adj
               };
             });
 
@@ -1372,20 +1548,26 @@ jobs:
               predicted: { ...pv2.predicted, meta: { strategy: STRATEGY_NAME, model_version: MODEL_VERSION, schema_version: SCHEMA_VERSION, git_sha: GIT_SHA, config_hash: CONFIG_HASH, futures_hint: { target_exchange: pv2.target_exchange, market_type: pv2.market_type, margin_mode: pv2.margin_mode, leverage: pv2.leverage, entry_policy_override: pv2.entry_policy, exec: pv2.exec } } },
               confidence: pv2.confidence, reasons: pv2.reasons, reasons_text: pv2.reasons_text, trend5m: pv2.trend5m,
               bear_status: pv2.bear_status, max_correlation_in_portfolio: pv2.max_correlation_in_portfolio,
+              context_adj: pv2.context_adj,
             });
             let picks = picksV2.map(toV1Compat);
 
-            // Portfolio VaR/ES throttle on sizes
-            try {
-              const varStats = portfolioVaR_ES_tCopula(picks, 6);
-              if (varStats.ES95_bps < -220) {
-                const scale = clamp(-220 / Math.min(-1e-6, varStats.ES95_bps), 0.35, 1);
-                picks = picks.map(p => ({ ...p, size_bps: Math.max(4, Math.round(p.size_bps * scale)) }));
-                console.log("[gha] VaR/ES throttle", varStats, "scale", scale);
-              } else {
-                console.log("[gha] VaR/ES ok", varStats);
-              }
-            } catch (e) { console.log("[gha] VaR/ES warn", e?.message||e); }
+            // Portfolio VaR/ES throttle on sizes (disabled if using fixed sizing)
+            const FIXED_POSITION_PCT_CHECK_VAR = Number(process.env.FIXED_POSITION_SIZE_PCT);
+            if (!isNaN(FIXED_POSITION_PCT_CHECK_VAR) && FIXED_POSITION_PCT_CHECK_VAR > 0) {
+              log("[gha] Fixed position sizing enabled: VaR throttle disabled.");
+            } else {
+              try {
+                const varStats = portfolioVaR_ES_tCopula(picks, 6);
+                if (varStats.ES95_bps < -220) {
+                  const scale = clamp(-220 / Math.min(-1e-6, varStats.ES95_bps), 0.35, 1);
+                  picks = picks.map(p => ({ ...p, size_bps: Math.max(4, Math.round(p.size_bps * scale)) }));
+                  console.log("[gha] VaR/ES throttle", varStats, "scale", scale);
+                } else {
+                  console.log("[gha] VaR/ES ok", varStats);
+                }
+              } catch (e) { console.log("[gha] VaR/ES warn", e?.message||e); }
+            }
 
             // Update state with pending ideas
             try{
@@ -1414,8 +1596,8 @@ jobs:
             log("DEBUG: saveState call complete.");
 
             // Build meta and payload — push v1 ideas to the existing Worker
-            for (const p of picks) { log(`idea ${p.symbol_full} ${p.side} conf=${p.confidence} reasons=${(p.reasons_text||[]).join("; ")}`); }
-            const ideaLogs = picks.map(p=>({symbol:p.symbol_full,side:p.side,confidence:p.confidence,reasons:p.reasons_text,p_cal:+p.p_lcb.toFixed(3),ev_bps:p.ev_bps,idea_id:p.idea_id,bear_status:p.bear_status,max_corr:p.max_correlation_in_portfolio}));
+            for (const p of picks) { log(`idea ${p.symbol_full} ${p.side} conf=${p.confidence} reasons=${(p.reasons_text||[]).join("; ")} adj=${p.context_adj||'none'}`); }
+            const ideaLogs = picks.map(p=>({symbol:p.symbol_full,side:p.side,confidence:p.confidence,reasons:p.reasons_text,p_cal:+p.p_lcb.toFixed(3),ev_bps:p.ev_bps,idea_id:p.idea_id,bear_status:p.bear_status,max_corr:p.max_correlation_in_portfolio,context_adj:p.context_adj}));
 
             const meta = {
               origin:"github_actions", reason, exchange:"mexc", exchange_base: BASE,
@@ -1427,6 +1609,8 @@ jobs:
               heartbeat:{ mismatches:heartbeat?.mismatches||0, zombies:heartbeat?.zombies||0 },
               tier: selectionTier, idea_logs: ideaLogs, tf_weights: TF_WEIGHTS,
               calibration_health: calibHealth, bear_status: bearStatus,
+              // +++++ NEW: PRO DASHBOARDS IN LOGS +++++
+              pro_dashboards: { regimeForecast, marketHealth, crossAssetContext },
               extras: { v2_ideas: picksV2, features_requested: ["maker_join","post_only","futures"] }
             };
 
@@ -1447,7 +1631,7 @@ jobs:
                 ts: new Date().toISOString(),
                 mode: "normal",
                 source: "external_pusher",
-                meta: { origin: "github_actions_v2" },
+                meta: { origin: "github_actions_v2", pro_dashboards: { regimeForecast, marketHealth, crossAssetContext } },
                 top_n: picksV2.length,
                 ideas: picksV2
               };
