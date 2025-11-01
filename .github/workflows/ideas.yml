@@ -1302,10 +1302,10 @@ jobs:
             const TARGET_TOP_N = Math.max(1, TOP_N || 3);
 
             // ============================================================
-            // v7.7.7++ MODIFIED: Bear + correlation as confidence penalties (not filters)
+            // v7.7.7++ MODIFIED: Greedy selection with bear adjustments
             // ============================================================
-
-            // Apply bear market confidence adjustments
+            
+            // Step 1: Apply bear market confidence adjustments to all refined candidates
             for (const cand of refined) {
               if (bearStatus.action === "shorts_only") {
                 if (cand.side === "long") {
@@ -1328,33 +1328,29 @@ jobs:
               }
             }
 
-            // Apply correlation penalties
-            for (let i = 0; i < refined.length; i++) {
-              const cand = refined[i];
-              let maxCorr = 0;
-              
-              for (let j = 0; j < refined.length; j++) {
-                if (i === j || cand.side !== refined[j].side) continue;
-                maxCorr = Math.max(maxCorr, corr(cand.ret5 || [], refined[j].ret5 || []));
-              }
-              
-              if (maxCorr > 0.98) {
-                cand.confidence = Math.round(cand.confidence * 0.70);
-                cand.corr_penalty = -30;
-              } else if (maxCorr > 0.95) {
-                cand.confidence = Math.round(cand.confidence * 0.85);
-                cand.corr_penalty = -15;
-              } else if (maxCorr > 0.90) {
-                cand.confidence = Math.round(cand.confidence * 0.95);
-                cand.corr_penalty = -5;
-              }
-              
-              cand.max_correlation = +(maxCorr.toFixed(3));
-            }
+            // Step 2: Create a sorted list of candidates to pick from
+            const candidates = [...refined].sort((a, b) => b.confidence - a.confidence);
+            const selected = [];
 
-            // Re-sort and select top N
-            refined.sort((a, b) => b.confidence - a.confidence);
-            const selected = refined.slice(0, TARGET_TOP_N);
+            // Step 3: Greedy selection based on correlation with already-selected trades
+            while (selected.length < TARGET_TOP_N && candidates.length > 0) {
+              const cand = candidates.shift(); // Take highest confidence candidate
+              
+              // Check correlation only against already-selected trades
+              let maxCorr = 0;
+              for (const s of selected) {
+                if (cand.side === s.side) {
+                  const r = corr(cand.ret5 || [], s.ret5 || []);
+                  maxCorr = Math.max(maxCorr, r);
+                }
+              }
+              
+              // Accept if diverse enough OR if we're struggling to fill the portfolio
+              if (maxCorr < 0.95 || selected.length < Math.floor(TARGET_TOP_N * 0.5)) {
+                selected.push(cand);
+              }
+              // Otherwise, skip and the loop will try the next best candidate
+            }
 
             // Risk weights via softmax of EV (unchanged)
             const wEv=softmax(selected.map(x=>x.exp_lcb_bps),20);
