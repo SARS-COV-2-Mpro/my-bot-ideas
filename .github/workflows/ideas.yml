@@ -114,9 +114,9 @@ jobs:
           const softmax=(arr,t=20)=>{ const m=Math.max(...arr,0); const ex=arr.map(x=>Math.exp((x-m)/t)); const s=ex.reduce((a,b)=>a+b,0)||1; return ex.map(x=>x/s); };
           const sigmoid=(z)=>1/(1+Math.exp(-z));
           const logit=(p)=>{ const eps=1e-6; const pp=Math.min(1-eps,Math.max(eps,p)); return Math.log(pp/(1-pp)); };
-          
+
           // ============================================================
-          // v7.7.7++ ADDITIONS: New helper functions
+          // v7.7.7++ ADDITIONS (FIXED): New helper functions
           // ============================================================
 
           // 1. MICROPRICE - Volume-weighted mid price
@@ -125,7 +125,7 @@ jobs:
             return (ask*qb + bid*qa)/d; 
           };
 
-          // 2. META-LEARNING BOOST - Regime-based (no equity feedback loop)
+          // 2. REGIME-BASED BOOST (No equity dependency)
           const metaBoostRegime = (state, side, regime, p_cal, mtfAgg) => {
             // Use MARKET signals, not equity curve ✅
             const volatilityRegime = mtfAgg.atr_bps > 100 ? "high_vol" : "low_vol";
@@ -1129,7 +1129,6 @@ jobs:
                 const depth=depthB||depthA; if(!depth?.bids?.length || !depth?.asks?.length) continue;
                 const obi=computeOBI(depth,OBI_TOPN);
                 const ofi30s=ofiProxy(depthA,depthB);
-
                 // ============================================================
                 // v7.7.7++ NEW: Order Flow Imbalance gate
                 // ============================================================
@@ -1161,7 +1160,7 @@ jobs:
                 const nS = Math.max(1, Math.min(500, coeffS.n || 0));
 
                 // ============================================================
-                // v7.7.7++ MODIFIED: Apply regime-based meta-learning boost
+                // v7.7.7++ MODIFIED: Apply regime-based boost after calibration
                 // ============================================================
                 let pLong=calibrateP(state,"long",regime,p.pLong0);
                 pLong=metaBoostRegime(state,"long",regime,pLong, mtfAgg);
@@ -1236,13 +1235,15 @@ jobs:
 
                 const slipEst=chosen.side==="long"?slipL:slipS;
                 const btcCorr=corr((()=>{const r=[];for(let i=1;i<p.c5.length;i++) r.push(Math.log(p.c5[i]/p.c5[i-1])); return r.slice(-120);})(), btcR5);
+                
+                // REPLACE Granger with simple btcCorr threshold:
+                const btcPenalty = (Math.abs(btcCorr) < 0.4 ? 0.94 : 1.0); // Low correlation = penalty
+
                 const reasons=reasonBuilder({adx1h:ind1h?.adx||0,ofi30s,tfAlign,spread_bps:p.spreadBps,slip_bps_est:slipEst,mtf_rsi:mtfAgg.rsi});
 
                 // ============================================================
-                // v7.7.7++ MODIFIED: Replace Granger with simple btcCorr penalty
+                // v7.7.7++ MODIFIED: Use simple correlation penalty
                 // ============================================================
-                const btcPenalty = (Math.abs(btcCorr) < 0.4 ? 0.94 : 1.0); // Low correlation = penalty
-
                 const conf = confidenceScore({
                   p_cal: chosen.p_lcb,
                   ev_bps: chosen.ev_bps,
@@ -1301,52 +1302,59 @@ jobs:
             const TARGET_TOP_N = Math.max(1, TOP_N || 3);
 
             // ============================================================
-            // v7.7.7++ MODIFIED: Smart bear market filtering by side
+            // v7.7.7++ MODIFIED: Bear + correlation as confidence penalties (not filters)
             // ============================================================
-            const selected=[];
+
+            // Apply bear market confidence adjustments
             for (const cand of refined) {
-              if (selected.length >= TARGET_TOP_N) break;
-              
-              // Bear market side filter
-              if(bearStatus.action==="shorts_only"){
-                if(cand.side==="long"){
-                  log(`Skip ${cand.symbol} LONG: strong bear market (shorts only mode)`);
-                  continue;
-                }
-                // Boost short confidence in strong bear
-                cand.confidence=Math.round(cand.confidence*1.15);
-              }
-              
-              if(bearStatus.action==="shorts_preferred"){
-                if(cand.side==="long" && cand.confidence<65){
-                  log(`Skip ${cand.symbol} LONG: moderate bear (conf ${cand.confidence}<65)`);
-                  continue;
-                }
-                // Moderate boost for shorts
-                if(cand.side==="short"){
-                  cand.confidence=Math.round(cand.confidence*1.08);
+              if (bearStatus.action === "shorts_only") {
+                if (cand.side === "long") {
+                  cand.confidence = Math.round(cand.confidence * 0.50);
+                  cand.bear_penalty = -50;
+                } else {
+                  cand.confidence = Math.round(cand.confidence * 1.15);
+                  cand.bear_boost = 15;
                 }
               }
               
-              // Correlation filter
-              let ok=true;
-              for (const s of selected) {
-                const r=corr(cand.ret5||[], s.ret5||[]);
-                if (r>0.98 && cand.side===s.side) { ok=false; break; }
-              }
-              if (ok) selected.push(cand);
-            }
-            // If still fewer than target, fill ignoring correlation guard by descending confidence
-            if (selected.length < TARGET_TOP_N) {
-              const have=new Set(selected.map(s=>s.symbol+":"+s.side));
-              for (const c of refined) {
-                if (selected.length >= TARGET_TOP_N) break;
-                const k=c.symbol+":"+c.side;
-                if (!have.has(k)) { selected.push(c); have.add(k); }
+              if (bearStatus.action === "shorts_preferred") {
+                if (cand.side === "long") {
+                  cand.confidence = Math.round(cand.confidence * 0.75);
+                  cand.bear_penalty = -25;
+                } else {
+                  cand.confidence = Math.round(cand.confidence * 1.08);
+                  cand.bear_boost = 8;
+                }
               }
             }
-            // Just in case refined was tiny, ensure we never exceed target
-            if (selected.length > TARGET_TOP_N) selected.splice(TARGET_TOP_N);
+
+            // Apply correlation penalties
+            for (let i = 0; i < refined.length; i++) {
+              const cand = refined[i];
+              let maxCorr = 0;
+              
+              for (let j = 0; j < refined.length; j++) {
+                if (i === j || cand.side !== refined[j].side) continue;
+                maxCorr = Math.max(maxCorr, corr(cand.ret5 || [], refined[j].ret5 || []));
+              }
+              
+              if (maxCorr > 0.98) {
+                cand.confidence = Math.round(cand.confidence * 0.70);
+                cand.corr_penalty = -30;
+              } else if (maxCorr > 0.95) {
+                cand.confidence = Math.round(cand.confidence * 0.85);
+                cand.corr_penalty = -15;
+              } else if (maxCorr > 0.90) {
+                cand.confidence = Math.round(cand.confidence * 0.95);
+                cand.corr_penalty = -5;
+              }
+              
+              cand.max_correlation = +(maxCorr.toFixed(3));
+            }
+
+            // Re-sort and select top N
+            refined.sort((a, b) => b.confidence - a.confidence);
+            const selected = refined.slice(0, TARGET_TOP_N);
 
             // Risk weights via softmax of EV (unchanged)
             const wEv=softmax(selected.map(x=>x.exp_lcb_bps),20);
