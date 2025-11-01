@@ -1,7 +1,6 @@
-name: Ideas Pusher (MEXC Ultimate 7.7.7 - FIXED+PRO)
+name: Ideas Pusher (MEXC Ultimate 7.7.7)
 
 on:
-  
   repository_dispatch:
     types: [run_B]
   workflow_dispatch: {}
@@ -72,19 +71,6 @@ jobs:
       SCHEMA_VERSION: ${{ vars.SCHEMA_VERSION }}
       GIT_SHA: ${{ github.sha }}
 
-      # New v7.7.7 Features
-      MIN_CONFIDENCE: ${{ vars.MIN_CONFIDENCE }}
-      ENABLE_MICROPRICE: ${{ vars.ENABLE_MICROPRICE }}
-      ENABLE_IMPACT_PRICING: ${{ vars.ENABLE_IMPACT_PRICING }}
-      ENABLE_REGIME_BOOST: ${{ vars.ENABLE_REGIME_BOOST }}
-      ENABLE_BEAR_DETECTION: ${{ vars.ENABLE_BEAR_DETECTION }}
-      ENABLE_OFI_GATE: ${{ vars.ENABLE_OFI_GATE }}
-      OFI_THRESHOLD: ${{ vars.OFI_THRESHOLD }}
-      BEAR_CONF_PENALTY: ${{ vars.BEAR_CONF_PENALTY }}
-      
-      # Fixed Position Sizing Override (e.g., set to 10 for 10% fixed size)
-      FIXED_POSITION_SIZE_PCT: ${{ vars.FIXED_POSITION_SIZE_PCT }}
-
     steps:
       - name: Setup Node 20
         uses: actions/setup-node@v4
@@ -107,7 +93,7 @@ jobs:
           (async ()=>{
           'use strict';
           const crypto = require('crypto');
-          const MODEL_VERSION=(process.env.MODEL_VERSION||"7.7.7-PRO");
+          const MODEL_VERSION=(process.env.MODEL_VERSION||"6.4");
           const UA = `gh-actions-ideas-mexc-ultimate/${MODEL_VERSION} (+https://github.com/)`;
 
           // ---------------- Utils ----------------
@@ -239,125 +225,11 @@ jobs:
           const microprice=(bid,ask,qb,qa)=>{ const d=(qb||1)+(qa||1); return (ask*qb + bid*qa)/d; };
           const ofiProxy=(d0,d1)=>{ const lev=(side,d)=>d?.[side]?.slice(0,3).map(x=>+x[1]||0)||[]; const sum=a=>a.reduce((x,y)=>x+y,0); if(!d0||!d1) return 0; return (sum(lev("bids",d1))-sum(lev("bids",d0))) - (sum(lev("asks",d1))-sum(lev("asks",d0))); };
           const bookSlope=(depth, mid)=>{ const toPts=(levels)=>{ let cum=0; const pts=[]; for(const [ps,qs] of (levels||[])){ const p=+ps,q=+qs; if(!(p>0&&q>0)) continue; cum+=p*q; const x=Math.log(Math.abs(p-mid)/mid + 1e-6), y=Math.log(cum+1); pts.push([x,y]); if(pts.length>=10) break; } return pts; }; if(!depth?.asks?.length||!depth?.bids?.length||!(mid>0)) return { slope:0, r2:0 }; const pts=toPts(depth.asks).concat(toPts(depth.bids)); if(pts.length<6) return { slope:0, r2:0 }; const xs=pts.map(p=>p[0]), ys=pts.map(p=>p[1]), mx=mean(xs), my=mean(ys); let num=0,den=0,vy=0; for(let i=0;i<xs.length;i++){ const dx=xs[i]-mx, dy=ys[i]-my; num+=dx*dy; den+=dx*dx; vy+=dy*dy; } return { slope: den>1e-9? num/den : 0, r2: den>1e-9 && vy>1e-9? (num*num)/(den*vy):0 }; };
-          const reasonBuilder=(ctx)=>{
-            const out=[];
-            if((ctx.adx1h||0)>22)out.push({factor:"ADX_1h",value:+(ctx.adx1h||0).toFixed(1),contribution:+Math.min(12,(ctx.adx1h-22)*0.6).toFixed(1)});
-            if((ctx.ofi30s||0)>0)out.push({factor:"OFI_30s",value:+(ctx.ofi30s||0).toFixed(3),contribution:+Math.min(10,ctx.ofi30s*10).toFixed(1)});
-            if((ctx.spread_bps||0)>8)out.push({factor:"Spread_bps",value:ctx.spread_bps,contribution:-Math.min(8,(ctx.spread_bps-8))});
-            if((ctx.slip_bps_est||0)>4)out.push({factor:"Slip_est_bps",value:ctx.slip_bps_est,contribution:-Math.min(6,(ctx.slip_bps_est-4))});
-            if((ctx.tfAlign||0)>=0.7)out.push({factor:"TF_alignment",value:+(ctx.tfAlign||0).toFixed(2),contribution:+6.0});
-            if((ctx.mtf_rsi||0)>55)out.push({factor:"MTF_RSI",value:+(ctx.mtf_rsi||0).toFixed(1),contribution:+3.0});
-            if((ctx.ofi_strong||0)>0.15)out.push({factor:"OFI_strong",value:+(ctx.ofi_strong||0).toFixed(2),contribution:+5.0});
-            if((ctx.ofi_strong||0)<-0.15)out.push({factor:"OFI_strong",value:+(ctx.ofi_strong||0).toFixed(2),contribution:-5.0});
-            if((ctx.bear_status||"none")!=="none")out.push({factor:"Bear_market",value:ctx.bear_status,contribution:-8.0});
-            if((ctx.entry_improvement_bps||0)>3)out.push({factor:"Entry_optimization",value:ctx.entry_improvement_bps,contribution:+4.0});
-            return out.sort((a,b)=>Math.abs(b.contribution)-Math.abs(a.contribution)).slice(0,6);
-          };
+          const reasonBuilder=(ctx)=>{ const out=[]; if((ctx.adx1h||0)>22) out.push({ factor:"ADX_1h", value:+(ctx.adx1h||0).toFixed(1), contribution:+Math.min(12,(ctx.adx1h-22)*0.6).toFixed(1) }); if((ctx.ofi30s||0)>0) out.push({ factor:"OFI_30s", value:+(ctx.ofi30s||0).toFixed(3), contribution:+Math.min(10, ctx.ofi30s*10).toFixed(1) }); if((ctx.spread_bps||0)>8) out.push({ factor:"Spread_bps", value:ctx.spread_bps, contribution:-Math.min(8,(ctx.spread_bps-8)) }); if((ctx.slip_bps_est||0)>4) out.push({ factor:"Slip_est_bps", value:ctx.slip_bps_est, contribution:-Math.min(6,(ctx.slip_bps_est-4)) }); if((ctx.tfAlign||0)>=0.7) out.push({ factor:"TF_alignment", value:+(ctx.tfAlign||0).toFixed(2), contribution:+6.0 }); if((ctx.mtf_rsi||0)>55) out.push({ factor:"MTF_RSI", value:+(ctx.mtf_rsi||0).toFixed(1), contribution:+3.0 }); return out.sort((a,b)=>Math.abs(b.contribution)-Math.abs(a.contribution)).slice(0,5); };
           const cholesky=(A)=>{ const n=A.length; const L=Array.from({length:n},()=>Array(n).fill(0)); for(let i=0;i<n;i++){ for(let j=0;j<=i;j++){ let s=0; for(let k=0;k<j;k++) s+=L[i][k]*L[j][k]; const v=A[i][j]-s; if(i===j){ if(v<=1e-12) return null; L[i][j]=Math.sqrt(Math.max(v,1e-12)); } else L[i][j]=v/(L[j][j]||1e-12); } } return L; };
           const choleskySafe=(S)=>{ const L=cholesky(S); if(L) return L; const n=S.length; const Sc=S.map((r,i)=> r.map((v,j)=> v + (i===j?1e-6:0))); return cholesky(Sc); };
-          const sampleMultiT=(muVec,Sigma,df=6,M=1000)=>{ const n=muVec.length; const L=choleskySafe(Sigma); if(!L) return []; const out=[]; for(let m=0;m<M;m++){ const z=Array(n).fill(0).map(()=>randn()); const y=Array(n).fill(0); for(let i=0;i<n;i++){ let s=0; for(let k=0;k<n;k++) s+=L[i][k]*z[k]; y[i]=s; } let chi=0; for(let i=0;i<df;i++){ const zc=randn(); chi+=zc*zc; } const scale=Math.sqrt(df/Math.max(1e-9,chi)); out.push(y.map((yi,i)=> (muVec[i]||0) + yi*scale)); } return out; };
+          const sampleMultiT=(muVec,Sigma,df=6,M=1000)=>{ const n=muVec.length; const L=choleskySafe(Sigma); if(!L) return []; const out=[]; for(let m=0;m<M;m++){ const z=Array(n).fill(0).map(()=>randn()); const y=Array(n).fill(0); for(let i=0;i<n;i++){ let s=0; for(let k=0;k<=i;k++) s+=L[i][k]*z[k]; y[i]=s; } let chi=0; for(let i=0;i<df;i++){ const zc=randn(); chi+=zc*zc; } const scale=Math.sqrt(df/Math.max(1e-9,chi)); out.push(y.map((yi,i)=> (muVec[i]||0) + yi*scale)); } return out; };
           const portfolioVaR_ES_tCopula=(picks, df=6)=>{ if(!picks.length) return { VaR95_bps:0, ES95_bps:0 }; const n=picks.length, mu=Array(n).fill(0), sd=Array(n).fill(0); for(let i=0;i<n;i++){ const r5=picks[i].ret5||[]; const rMean=mean(r5), rStd=std(r5)||1e-4; const steps=Math.max(1, Math.round((picks[i].ttl_sec||600)/300)); mu[i]=rMean*steps*10000; sd[i]=rStd*Math.sqrt(steps)*10000; } const R=Array.from({length:n},()=>Array(n).fill(0)); for(let i=0;i<n;i++){ for(let j=i;j<n;j++) R[i][j]=corr(picks[i].ret5||[], picks[j].ret5||[]); R[i][i]=1; } const Sigma=Array.from({length:n},()=>Array(n).fill(0)); for(let i=0;i<n;i++) for(let j=0;j<n;j++) Sigma[i][j]=R[i][j]*sd[i]*sd[j]; const draws=sampleMultiT(mu,Sigma,df,1200); if(!draws.length) return { VaR95_bps:0, ES95_bps:0 }; const w0=picks.map(p=> p.size_bps||0); const ws=sum(w0)||1; const w=w0.map(x=> x/ws); const port=draws.map(d=> d.reduce((acc,di,ii)=> acc + w[ii]*di, 0)); port.sort((a,b)=>a-b); const idx=Math.floor(0.05*port.length); const VaR95=port[idx]||0; const ES=mean(port.slice(0,idx+1)); return { VaR95_bps:Math.round(VaR95), ES95_bps:Math.round(ES) }; };
-          const metaBoostRegime=(state,side,regime,p_cal,mtfAgg)=>{const volatilityRegime=mtfAgg.atr_bps>100?"high_vol":"low_vol";const trendStrength=Math.abs(mtfAgg.rsi-50);if(volatilityRegime==="high_vol"&&trendStrength<15){return clamp(p_cal*0.90,0.05,0.95);}if(volatilityRegime==="low_vol"&&trendStrength>20){return clamp(p_cal*1.08,0.05,0.95);}return p_cal;};
-          const smartBearHandler=(equity)=>{const recent20=(equity||[]).slice(-20).map(e=>e.pnl_bps);if(recent20.length<20)return{isBear:false,action:"normal",severity:"none"};const winRate=recent20.filter(x=>x>0).length/20;const avgPnL=mean(recent20);const strongBear=(winRate<0.30)||(avgPnL<-25);const moderateBear=(winRate<0.35)||(avgPnL<-15);if(strongBear){return{isBear:true,severity:"strong",action:"shorts_only",metrics:{winRate,avgPnL}};}else if(moderateBear){return{isBear:true,severity:"moderate",action:"shorts_preferred",metrics:{winRate,avgPnL}};}else{return{isBear:false,severity:"none",action:"normal",metrics:{winRate,avgPnL}};}};
-          
-          // +++++ NEW: PRO DASHBOARD HELPERS (v7.7.7-PRO) +++++
-          async function calculateMarketBreadth(universe, getKCached) {
-            const emaPeriod = 50;
-            let above_ema_1h = 0, above_ema_4h = 0, total = 0;
-            const promises = universe.map(async (u) => {
-              try {
-                const k1h = await getKCached(u.symbol, "1h", emaPeriod + 2);
-                const k4h = await getKCached(u.symbol, "4h", emaPeriod + 2);
-                if (!k1h || !k4h) return;
-
-                const c1h = k1h.map(k => +k[4]);
-                const c4h = k4h.map(k => +k[4]);
-
-                const ema1h = ema(c1h, emaPeriod);
-                const ema4h = ema(c4h, emaPeriod);
-                
-                if (ema1h && c1h.at(-1) > ema1h) above_ema_1h++;
-                if (ema4h && c4h.at(-1) > ema4h) above_ema_4h++;
-                total++;
-              } catch {}
-            });
-            await Promise.all(promises);
-            return {
-              pct_above_ema50_1h: total > 0 ? +(100 * above_ema_1h / total).toFixed(1) : 50,
-              pct_above_ema50_4h: total > 0 ? +(100 * above_ema_4h / total).toFixed(1) : 50,
-              count: total
-            };
-          }
-
-          function analyzeBtcContext(k1h, k4h) {
-              if (!k1h || !k4h) return { momentumDivergence: 'neutral', volatilityClustering: 'normal', volumeProfile: 'normal' };
-              const c1h = k1h.map(k => +k[4]), v1h = k1h.map(k => +k[5]);
-              const c4h = k4h.map(k => +k[4]);
-              // Momentum Divergence (4h)
-              const rsi_4h = rsi(c4h, 14);
-              const price_slope_4h = slopeBps(c4h, 14);
-              const rsi_slope_4h = slopeBps(kalman1D(c4h.map((c, i) => rsi(c4h.slice(0, i + 1), 14) || 50)), 14);
-              let momentumDivergence = 'neutral';
-              if (price_slope_4h > 0.1 && rsi_slope_4h < -0.1) momentumDivergence = 'bearish_divergence';
-              if (price_slope_4h < -0.1 && rsi_slope_4h > 0.1) momentumDivergence = 'bullish_divergence';
-              // Volatility Clustering (1h)
-              const rets1h = c1h.slice(-24).map((c, i, a) => i > 0 ? Math.log(c / a[i-1]) : 0).slice(1);
-              const vol1h = std(rets1h) * 100; // as percentage
-              let volatilityClustering = vol1h > 1.0 ? 'high' : (vol1h < 0.4 ? 'low' : 'normal');
-              // Volume Profile (1h)
-              const vol_ma = mean(v1h.slice(-24, -1));
-              const vol_spike = v1h.at(-1) > vol_ma * 2.5;
-              let volumeProfile = vol_spike ? 'spike' : 'normal';
-              return { momentumDivergence, volatilityClustering, volumeProfile, vol_pct: vol1h };
-          }
-          
-          async function analyzeSectorRotation(universe, getKCached) {
-            const sectors = {
-              DEFI: new Set(['UNI', 'AAVE', 'LDO', 'MKR', 'SNX', 'CRV']),
-              L1: new Set(['SOL', 'AVAX', 'SUI', 'APT', 'NEAR', 'ADA']),
-              MEME: new Set(['DOGE', 'SHIB', 'PEPE', 'WIF', 'BONK']),
-            };
-            const perf = { DEFI: 0, L1: 0, MEME: 0, OTHER: 0};
-            let counts = { DEFI: 0, L1: 0, MEME: 0, OTHER: 0};
-            
-            const promises = universe.map(async u => {
-              try {
-                const k = await getKCached(u.symbol, "1h", 25);
-                if (!k || k.length < 25) return;
-                const roc = (k.at(-1)[4] / k.at(-25)[4]) - 1;
-
-                let sector = 'OTHER';
-                if(sectors.DEFI.has(u.base)) sector = 'DEFI';
-                else if(sectors.L1.has(u.base)) sector = 'L1';
-                else if(sectors.MEME.has(u.base)) sector = 'MEME';
-
-                perf[sector] += roc;
-                counts[sector]++;
-              } catch {}
-            });
-            await Promise.all(promises);
-
-            const avgPerf = {};
-            for(const sec in perf) {
-              avgPerf[sec] = counts[sec] > 0 ? perf[sec] / counts[sec] : 0;
-            }
-            
-            const sorted = Object.entries(avgPerf).sort((a, b) => b[1] - a[1]);
-            return {
-              winning_sector: sorted[0][0],
-              strength: +(sorted[0][1] - sorted[1][1]).toFixed(4),
-              performance: avgPerf,
-            };
-          }
-          
-          // Stub functions for concepts that are hard to implement in a GHA
-          const analyzeTermStructure = () => ({ status: 'neutral', detail: 'not_implemented' });
-          const monitorOptionsSkew = () => ({ status: 'neutral', detail: 'not_implemented' });
-          const trackFundingAnomalies = () => ({ status: 'neutral', detail: 'not_implemented' }); // Not applicable for spot
-          const gaugeMarketSentiment = () => ({ status: 'neutral', detail: 'not_implemented' });
-          const calculateCryptoBeta = () => ({ beta: 1.0, detail: 'not_implemented' });
-          const monitorCapitalMovements = () => ({ flow: 'neutral', detail: 'not_implemented' });
-          const trackMarketLeverage = () => ({ ratio: 'normal', detail: 'not_implemented' }); // Not applicable for spot
 
           // ---------- HTTP + Concurrency ----------
           async function fetchWithTimeout(url,opts={},ms=12000){ const ac=new AbortController(); const t=setTimeout(()=>ac.abort(),ms); try{ return await fetch(url,{...opts,signal:ac.signal,headers:{"User-Agent":UA,...(opts?.headers||{})}});} finally{ clearTimeout(t);} }
@@ -425,14 +297,6 @@ jobs:
           const LONG_EDGE_MULT_MIN=Number(process.env.LONG_EDGE_MULT_MIN||"4");
           const LONG_BOUNCE_SL_ATR=Number(process.env.LONG_BOUNCE_SL_ATR||"0.50"), LONG_BOUNCE_TP_ATR=Number(process.env.LONG_BOUNCE_TP_ATR||"0.90");
           const LONG_SIMILARITY_RHO=Number(process.env.LONG_SIMILARITY_RHO||"0.84");
-          const MIN_CONFIDENCE = Number(process.env.MIN_CONFIDENCE || "35");
-          const ENABLE_MICROPRICE = (process.env.ENABLE_MICROPRICE || "true").toLowerCase() === 'true';
-          const ENABLE_IMPACT_PRICING = (process.env.ENABLE_IMPACT_PRICING || "true").toLowerCase() === 'true';
-          const ENABLE_REGIME_BOOST = (process.env.ENABLE_REGIME_BOOST || "true").toLowerCase() === 'true';
-          const ENABLE_BEAR_DETECTION = (process.env.ENABLE_BEAR_DETECTION || "true").toLowerCase() === 'true';
-          const ENABLE_OFI_GATE = (process.env.ENABLE_OFI_GATE || "true").toLowerCase() === 'true';
-          const OFI_THRESHOLD = Number(process.env.OFI_THRESHOLD || "0.20");
-          const BEAR_CONF_PENALTY = Number(process.env.BEAR_CONF_PENALTY || "0.85");
 
           const CONFIG_HASH=(()=>{ try{
             const knobs={
@@ -440,10 +304,7 @@ jobs:
               MAX_COST_BPS_HARD, MIN_VOL_1H_USD, DEPTH_1P_MIN_USD, NO_LONG_DOWN_ENABLE,
               LONG_DOWN_RSI_CUTOFF, LONG_MR_DIVERGENCE_REQ, LONG_EDGE_MULT_MIN,
               LONG_BOUNCE_SL_ATR, LONG_BOUNCE_TP_ATR, LONG_SIMILARITY_RHO, TOP_N, MAX_SPREAD_BPS,
-              EXP_LCB_MIN_BPS_BASE, COST_BPS, NOTIONAL, DEPTH_LIMIT, OBI_TOPN, MIN_TF_ALIGN, TF_WEIGHTS,
-              MIN_CONFIDENCE, ENABLE_MICROPRICE, ENABLE_IMPACT_PRICING, ENABLE_REGIME_BOOST,
-              ENABLE_BEAR_DETECTION, ENABLE_OFI_GATE, OFI_THRESHOLD, BEAR_CONF_PENALTY,
-              FIXED_POSITION_SIZE_PCT: process.env.FIXED_POSITION_SIZE_PCT
+              EXP_LCB_MIN_BPS_BASE, COST_BPS, NOTIONAL, DEPTH_LIMIT, OBI_TOPN, MIN_TF_ALIGN, TF_WEIGHTS
             };
             return hashObj(knobs);
           }catch{ return "cfg-unknown"; } })();
@@ -549,7 +410,7 @@ jobs:
           // ---------- State (Gist) + Calibration + Audit ----------
           async function loadState(){
             const token=process.env.GIST_TOKEN, id=process.env.GIST_ID;
-            const init={ v:"mexc-ultimate-7.7.7-audit-mtf",
+            const init={ v:"mexc-ultimate-6.4-audit-mtf",
               cooldown:{}, cooldown_side:{}, pending:[], equity:[], closed:[],
               mr_lockout:{}, sym_stats:{}, sym_stats_real:{}, calibCoeffs:{}, lastReconcileTs:0,
               calibration_holdout:[]
@@ -1030,21 +891,7 @@ jobs:
             const { state, persist } = await loadState();
             learnFromGistRealFills(state);
             const calibHealth = validateCalibration(state);
-            const bearStatus = ENABLE_BEAR_DETECTION ? smartBearHandler(state.equity) : { isBear: false, action: "normal", severity: "none" };
-            if (bearStatus.isBear) {
-              log(`🐻 Bear market detected: ${bearStatus.severity}`);
-              log(`   Action: ${bearStatus.action}`);
-              log(`   Metrics: WR=${(bearStatus.metrics.winRate * 100).toFixed(1)}%, Avg=${bearStatus.metrics.avgPnL.toFixed(1)}bps`);
-            }
-            for (const key of Object.keys(calibHealth)) {
-              const health = calibHealth[key];
-              if (health.status === "degraded") {
-                log(`⚠️  Calibration degraded: ${key}`);
-                log(`   n=${health.n}, a=${health.a}, b=${health.b}, avg_error=${health.avg_error}`);
-                log(`   → Consider manual review or reset`);
-              }
-            }
-            
+
             // Heartbeat existing pending
             const heartbeat = await heartbeatCheck(state);
             if((heartbeat?.zombies||0)>0) log("heartbeat zombies", heartbeat.zombies, (heartbeat.details||[]).slice(0,5));
@@ -1065,7 +912,6 @@ jobs:
             // BTC regimes
             const BTC="BTCUSDT", ETH="ETHUSDT", SOL="SOLUSDT";
             const kBTC1H=await getKCached(BTC,"1h",K1H);
-            const kBTC4H=await getKCached(BTC,"4h",K4H);
             const kBTC5=await getKCached(BTC,"5m",K5M);
             const btcUp1h = (() => {
               if (!kBTC1H?.length) return false;
@@ -1083,33 +929,6 @@ jobs:
             while(filt.length<UNIV_TARGET_MIN && dynMinQV>1_000_000){ dynMinQV=Math.max(1_000_000, dynMinQV-DYN_QV_STEP); filt=all.filter(x=>x.qv>=dynMinQV); }
             const universe=filt.slice(0,UNIV_TARGET_MAX);
             log("universe", universe.length, "dyn_min_qv", dynMinQV);
-
-            // +++++ NEW: PRO DASHBOARDS (v7.7.7-PRO) +++++
-            const btc_context = analyzeBtcContext(kBTC1H, kBTC4H);
-
-            const regimeForecast = {
-              termStructure: analyzeTermStructure(),
-              optionsSkew: monitorOptionsSkew(),
-              fundingRates: trackFundingAnomalies(),
-              socialSentiment: gaugeMarketSentiment(),
-              risk_on: btc_context.volatilityClustering === 'low' && btc_context.momentumDivergence !== 'bearish_divergence',
-            };
-            const marketHealth = {
-              breadth: await calculateMarketBreadth(universe, getKCached),
-              momentumDivergence: btc_context.momentumDivergence,
-              volumeProfile: btc_context.volumeProfile,
-              volatilityClustering: btc_context.volatilityClustering,
-            };
-            const crossAssetContext = {
-              cryptoBeta: calculateCryptoBeta(),
-              defiVsCeFi: await analyzeSectorRotation(universe, getKCached),
-              stablecoinFlows: monitorCapitalMovements(),
-              leverageRatio: trackMarketLeverage(),
-            };
-            log("📈 Market Health:", marketHealth.breadth, `BTC_Vol: ${marketHealth.volatilityClustering}`, `BTC_Div: ${marketHealth.momentumDivergence}`);
-            log("🔭 Regime Forecast:", `Risk-On: ${regimeForecast.risk_on}`);
-            log("💸 Cross-Asset:", `Winning Sector: ${crossAssetContext.defiVsCeFi.winning_sector} (str: ${crossAssetContext.defiVsCeFi.strength})`);
-            // +++++ END PRO DASHBOARDS +++++
 
             // DD/throttle
             const equityStats=(eq)=>{ const day=Date.now()-24*3600*1000; let pnl24=0,cum=0,peak=0,dd=0; for(const e of eq||[]){ if(e.ts_ms>=day) pnl24+=e.pnl_bps; cum+=e.pnl_bps; if(cum>peak) peak=cum; dd=Math.min(dd,cum-peak); } return { pnl24_bps:Math.round(pnl24), peak_dd_bps:Math.round(dd) }; };
@@ -1182,16 +1001,10 @@ jobs:
             for(let idx=0; idx<prelim.length; idx++){
               try{
                 const p=prelim[idx], c=p.c;
-                const book=bookMap.get(c.symbol) || await getBookTickerCached(c.symbol); if(!book?.bid||!book?.ask) continue;
+                const book=bookMap.get(c.symbol)||await getBookTickerCached(c.symbol); if(!book?.bid||!book?.ask) continue;
                 const mid=(+book.bid + +book.ask)/2; if(!(mid>0)) continue;
-                
-                const depthForMicro = await getDepthCached(c.symbol);
-                const bidQ_micro = depthForMicro?.bids?.[0]?.[1] || 1;
-                const askQ_micro = depthForMicro?.asks?.[0]?.[1] || 1;
-                const microMid = microprice(+book.bid, +book.ask, bidQ_micro, askQ_micro);
-                const entryPrice = ENABLE_MICROPRICE ? microMid : mid;
 
-                const depthA=depthForMicro; await sleep(180+Math.floor(Math.random()*120)); const depthB=await fetchDepth(c.symbol);
+                const depthA=await getDepthCached(c.symbol); await sleep(180+Math.floor(Math.random()*120)); const depthB=await fetchDepth(c.symbol);
                 const depth=depthB||depthA; if(!depth?.bids?.length || !depth?.asks?.length) continue;
                 const obi=computeOBI(depth,OBI_TOPN);
                 const ofi30s=ofiProxy(depthA,depthB);
@@ -1199,9 +1012,6 @@ jobs:
                 const bestBid=+depth?.bids?.[0]?.[0], bestAsk=+depth?.asks?.[0]?.[0], bidQ=+depth?.bids?.[0]?.[1], askQ=+depth?.asks?.[0]?.[1];
                 const mp=(bestBid&&bestAsk&&bidQ&&askQ)?microprice(bestBid,bestAsk,bidQ,askQ):null;
                 const micro_bias_bps=(mp&&mid)?Math.round((mp-mid)/mid*10000):null;
-                const bidVolTop10=(depth.bids||[]).slice(0,10).reduce((s,[p,q])=>s+(+p)*(+q),0);
-                const askVolTop10=(depth.asks||[]).slice(0,10).reduce((s,[p,q])=>s+(+p)*(+q),0);
-                const ofi_strong=(bidVolTop10-askVolTop10)/(bidVolTop10+askVolTop10||1);
 
                 const km=await getKMultiTF(c.symbol);
                 const mtf=computeMTFIndicators(km, TF_WEIGHTS);
@@ -1217,15 +1027,12 @@ jobs:
                 const depth1pUSD=(d1.asksUSD||0)+(d1.bidsUSD||0);
 
                 const regime=p.mrLocked?"trend":"meanrevert";
-                let pLong=calibrateP(state,"long",regime,p.pLong0);
-                let pShort=calibrateP(state,"short",regime,p.pShort0);
-                if(ENABLE_REGIME_BOOST){
-                  pLong=metaBoostRegime(state,"long",regime,pLong,mtfAgg);
-                  pShort=metaBoostRegime(state,"short",regime,pShort,mtfAgg);
-                }
-
-                const coeffL=getCoeffs(state,"long",regime); const coeffS=getCoeffs(state,"short",regime);
-                const nL=Math.max(1,Math.min(500,coeffL.n||0)); const nS=Math.max(1,Math.min(500,coeffS.n||0));
+                const coeffL = getCoeffs(state, "long", regime);
+                const coeffS = getCoeffs(state, "short", regime);
+                const nL = Math.max(1, Math.min(500, coeffL.n || 0));
+                const nS = Math.max(1, Math.min(500, coeffS.n || 0));
+                const pLong=calibrateP(state,"long",regime,p.pLong0);
+                const pShort=calibrateP(state,"short",regime,p.pShort0);
                 const pLong_lcb=wilsonLCB(pLong, nL, WILSON_Z);
                 const pShort_lcb=wilsonLCB(pShort, nS, WILSON_Z);
 
@@ -1264,6 +1071,7 @@ jobs:
                 if(!chosen) continue;
 
                 const microQ=(Math.max(0,1-(p.spreadBps||0)/20))*(1-Math.min(0.6,(chosen.cost_bps-COST_BPS)/20))*(1+clamp(obi,-0.2,0.2));
+                // Soft TF alignment (no hard gate)
                 const gTF = clamp(0.4 + 0.8*tfAlign, 0.2, 1.2);
                 const regimeQ=0.7+0.4*tfAlign;
 
@@ -1278,7 +1086,7 @@ jobs:
 
                 const gateMult= clamp(gSpread * gCost * gVol * gDepth * gMR * gDir * gBTC * gTF * gEV, 0.2, 1.4);
 
-                let conf = confidenceScore({
+                const conf = confidenceScore({
                   p_cal: chosen.p_lcb,
                   ev_bps: chosen.ev_bps,
                   atr_bps: p.atr_bps,
@@ -1288,29 +1096,9 @@ jobs:
                   riskAdj: 1
                 }) * gateMult;
 
-                let ofi_penalty = null;
-                if(ENABLE_OFI_GATE){
-                  if(chosen.side==="long"&&ofi_strong<-OFI_THRESHOLD){conf=Math.round(conf*0.90);ofi_penalty="strong_sell_pressure";log(`⚠️  ${c.symbol} LONG has sell pressure OFI=${ofi_strong.toFixed(2)}`);}
-                  if(chosen.side==="short"&&ofi_strong>OFI_THRESHOLD){conf=Math.round(conf*0.90);ofi_penalty="strong_buy_pressure";log(`⚠️  ${c.symbol} SHORT has buy pressure OFI=${ofi_strong.toFixed(2)}`);}
-                }
-
                 const slipEst=chosen.side==="long"?slipL:slipS;
                 const btcCorr=corr((()=>{const r=[];for(let i=1;i<p.c5.length;i++) r.push(Math.log(p.c5[i]/p.c5[i-1])); return r.slice(-120);})(), btcR5);
-                
-                let entry_improvement_bps=0;
-                if(mid!=null){
-                    const slF=chosen.sl_bps/10000;
-                    const entry_limit_basic_long = entryPrice * (1 - Math.max(0.001, slF * 0.5));
-                    const entry_limit_basic_short = entryPrice * (1 + Math.max(0.001, slF * 0.5));
-                    if (ENABLE_IMPACT_PRICING) {
-                        const spreadBps=p.spreadBps||10;const impactBps=Math.min(spreadBps*0.3,8);
-                        if(chosen.side==="long"){const entry_limit_impact=entryPrice*(1-(slF*0.4+impactBps/10000));entry_improvement_bps=Math.round(Math.abs(entry_limit_impact-entry_limit_basic_long)/mid*10000);}
-                        else{const entry_limit_impact=entryPrice*(1+(slF*0.4+impactBps/10000));entry_improvement_bps=Math.round(Math.abs(entry_limit_impact-entry_limit_basic_short)/mid*10000);}
-                    }
-                }
-
-                const reasons=reasonBuilder({adx1h:ind1h?.adx||0,ofi30s,tfAlign,spread_bps:p.spreadBps,slip_bps_est:slipEst,mtf_rsi:mtfAgg.rsi,ofi_strong,bear_status:bearStatus.severity,entry_improvement_bps});
-                const calib_key = `side:${chosen.side}|regime:${chosen.regime}`;
+                const reasons=reasonBuilder({adx1h:ind1h?.adx||0,ofi30s,tfAlign,spread_bps:p.spreadBps,slip_bps_est:slipEst,mtf_rsi:mtfAgg.rsi});
 
                 refined.push({
                   symbol:c.symbol, base:c.base, quote:c.quote, qv:c.qv,
@@ -1334,9 +1122,7 @@ jobs:
                   mtf_agg: mtfAgg,
                   mtf_weights: mtf?.weights||{},
                   btc_corr: +(+btcCorr||0).toFixed(3),
-                  trend5m: p.trend5m, calib_key,
-                  microprice_val: mp, ofi_strong: +(ofi_strong.toFixed(3)), ofi_penalty,
-                  entry_improvement_bps
+                  trend5m: p.trend5m
                 });
               }catch(e){ log("heavy refine warn",e?.message||e); }
             }
@@ -1356,232 +1142,242 @@ jobs:
               const symMult = getSymbolAdj(state, x.base);
               x.confidence = Math.round(x.confidence * uniqMult * symMult);
             }
-            
-            // +++++ NEW: PRO DASHBOARD CONFIDENCE ADJUSTMENT (v7.7.7-PRO) +++++
-            const winning_sector = crossAssetContext.defiVsCeFi.winning_sector;
-            const sectors = { DEFI: new Set(['UNI', 'AAVE', 'LDO', 'MKR', 'SNX', 'CRV']), L1: new Set(['SOL', 'AVAX', 'SUI', 'APT', 'NEAR', 'ADA']), MEME: new Set(['DOGE', 'SHIB', 'PEPE', 'WIF', 'BONK']) };
-            
-            for (const x of refined) {
-              // 1. Regime Forecast Adjustment
-              if (!regimeForecast.risk_on && x.side === 'long') {
-                x.confidence = Math.round(x.confidence * 0.88);
-                x.context_adj = (x.context_adj || "") + "risk-off_long_penalty(-12%);";
-              }
-              // 2. Market Health Adjustment
-              if (marketHealth.breadth.pct_above_ema50_1h < 30 && x.side === 'long') {
-                x.confidence = Math.round(x.confidence * 0.90);
-                x.context_adj = (x.context_adj || "") + "low_breadth_penalty(-10%);";
-              }
-              if (marketHealth.momentumDivergence === 'bearish_divergence' && x.side === 'long') {
-                x.confidence = Math.round(x.confidence * 0.92);
-                x.context_adj = (x.context_adj || "") + "btc_div_penalty(-8%);";
-              }
-              // 3. Cross-Asset Context Adjustment
-              if (winning_sector && winning_sector !== 'OTHER' && crossAssetContext.defiVsCeFi.strength > 0.01) {
-                  if (sectors[winning_sector]?.has(x.base)) {
-                      x.confidence = Math.round(x.confidence * 1.07);
-                      x.context_adj = (x.context_adj || "") + `sector_boost(${winning_sector},+7%);`;
-                  }
-              }
-            }
-            // +++++ END PRO ADJUSTMENT +++++
 
-            // Bear Market and Calibration Health Penalties
-            for (const x of refined) {
-              if (ENABLE_BEAR_DETECTION) {
-                x.bear_status = bearStatus.severity;
-                if (bearStatus.action === "shorts_only" && x.side === "long") { x.confidence = Math.round(x.confidence * BEAR_CONF_PENALTY); x.bear_penalty_applied = Math.round(100*(1-BEAR_CONF_PENALTY)); }
-                if (bearStatus.action === "shorts_preferred" && x.side === "short") { x.confidence = Math.round(x.confidence * 1.05); x.bear_boost_applied = 5; }
-              }
-              const [side_key, regime_key] = x.calib_key ? x.calib_key.split('|') : ['', ''];
-              const c_side = side_key.split(':')[1];
-              const c_regime = regime_key.split(':')[1];
-              const health_key = `${c_side}_${c_regime}`;
-              const health_info = calibHealth[health_key];
-              if (health_info && health_info.status === "degraded" && parseFloat(health_info.avg_error) > 0.45) {
-                x.confidence = Math.round(x.confidence * 0.90);
-                x.calib_degraded_penalty = -10;
-              }
-            }
-            
             refined.sort((a,b)=>b.confidence-a.confidence);
 
-            // Greedy Correlation-Aware Selection
             const TARGET_TOP_N = Math.max(1, TOP_N || 3);
-            const CORR_THRESHOLD = 0.98;
-            const MIN_QUOTA = Math.floor(TARGET_TOP_N * 0.67);
 
-            const selected = [];
+            const selected=[];
             for (const cand of refined) {
               if (selected.length >= TARGET_TOP_N) break;
-              
-              let maxCorr = 0;
+              let ok=true;
               for (const s of selected) {
-                if (cand.side === s.side) {
-                  const r = corr(cand.ret5 || [], s.ret5 || []);
-                  maxCorr = Math.max(maxCorr, r);
-                }
+                const r=corr(cand.ret5||[], s.ret5||[]);
+                if (r>0.98 && cand.side===s.side) { ok=false; break; }
               }
-              cand.max_correlation = +(maxCorr.toFixed(3));
-              
-              const isDiverse = maxCorr < CORR_THRESHOLD;
-              const needQuota = selected.length < MIN_QUOTA;
-              
-              if (isDiverse || needQuota) {
-                if (!isDiverse && needQuota) {
-                  cand.forced_for_quota = true;
-                }
-                selected.push(cand);
-              } else {
-                cand.rejected_reason = `high_corr_${maxCorr.toFixed(2)}`;
+              if (ok) selected.push(cand);
+            }
+            // If still fewer than target, fill ignoring correlation guard by descending confidence
+            if (selected.length < TARGET_TOP_N) {
+              const have=new Set(selected.map(s=>s.symbol+":"+s.side));
+              for (const c of refined) {
+                if (selected.length >= TARGET_TOP_N) break;
+                const k=c.symbol+":"+c.side;
+                if (!have.has(k)) { selected.push(c); have.add(k); }
               }
             }
-            log(`Selected ${selected.length}/${TARGET_TOP_N} (${selected.filter(s => s.forced_for_quota).length} forced)`);
+            // Just in case refined was tiny, ensure we never exceed target
+            if (selected.length > TARGET_TOP_N) selected.splice(TARGET_TOP_N);
 
-            // Minimum Confidence Gate
-            const viable = selected.filter(s => s.confidence >= MIN_CONFIDENCE);
-            if (viable.length < selected.length) {
-              log(`⚠️  Filtered ${selected.length - viable.length} trades below confidence ${MIN_CONFIDENCE}`);
-              log(`   Rejected: ${selected.filter(s => s.confidence < MIN_CONFIDENCE).map(s => `${s.symbol}:${s.confidence}`).join(', ')}`);
-            }
-            if (viable.length === 0 && selected.length > 0) {
-              log("🛑 No trades meet minimum confidence - skipping cycle");
-              reason = "low_confidence";
-            }
+            // Risk weights via softmax of EV (unchanged)
+            const wEv=softmax(selected.map(x=>x.exp_lcb_bps),20);
 
-            // Correlation Metadata for final portfolio
-            for (const s of viable) {
-              let maxCorr = 0;
-              for (const other of viable) {
-                if (s.symbol === other.symbol) continue;
-                const r = corr(s.ret5 || [], other.ret5 || []);
-                maxCorr = Math.max(maxCorr, r);
-              }
-              s.max_correlation_in_portfolio = +(maxCorr.toFixed(3));
-            }
-            if (viable.length > 1) {
-              const avgCorr = mean(viable.map(s => s.max_correlation_in_portfolio || 0));
-              log(`📊 Portfolio avg correlation: ${avgCorr.toFixed(3)}`);
-              if (avgCorr > 0.85) { log(`⚠️  High correlation portfolio - consider manual review`); }
-            }
-
-            // Risk weights via softmax of EV, or equal weights if using fixed sizing
-            const FIXED_POSITION_PCT_CHECK = Number(process.env.FIXED_POSITION_SIZE_PCT);
-            let wEv;
-            if (!isNaN(FIXED_POSITION_PCT_CHECK) && FIXED_POSITION_PCT_CHECK > 0) {
-              wEv = Array(viable.length).fill(1/Math.max(1, viable.length));
-              log(`[gha] Fixed position sizing enabled (${FIXED_POSITION_PCT_CHECK}%): Using equal weights.`);
-            } else {
-              wEv = softmax(viable.map(x=>x.exp_lcb_bps),20);
-            }
-
-            // Build full v2 ideas
-            let picksV2 = viable.map((x,i)=>{
+            // Build full v2 ideas (all code2 semantics kept)
+            let picksV2 = selected.map((x,i)=>{
               const bk = bookMap.get(x.symbol);
               const mid = (bk?.bid && bk?.ask) ? ((+bk.bid + +bk.ask)/2) : null;
-              
+
+              // compute abs exits (also needed for v1 compat)
               let entry_limit = null, tp_abs = null, sl_abs = null;
               if (mid != null) {
                 const slF = x.sl_bps/10000, tpF = x.tp_bps/10000;
-                const entry_base_price = (ENABLE_MICROPRICE && x.microprice_val) ? x.microprice_val : mid;
-
-                const entry_limit_basic_long = entry_base_price * (1 - Math.max(0.001, slF * 0.5));
-                const entry_limit_basic_short = entry_base_price * (1 + Math.max(0.001, slF * 0.5));
-
-                entry_limit = (x.side === 'long') ? entry_limit_basic_long : entry_limit_basic_short;
-
-                if (ENABLE_IMPACT_PRICING) {
-                  const spreadBps = x.spread_bps || 10;
-                  const impactBps = Math.min(spreadBps * 0.3, 8);
-                  if (x.side === "long") {
-                    entry_limit = entry_base_price * (1 - (slF * 0.4 + impactBps / 10000));
-                  } else {
-                    entry_limit = entry_base_price * (1 + (slF * 0.4 + impactBps / 10000));
-                  }
+                if (x.side === "long") {
+                  entry_limit = mid * (1 - Math.max(0.001, slF*0.5));
+                  tp_abs = entry_limit * (1 + tpF);
+                  sl_abs = entry_limit * (1 - slF);
+                } else {
+                  entry_limit = mid * (1 + slF);
+                  tp_abs = entry_limit * (1 - tpF);
+                  sl_abs = entry_limit * (1 + slF);
                 }
-                
-                tp_abs = (x.side === 'long') ? entry_limit * (1 + tpF) : entry_limit * (1 - tpF);
-                sl_abs = (x.side === 'long') ? entry_limit * (1 - slF) : entry_limit * (1 + slF);
               }
 
               const idea_id = uuidv4();
               const client_order_id = mkClientOrderId("mxu");
+
               const ttl = clamp(Math.round((x.hold_sec || 720)+i*12), TTL_MIN, TTL_MAX);
-              
-              const FIXED_POSITION_PCT = Number(process.env.FIXED_POSITION_SIZE_PCT);
-              let size_bps;
-              if (!isNaN(FIXED_POSITION_PCT) && FIXED_POSITION_PCT > 0) {
-                size_bps = Math.round(FIXED_POSITION_PCT * 100);
-              } else {
-                size_bps = (Number(process.env.FORCE_SIZE_BPS||"0")>0)
-                    ? Math.round(Number(process.env.FORCE_SIZE_BPS))
-                    : (x.sl_bps>0?Math.min(220,Math.round((wEv[i]*TARGET_PORT_RISK_BPS/x.sl_bps)*100)):0);
-              }
+              const size_bps = (Number(process.env.FORCE_SIZE_BPS||"0")>0)
+                  ? Math.round(Number(process.env.FORCE_SIZE_BPS))
+                  : (x.sl_bps>0?Math.min(220,Math.round((wEv[i]*TARGET_PORT_RISK_BPS/x.sl_bps)*100)):0);
 
               return {
-                idea_id, client_order_id, symbol: x.base, symbol_full: x.symbol, symbolFull: x.symbol, quote: x.quote, side: x.side, rank: i+1,
-                target_exchange: TARGET_EXCHANGE, market_type: MARKET_TYPE, margin_mode: MARGIN_MODE, leverage: LEVERAGE,
-                entry_policy: "maker_join", exec: { exec: "post_only" },
-                entry_mid: mid, entry_limit, tp_abs, sl_abs, tp_bps: x.tp_bps, sl_bps: x.sl_bps, rrr: x.rrr,
-                exp_lcb_bps: x.exp_lcb_bps, ev_bps: x.exp_bps, cost_bps: x.cost_bps,
-                p_win: x.p_lcb, p_lcb: x.p_lcb, p_raw: x.p_raw, calib_key: x.calib_key, regime: x.regime,
-                ttl_sec: ttl, size_bps,
-                predicted: { ts_ms: Date.now(), p_cal: x.p_lcb, ev_bps: x.exp_lcb_bps ?? x.exp_bps, confidence_score: x.confidence },
-                confidence: x.confidence, reasons: x.reasons,
+                idea_id, client_order_id,
+
+                symbol: x.base,
+                symbol_full: x.symbol,
+                symbolFull: x.symbol,
+                quote: x.quote,
+                side: x.side,
+                rank: i+1,
+
+                // v2/futures intent (kept, but hidden from v1 Worker)
+                target_exchange: TARGET_EXCHANGE,   // e.g. "bybit_futures_testnet"
+                market_type: MARKET_TYPE,           // "futures"
+                margin_mode: MARGIN_MODE,           // "isolated"
+                leverage: LEVERAGE,                 // 1
+
+                // code2 entry intent
+                entry_policy: "maker_join",
+                exec: { exec: "post_only" },
+
+                // entry + exits
+                entry_mid: mid,
+                entry_limit,
+                tp_abs,
+                sl_abs,
+
+                tp_bps: x.tp_bps,
+                sl_bps: x.sl_bps,
+                rrr: x.rrr,
+                exp_lcb_bps: x.exp_lcb_bps,
+                ev_bps: x.exp_bps,
+                cost_bps: x.cost_bps,
+
+                p_win: x.p_lcb,
+                p_lcb: x.p_lcb,
+                p_raw: x.p_raw,
+                calib_key: `side:${x.side}|regime:${x.regime}`,
+                regime: x.regime,
+
+                ttl_sec: ttl,
+                size_bps,
+
+                predicted: {
+                  ts_ms: Date.now(),
+                  p_cal: x.p_lcb,
+                  ev_bps: x.exp_lcb_bps ?? x.exp_bps,
+                  confidence_score: x.confidence
+                },
+
+                confidence: x.confidence,
+                reasons: x.reasons,
                 reasons_text: (x.reasons||[]).slice(0,3).map(r=>`${r.factor}:${r.value}(${r.contribution>=0?"+":""}${r.contribution})`),
-                trend5m: x.trend5m, bear_status: x.bear_status, max_correlation_in_portfolio: x.max_correlation_in_portfolio,
-                context_adj: x.context_adj
+
+                // keep for state/debug parity
+                trend5m: x.trend5m
               };
             });
 
-            // Convert v2 ideas to a v1‑compatible shape
+            // Convert v2 ideas to a v1‑compatible shape for the current Worker
             const toV1Compat = (pv2) => ({
-              idea_id: pv2.idea_id, client_order_id: pv2.client_order_id,
-              symbol: pv2.symbol, symbol_full: pv2.symbol_full, quote: pv2.quote, side: pv2.side, rank: pv2.rank,
-              entry_policy: "smart_swing_limit", entry_type: "limit", activation: "on_fill",
-              entry_mid: pv2.entry_mid, entry_limit: pv2.entry_limit, tp_abs: pv2.tp_abs, sl_abs: pv2.sl_abs,
-              tp_bps: pv2.tp_bps, sl_bps: pv2.sl_bps, rrr: pv2.rrr,
-              exp_lcb_bps: pv2.exp_lcb_bps, ev_bps: pv2.ev_bps, cost_bps: pv2.cost_bps,
-              p_win: pv2.p_lcb, p_lcb: pv2.p_lcb, p_raw: pv2.p_raw, calib_key: pv2.calib_key, regime: pv2.regime,
-              ttl_sec: pv2.ttl_sec, size_bps: pv2.size_bps,
-              predicted: { ...pv2.predicted, meta: { strategy: STRATEGY_NAME, model_version: MODEL_VERSION, schema_version: SCHEMA_VERSION, git_sha: GIT_SHA, config_hash: CONFIG_HASH, futures_hint: { target_exchange: pv2.target_exchange, market_type: pv2.market_type, margin_mode: pv2.margin_mode, leverage: pv2.leverage, entry_policy_override: pv2.entry_policy, exec: pv2.exec } } },
-              confidence: pv2.confidence, reasons: pv2.reasons, reasons_text: pv2.reasons_text, trend5m: pv2.trend5m,
-              bear_status: pv2.bear_status, max_correlation_in_portfolio: pv2.max_correlation_in_portfolio,
-              context_adj: pv2.context_adj,
-            });
-            let picks = picksV2.map(toV1Compat);
+              idea_id: pv2.idea_id,
+              client_order_id: pv2.client_order_id,
 
-            // Portfolio VaR/ES throttle on sizes (disabled if using fixed sizing)
-            const FIXED_POSITION_PCT_CHECK_VAR = Number(process.env.FIXED_POSITION_SIZE_PCT);
-            if (!isNaN(FIXED_POSITION_PCT_CHECK_VAR) && FIXED_POSITION_PCT_CHECK_VAR > 0) {
-              log("[gha] Fixed position sizing enabled: VaR throttle disabled.");
-            } else {
-              try {
-                const varStats = portfolioVaR_ES_tCopula(picks, 6);
-                if (varStats.ES95_bps < -220) {
-                  const scale = clamp(-220 / Math.min(-1e-6, varStats.ES95_bps), 0.35, 1);
-                  picks = picks.map(p => ({ ...p, size_bps: Math.max(4, Math.round(p.size_bps * scale)) }));
-                  console.log("[gha] VaR/ES throttle", varStats, "scale", scale);
-                } else {
-                  console.log("[gha] VaR/ES ok", varStats);
+              symbol: pv2.symbol,
+              symbol_full: pv2.symbol_full,
+              quote: pv2.quote,
+              side: pv2.side,
+              rank: pv2.rank,
+
+              // v1 entry shape (what the current MEXC Worker expects)
+              entry_policy: "smart_swing_limit",
+              entry_type: "limit",
+              activation: "on_fill",
+
+              entry_mid: pv2.entry_mid,
+              entry_limit: pv2.entry_limit,
+              tp_abs: pv2.tp_abs,
+              sl_abs: pv2.sl_abs,
+
+              tp_bps: pv2.tp_bps,
+              sl_bps: pv2.sl_bps,
+              rrr: pv2.rrr,
+              exp_lcb_bps: pv2.exp_lcb_bps,
+              ev_bps: pv2.ev_bps,
+              cost_bps: pv2.cost_bps,
+
+              p_win: pv2.p_lcb,
+              p_lcb: pv2.p_lcb,
+              p_raw: pv2.p_raw,
+              calib_key: pv2.calib_key,
+              regime: pv2.regime,
+
+              ttl_sec: pv2.ttl_sec,
+              size_bps: pv2.size_bps,
+
+              // keep all new info inside meta extras (preserved for your separate Worker)
+              predicted: {
+                ...pv2.predicted,
+                meta: {
+                  strategy: STRATEGY_NAME, model_version: MODEL_VERSION, schema_version: SCHEMA_VERSION,
+                  git_sha: GIT_SHA, config_hash: CONFIG_HASH,
+                  futures_hint: {
+                    target_exchange: pv2.target_exchange,
+                    market_type: pv2.market_type,
+                    margin_mode: pv2.margin_mode,
+                    leverage: pv2.leverage,
+                    entry_policy_override: pv2.entry_policy,
+                    exec: pv2.exec
+                  }
                 }
-              } catch (e) { console.log("[gha] VaR/ES warn", e?.message||e); }
-            }
+              },
 
-            // Update state with pending ideas
+              confidence: pv2.confidence,
+              reasons: pv2.reasons,
+              reasons_text: pv2.reasons_text,
+              trend5m: pv2.trend5m
+            });
+
+            let picks = picksV2.map(toV1Compat); // this is what you POST to the current Worker
+
+            // Portfolio VaR/ES throttle on sizes
+            try {
+              const varStats = portfolioVaR_ES_tCopula(picks, 6);
+              if (varStats.ES95_bps < -220) {
+                const scale = clamp(-220 / Math.min(-1e-6, varStats.ES95_bps), 0.35, 1);
+                picks = picks.map(p => ({ ...p, size_bps: Math.max(4, Math.round(p.size_bps * scale)) }));
+                console.log("[gha] VaR/ES throttle", varStats, "scale", scale);
+              } else {
+                console.log("[gha] VaR/ES ok", varStats);
+              }
+            } catch (e) { console.log("[gha] VaR/ES warn", e?.message||e); }
+
+            // Update state with pending ideas + cooldowns (v1-safe)
             try{
-              const nowMs = Date.now(); const ideasTs = new Date(nowMs).toISOString();
+              const nowMs = Date.now();
+              const ideasTs = new Date(nowMs).toISOString();
               for (const p of picks) {
-                state.cooldown[p.symbol] = nowMs; state.cooldown_side[p.symbol] = { side: p.side, ts_ms: nowMs };
+                state.cooldown[p.symbol] = nowMs;
+                state.cooldown_side[p.symbol] = { side: p.side, ts_ms: nowMs };
                 state.pending.push({
-                  ts: ideasTs, ts_ms: nowMs, ttl_ts_ms: nowMs + p.ttl_sec*1000,
-                  symbolFull: p.symbol_full, base: p.symbol, quote: p.quote, side: p.side,
-                  entry_limit: p.entry_limit, tp_abs: p.tp_abs, sl_abs: p.sl_abs,
-                  hold_sec: p.ttl_sec, tp_bps: p.tp_bps, sl_bps: p.sl_bps, cost_bps: p.cost_bps, tier: p.tier || "confidence",
-                  p_lcb: p.p_lcb, p_raw: p.p_raw, calib_key: p.calib_key, predicted: p.predicted, regime: p.regime,
+                  ts: ideasTs,
+                  ts_ms: nowMs,
+                  ttl_ts_ms: nowMs + p.ttl_sec*1000,
+
+                  symbolFull: p.symbol_full,   // keep this key as in code1/state
+                  base: p.symbol,
+                  quote: p.quote,
+                  side: p.side,
+
+                  entry_limit: p.entry_limit,
+                  tp_abs: p.tp_abs,
+                  sl_abs: p.sl_abs,
+
+                  hold_sec: p.ttl_sec,
+                  tp_bps: p.tp_bps,
+                  sl_bps: p.sl_bps,
+                  cost_bps: p.cost_bps,
+                  tier: p.tier || "confidence",
+
+                  p_lcb: p.p_lcb,
+                  p_raw: p.p_raw,
+                  calib_key: p.calib_key,
+                  predicted: p.predicted,
+                  regime: p.regime,
+
                   decision_context: { tfs:["1m","5m","15m","1h","4h"], mtf_weights: TF_WEIGHTS },
-                  notional_usd: NOTIONAL, size_bps: p.size_bps, idea_id: p.idea_id, client_order_id: p.client_order_id, trend5m: p.trend5m,
-                  status: "planned", entry_ts_ms: null, entry_price: null, qty: null
+
+                  notional_usd: NOTIONAL,
+                  size_bps: p.size_bps,
+
+                  idea_id: p.idea_id,
+                  client_order_id: p.client_order_id,
+                  trend5m: p.trend5m,
+
+                  status: "planned",
+                  entry_ts_ms: null,
+                  entry_price: null,
+                  qty: null
                 });
               }
               if (state.pending.length > 550) state.pending = state.pending.slice(-550);
@@ -1595,22 +1391,29 @@ jobs:
             log("DEBUG: saveState call complete.");
 
             // Build meta and payload — push v1 ideas to the existing Worker
-            for (const p of picks) { log(`idea ${p.symbol_full} ${p.side} conf=${p.confidence} reasons=${(p.reasons_text||[]).join("; ")} adj=${p.context_adj||'none'}`); }
-            const ideaLogs = picks.map(p=>({symbol:p.symbol_full,side:p.side,confidence:p.confidence,reasons:p.reasons_text,p_cal:+p.p_lcb.toFixed(3),ev_bps:p.ev_bps,idea_id:p.idea_id,bear_status:p.bear_status,max_corr:p.max_correlation_in_portfolio,context_adj:p.context_adj}));
+            for (const p of picks) { log(`idea ${p.symbol_full} ${p.side} conf=${p.confidence} reasons=${(p.reasons_text||[]).join("; ")}`); }
+            const ideaLogs = picks.map(p=>({symbol:p.symbol_full,side:p.side,confidence:p.confidence,reasons:p.reasons_text,p_cal:+p.p_lcb.toFixed(3),ev_bps:p.ev_bps,idea_id:p.idea_id}));
 
             const meta = {
-              origin:"github_actions", reason, exchange:"mexc", exchange_base: BASE,
+              origin:"github_actions",
+              reason,
+              exchange:"mexc", exchange_base: BASE,
               strategy: STRATEGY_NAME, model_version: MODEL_VERSION, schema_version: SCHEMA_VERSION,
               git_sha: GIT_SHA, config_hash: CONFIG_HASH,
-              counts:{universe:universe.length,refined:refined.length,selected:viable.length,pushed:picks.length},
+              counts:{universe:universe.length,refined:refined.length,selected:picks.length},
               dd_gate:{pnl24_bps,peak_dd_bps,throttle},
               tod:{active:S_H!=null&&E_H!=null,start:S_H,end:E_H},
               heartbeat:{ mismatches:heartbeat?.mismatches||0, zombies:heartbeat?.zombies||0 },
-              tier: selectionTier, idea_logs: ideaLogs, tf_weights: TF_WEIGHTS,
-              calibration_health: calibHealth, bear_status: bearStatus,
-              // +++++ NEW: PRO DASHBOARDS IN LOGS +++++
-              pro_dashboards: { regimeForecast, marketHealth, crossAssetContext },
-              extras: { v2_ideas: picksV2, features_requested: ["maker_join","post_only","futures"] }
+              tier: selectionTier,
+              idea_logs: ideaLogs,
+              tf_weights: TF_WEIGHTS,
+              calibration_health: calibHealth,
+
+              // keep all code2 fields here so nothing is lost
+              extras: {
+                v2_ideas: picksV2,
+                features_requested: ["maker_join","post_only","futures"]
+              }
             };
 
             const payload = { ts:new Date().toISOString(), mode:"normal", source:"external_pusher", meta, top_n:picks.length||0, ideas:picks||[] };
@@ -1630,7 +1433,7 @@ jobs:
                 ts: new Date().toISOString(),
                 mode: "normal",
                 source: "external_pusher",
-                meta: { origin: "github_actions_v2", pro_dashboards: { regimeForecast, marketHealth, crossAssetContext } },
+                meta: { origin: "github_actions_v2" },
                 top_n: picksV2.length,
                 ideas: picksV2
               };
