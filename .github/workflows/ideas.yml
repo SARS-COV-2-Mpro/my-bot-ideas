@@ -45,6 +45,7 @@ jobs:
       ACTIVE_UTC_END: ${{ vars.ACTIVE_UTC_END }}
       MEXC_BASE: ${{ vars.MEXC_BASE }}
       FORCE_SIZE_BPS: ${{ vars.FORCE_SIZE_BPS }}
+      CAPITAL_PCT_PER_TRADE: ${{ vars.CAPITAL_PCT_PER_TRADE }}  # ⭐ NEW: e.g., 10 for 10%
 
       # New Confidence Model Knobs
       DIRECTION: ${{ vars.DIRECTION }}
@@ -298,6 +299,11 @@ jobs:
           const LONG_BOUNCE_SL_ATR=Number(process.env.LONG_BOUNCE_SL_ATR||"0.50"), LONG_BOUNCE_TP_ATR=Number(process.env.LONG_BOUNCE_TP_ATR||"0.90");
           const LONG_SIMILARITY_RHO=Number(process.env.LONG_SIMILARITY_RHO||"0.84");
 
+          // ⭐ NEW: Fixed capital % per trade (e.g., 10 = 10% of capital)
+          const CAPITAL_PCT_PER_TRADE=Number(process.env.CAPITAL_PCT_PER_TRADE||"0");
+          const FIXED_SIZE_BPS = CAPITAL_PCT_PER_TRADE > 0 ? Math.min(2000, Math.round(CAPITAL_PCT_PER_TRADE * 100)) : 0;
+          // If CAPITAL_PCT_PER_TRADE=10, then FIXED_SIZE_BPS=1000 (10% = 1000 bps)
+
           const CONFIG_HASH=(()=>{ try{
             const knobs={
               DIRECTION, MR_BREAKOUT_DC_N, MR_BREAKOUT_RET15_ATR, MR_LOCKOUT_SEC,
@@ -414,6 +420,7 @@ jobs:
               cooldown:{}, cooldown_side:{}, pending:[], equity:[], closed:[],
               mr_lockout:{}, sym_stats:{}, sym_stats_real:{}, calibCoeffs:{}, lastReconcileTs:0,
               calibration_holdout:[],
+              ml_voting_history:[], // ⭐ NEW
               ml_models:{
                 xgboost:{weights:null,trained_at:0,n_samples:0},
                 lightgbm:{weights:null,trained_at:0,n_samples:0},
@@ -466,6 +473,7 @@ jobs:
                 hmm:{transition:null,emission:null,trained_at:0,n_samples:0}
               };
               if(!Array.isArray(s.ml_training_buffer))s.ml_training_buffer=[];
+              if(!Array.isArray(s.ml_voting_history))s.ml_voting_history=[]; // ⭐ NEW
 
               return { state:s, persist:{ id, token, etag } };
             }catch(e){ log("loadState warn", e?.message||e); return { state:init, persist:null }; }
@@ -882,9 +890,12 @@ jobs:
             
             const votes={long:0,short:0,details:[]};
             
-            log(`🔍 Collecting votes from 11 models...`);
+            log(`🔍 Collecting votes from 11 models (XGBoost=3x weight)...`);
             
-            const v1=predictXGBoost(state.ml_models.xgboost,features); votes[v1]++; votes.details.push({model:'XGBoost',vote:v1}); log(`  [1] XGBoost      → ${v1.toUpperCase()}`);
+            const v1=predictXGBoost(state.ml_models.xgboost,features); 
+            votes[v1]+=3; // ⭐ XGBoost counts as 3 votes
+            votes.details.push({model:'XGBoost',vote:v1,weight:3}); 
+            log(`  [1] XGBoost      → ${v1.toUpperCase()} (×3 weight)`);
             const v2=predictLightGBM(state.ml_models.lightgbm,features); votes[v2]++; votes.details.push({model:'LightGBM',vote:v2}); log(`  [2] LightGBM     → ${v2.toUpperCase()}`);
             const v3=predictCatBoost(state.ml_models.catboost,features); votes[v3]++; votes.details.push({model:'CatBoost',vote:v3}); log(`  [3] CatBoost     → ${v3.toUpperCase()}`);
             const v4=predictRandomForest(state.ml_models.random_forest,features); votes[v4]++; votes.details.push({model:'RandomForest',vote:v4}); log(`  [4] RandomForest → ${v4.toUpperCase()}`);
@@ -902,12 +913,13 @@ jobs:
             const majorityCount=Math.max(votes.long,votes.short);
             const minorityCount=Math.min(votes.long,votes.short);
             const confidenceBoost=majorityCount-minorityCount;
-            
-            log(`✅ DECISION: ${majoritySide.toUpperCase()} +${confidenceBoost} (${(majorityCount/11*100).toFixed(1)}% agree)`);
+            const totalVotes=votes.long+votes.short; // Now 13 total (11 models, XGBoost=3)
+
+            log(`✅ DECISION: ${majoritySide.toUpperCase()} +${confidenceBoost} (${(majorityCount/totalVotes*100).toFixed(1)}% agree)`);
             if(majoritySide!==originalSide)log(`⚠️  SIDE FLIPPED: ${originalSide}→${majoritySide}`);
             log(`==========================================\n`);
             
-            return {ensemble_side:majoritySide,votes_long:votes.long,votes_short:votes.short,confidence_boost:confidenceBoost,agreement:(majorityCount/11).toFixed(2),details:votes.details};
+            return {ensemble_side:majoritySide,votes_long:votes.long,votes_short:votes.short,confidence_boost:confidenceBoost,agreement:(majorityCount/totalVotes).toFixed(2),details:votes.details};
           }
           function getSymbolAdj(state, base) {
             const real = state.sym_stats_real?.[base];
@@ -1343,13 +1355,14 @@ jobs:
                 pick.tfAlign||0
               );
               
-              const ensemble=await mlEnsembleVote(pick.symbol,features,pick.side,state);
-              
               const oldSide=pick.side;
+              const ensemble=await mlEnsembleVote(pick.symbol,features,oldSide,state);
+              
               const oldConf=pick.confidence;
               
               pick.side=ensemble.ensemble_side;
               pick.confidence+=ensemble.confidence_boost;
+              ensemble.original_side = oldSide;
               pick.ml_ensemble=ensemble;
               pick.ml_features=features;
               
@@ -1367,8 +1380,48 @@ jobs:
               log(`  ${i+1}. ${p.symbol} ${p.side.toUpperCase()} conf=${p.confidence} (${p.ml_ensemble?.votes_long}L/${p.ml_ensemble?.votes_short}S)`);
             }
 
+            // ⭐ NEW: Save voting record to Gist
+            log(`\n💾 Saving ML voting record to Gist...`);
+            if(!state.ml_voting_history) state.ml_voting_history=[];
+            const votingRecord={
+              ts: new Date().toISOString(),
+              ts_ms: Date.now(),
+              votes: selected.slice(0,10).map(p=>({
+                symbol: p.symbol,
+                original_side: p.ml_ensemble?.original_side || p.side,
+                final_side: p.side,
+                votes_long: p.ml_ensemble?.votes_long||0,
+                votes_short: p.ml_ensemble?.votes_short||0,
+                confidence_before: p.ml_ensemble ? (p.confidence - p.ml_ensemble.confidence_boost) : p.confidence,
+                confidence_after: p.confidence,
+                boost: p.ml_ensemble?.confidence_boost||0,
+                agreement_pct: p.ml_ensemble?.agreement||'0.00',
+                model_votes: p.ml_ensemble?.details||[]
+              }))
+            };
+            state.ml_voting_history.push(votingRecord);
+            if(state.ml_voting_history.length>20) state.ml_voting_history=state.ml_voting_history.slice(-20);
+
+            // Save to Gist BEFORE building picks
+            try {
+              const auditOut=buildAuditOutputs(state);
+              await saveState(persist, state, auditOut, 2, true);
+              log(`✅ ML voting record saved to Gist (${votingRecord.votes.length} votes)`);
+            } catch(e) {
+              log(`⚠️  Failed to save voting record:`, e?.message||e);
+            }
+
             // Risk weights via softmax of EV (unchanged)
             const wEv=softmax(selected.map(x=>x.exp_lcb_bps),20);
+
+            // Log sizing mode
+            if(FIXED_SIZE_BPS > 0) {
+              log(`\n💰 Using FIXED capital allocation: ${CAPITAL_PCT_PER_TRADE}% per trade (${FIXED_SIZE_BPS} bps)`);
+            } else if(Number(process.env.FORCE_SIZE_BPS||"0")>0) {
+              log(`\n💰 Using FORCE_SIZE_BPS: ${process.env.FORCE_SIZE_BPS} bps per trade`);
+            } else {
+              log(`\n💰 Using DYNAMIC risk-based sizing (max ${TARGET_PORT_RISK_BPS} bps portfolio risk)`);
+            }
 
             // Build full v2 ideas (all code2 semantics kept)
             let picksV2 = selected.map((x,i)=>{
@@ -1394,9 +1447,11 @@ jobs:
               const client_order_id = mkClientOrderId("mxu");
 
               const ttl = clamp(Math.round((x.hold_sec || 720)+i*12), TTL_MIN, TTL_MAX);
-              const size_bps = (Number(process.env.FORCE_SIZE_BPS||"0")>0)
-                  ? Math.round(Number(process.env.FORCE_SIZE_BPS))
-                  : (x.sl_bps>0?Math.min(220,Math.round((wEv[i]*TARGET_PORT_RISK_BPS/x.sl_bps)*100)):0);
+              const size_bps = FIXED_SIZE_BPS > 0 
+                  ? FIXED_SIZE_BPS  // Use fixed % if set
+                  : (Number(process.env.FORCE_SIZE_BPS||"0")>0)
+                      ? Math.round(Number(process.env.FORCE_SIZE_BPS))  // Fallback to old FORCE_SIZE_BPS
+                      : (x.sl_bps>0?Math.min(220,Math.round((wEv[i]*TARGET_PORT_RISK_BPS/x.sl_bps)*100)):0);  // Dynamic risk-based
 
               return {
                 idea_id, client_order_id,
