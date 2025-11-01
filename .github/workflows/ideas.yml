@@ -1,8 +1,7 @@
 name: Ideas Pusher (MEXC Ultimate 7.7.7 - FIXED)
 
 on:
-  schedule:
-    - cron: "0 */3 * * *"
+  
   repository_dispatch:
     types: [run_B]
   workflow_dispatch: {}
