@@ -1,4 +1,3 @@
-s
 name: Ideas Pusher (MEXC Ultimate 7.7.7)
 
 on:
@@ -1000,14 +999,18 @@ jobs:
             let score = model.initial_pred || 0;
             for (const tree of model.trees) {
               let node = tree.root;
+              // For XGBoost, the tree might be trained on a subset of features
+              const feature_indices = tree.features || Array.from({length: feat.length}, (_, i) => i);
+              
               while (node.type === 'split') {
+                // Check if the feature used for split is in this tree's feature set
+                // This check is implicitly handled by `node.feature` being an index from the original `feat` array
                 if (feat[node.feature] < node.threshold) {
                   node = node.left;
                 } else {
                   node = node.right;
                 }
               }
-              // XGBoost uses learning rate (shrinkage)
               score += (model.learning_rate || 0.1) * node.value;
             }
             
@@ -1084,7 +1087,6 @@ jobs:
             if (!model?.transition || !model?.emission) {
               return Math.random() > 0.5 ? "long" : "short";
             }
-            
             // Simplified: use recent price momentum to determine state
             const momentum_score = (feat[0] || 0) + (feat[1] || 0); // roc1 + roc3
             
@@ -1109,249 +1111,213 @@ jobs:
           }
 
           async function trainMLModels(state) {
-            const data = state.ml_training_buffer.slice(-500);
-            const n = data.length;
-            
-            if (n < 20) {
-              log(`🎓 Not enough data to train (${n} < 20 samples)`);
-              return;
-            }
-            
-            log(`🎓 Training 12 ML models with ${n} samples...`);
-            const nowTs = Date.now();
-            
-            // Prepare X (features) and y (labels: 1 for long/win, 0 for short/loss)
-            const X = data.map(d => d.features);
-            const y = data.map(d => d.label); // 1 or 0
-            const y_signed = y.map(v => v === 1 ? 1 : -1); // +1 or -1 for some models
-            
-            // 1. Logistic Regression (gradient descent)
-            {
-              const lr = 0.01, epochs = 50;
-              const w = Array(X[0].length).fill(0);
-              let bias = 0;
-              
-              for (let epoch = 0; epoch < epochs; epoch++) {
-                for (let i = 0; i < n; i++) {
-                  let z = bias;
-                  for (let j = 0; j < w.length; j++) z += w[j] * X[i][j];
-                  const pred = sigmoid(z);
-                  const err = y[i] - pred;
-                  bias += lr * err;
-                  for (let j = 0; j < w.length; j++) w[j] += lr * err * X[i][j];
-                }
+              const data = state.ml_training_buffer.slice(-500);
+              const n = data.length;
+
+              if (n < 20) {
+                  log(`🎓 Not enough data to train (${n} < 20 samples)`);
+                  return;
               }
-              
-              state.ml_models.logistic = { w, bias, trained_at: nowTs, n_samples: n };
-            }
-            
-            // 2. Naive Bayes
-            {
-              const long_samples = X.filter((_, i) => y[i] === 1);
-              const short_samples = X.filter((_, i) => y[i] === 0);
-              
-              const means_long = Array(X[0].length).fill(0).map((_, j) => 
-                mean(long_samples.map(s => s[j]))
-              );
-              const stds_long = Array(X[0].length).fill(0).map((_, j) => 
-                std(long_samples.map(s => s[j])) || 1
-              );
-              const means_short = Array(X[0].length).fill(0).map((_, j) => 
-                mean(short_samples.map(s => s[j]))
-              );
-              const stds_short = Array(X[0].length).fill(0).map((_, j) => 
-                std(short_samples.map(s => s[j])) || 1
-              );
-              
-              state.ml_models.naivebayes = {
-                means_long, stds_long, means_short, stds_short,
-                prior_long: long_samples.length / n,
-                prior_short: short_samples.length / n,
-                trained_at: nowTs, n_samples: n
-              };
-            }
-            
-            // 3. k-NN (just store training data)
-            {
-              const training_data = X.map((feat, i) => ({
-                features: feat,
-                label: y[i] === 1 ? "long" : "short"
-              }));
-              
-              // Keep only last 200 samples for speed
-              state.ml_models.knn = {
-                training_data: training_data.slice(-200),
-                trained_at: nowTs,
-                n_samples: n
-              };
-            }
-            
-            // 4. Perceptron
-            {
-              const lr = 0.05, epochs = 30;
-              const w = Array(X[0].length).fill(0);
-              let bias = 0;
-              
-              for (let epoch = 0; epoch < epochs; epoch++) {
-                for (let i = 0; i < n; i++) {
-                  let z = bias;
-                  for (let j = 0; j < w.length; j++) z += w[j] * X[i][j];
-                  const pred = z > 0 ? 1 : -1;
-                  const target = y_signed[i];
-                  if (pred !== target) {
-                    bias += lr * target;
-                    for (let j = 0; j < w.length; j++) w[j] += lr * target * X[i][j];
-                  }
-                }
-              }
-              
-              state.ml_models.perceptron = { w, bias, trained_at: nowTs, n_samples: n };
-            }
-            
-            // 5. Decision Tree (simplified CART)
-            {
-              const buildTree = (X_subset, y_subset, depth = 0, max_depth = 5) => {
-                if (depth >= max_depth || X_subset.length < 5) {
-                  return { type: 'leaf', value: mean(y_subset.map(v => v === 1 ? 1 : -1)) };
-                }
-                
-                // Find best split (try all features, simple threshold)
-                let best_gain = -Infinity, best_feature = 0, best_threshold = 0;
-                
-                for (let f = 0; f < X_subset[0].length; f++) {
-                  const values = X_subset.map(x => x[f]).sort((a, b) => a - b);
-                  const threshold = values[Math.floor(values.length / 2)];
-                  
-                  const left_y = y_subset.filter((_, i) => X_subset[i][f] < threshold);
-                  const right_y = y_subset.filter((_, i) => X_subset[i][f] >= threshold);
-                  
-                  if (left_y.length === 0 || right_y.length === 0) continue;
-                  
-                  const gain = left_y.length * std(left_y) + right_y.length * std(right_y);
-                  if (gain < best_gain) {
-                    best_gain = gain;
-                    best_feature = f;
-                    best_threshold = threshold;
-                  }
-                }
-                
-                if (best_gain === -Infinity) {
-                  return { type: 'leaf', value: mean(y_subset.map(v => v === 1 ? 1 : -1)) };
-                }
-                
-                const left_X = X_subset.filter((x) => x[best_feature] < best_threshold);
-                const left_y = y_subset.filter((_, i) => X_subset[i][best_feature] < best_threshold);
-                const right_X = X_subset.filter((x) => x[best_feature] >= best_threshold);
-                const right_y = y_subset.filter((_, i) => X_subset[i][best_feature] >= best_threshold);
-                
-                return {
-                  type: 'split',
-                  feature: best_feature,
-                  threshold: best_threshold,
-                  left: buildTree(left_X, left_y, depth + 1, max_depth),
-                  right: buildTree(right_X, right_y, depth + 1, max_depth)
-                };
-              };
-              
-              state.ml_models.decisiontree = {
-                root: buildTree(X, y, 0, 5),
-                trained_at: nowTs,
-                n_samples: n
-              };
-            }
-            
-            // 6-8. Random Forest, Gradient Boosting, XGBoost (use same tree builder, different ensembles)
-            // (Simplified for brevity - you can expand these later)
-            
-            state.ml_models.randomforest = {
-              trees: [
-                state.ml_models.decisiontree, // reuse for now
-                state.ml_models.decisiontree,
-                state.ml_models.decisiontree
-              ],
-              trained_at: nowTs,
-              n_samples: n
-            };
-            
-            state.ml_models.gradientboosting = {
-              trees: [state.ml_models.decisiontree],
-              learning_rate: 0.15,
-              initial_pred: 0,
-              trained_at: nowTs,
-              n_samples: n
-            };
-            
-            state.ml_models.xgboost = {
-              trees: [state.ml_models.decisiontree],
-              learning_rate: 0.1,
-              initial_pred: 0,
-              trained_at: nowTs,
-              n_samples: n
-            };
-            
-            // 9. Neural Net (2-layer)
-            {
-              const hidden_size = 10, lr = 0.01, epochs = 50;
-              const w1 = Array(X[0].length).fill(0).map(() => Array(hidden_size).fill(0).map(() => (Math.random() - 0.5) * 0.2));
-              const b1 = Array(hidden_size).fill(0);
-              const w2 = Array(hidden_size).fill(0).map(() => (Math.random() - 0.5) * 0.2);
-              let b2 = 0;
-              
-              for (let epoch = 0; epoch < epochs; epoch++) {
-                for (let i = 0; i < n; i++) {
-                  // Forward
-                  const hidden = b1.map((bias, h) => {
-                    let sum = bias;
-                    for (let j = 0; j < X[i].length; j++) sum += X[i][j] * w1[j][h];
-                    return Math.max(0, sum); // ReLU
-                  });
-                  
-                  let output = b2;
-                  for (let h = 0; h < hidden_size; h++) output += hidden[h] * w2[h];
-                  
-                  // Backprop (simplified)
-                  const err = y_signed[i] - output;
-                  b2 += lr * err;
-                  for (let h = 0; h < hidden_size; h++) {
-                    w2[h] += lr * err * hidden[h];
-                    if (hidden[h] > 0) { // ReLU derivative
-                      const delta_h = err * w2[h];
-                      b1[h] += lr * delta_h;
-                      for (let j = 0; j < X[i].length; j++) {
-                        w1[j][h] += lr * delta_h * X[i][j];
+
+              log(`🎓 Training 12 ML models with ${n} samples...`);
+              const nowTs = Date.now();
+
+              const X = data.map(d => d.features);
+              const y = data.map(d => d.label); // 0 or 1
+              const y_signed = y.map(v => v === 1 ? 1 : -1); // +1 or -1 for some models
+
+              // 1. Logistic Regression
+              {
+                  const lr = 0.01, epochs = 50;
+                  const w = Array(X[0].length).fill(0);
+                  let bias = 0;
+                  for (let epoch = 0; epoch < epochs; epoch++) {
+                      for (let i = 0; i < n; i++) {
+                          let z = bias;
+                          for (let j = 0; j < w.length; j++) z += w[j] * X[i][j];
+                          const pred = sigmoid(z);
+                          const err = y[i] - pred;
+                          bias += lr * err;
+                          for (let j = 0; j < w.length; j++) w[j] += lr * err * X[i][j];
                       }
-                    }
                   }
-                }
+                  state.ml_models.logistic = { w, bias, trained_at: nowTs, n_samples: n };
               }
-              
-              state.ml_models.neuralnet = { w1, b1, w2, b2, trained_at: nowTs, n_samples: n };
-            }
-            
-            // 10-11. Mean Reversion & Momentum (rule-based, no training)
-            state.ml_models.meanreversion = { trained_at: nowTs, n_samples: n };
-            state.ml_models.momentum = { trained_at: nowTs, n_samples: n };
-            
-            // 12. HMM (simplified 2-state)
-            {
-              const bullish_samples = X.filter((_, i) => y[i] === 1);
-              const bearish_samples = X.filter((_, i) => y[i] === 0);
-              
-              // Transition matrix (simple estimate)
-              const transition = [
-                [0.7, 0.3], // bearish -> [stay bearish, go bullish]
-                [0.3, 0.7]  // bullish -> [go bearish, stay bullish]
-              ];
-              
-              state.ml_models.hmm = {
-                transition,
-                emission: [0.5, 0.5],
-                trained_at: nowTs,
-                n_samples: n
+
+              // 2. Naive Bayes
+              {
+                  const long_samples = X.filter((_, i) => y[i] === 1);
+                  const short_samples = X.filter((_, i) => y[i] === 0);
+                  const means_long = Array(X[0].length).fill(0).map((_, j) => mean(long_samples.map(s => s[j])));
+                  const stds_long = Array(X[0].length).fill(0).map((_, j) => std(long_samples.map(s => s[j])) || 1);
+                  const means_short = Array(X[0].length).fill(0).map((_, j) => mean(short_samples.map(s => s[j])));
+                  const stds_short = Array(X[0].length).fill(0).map((_, j) => std(short_samples.map(s => s[j])) || 1);
+                  state.ml_models.naivebayes = { means_long, stds_long, means_short, stds_short, prior_long: long_samples.length / n, prior_short: short_samples.length / n, trained_at: nowTs, n_samples: n };
+              }
+
+              // 3. k-NN
+              {
+                  const training_data = X.map((feat, i) => ({ features: feat, label: y[i] === 1 ? "long" : "short" }));
+                  state.ml_models.knn = { training_data: training_data.slice(-200), trained_at: nowTs, n_samples: n };
+              }
+
+              // 4. Perceptron
+              {
+                  const lr = 0.05, epochs = 30;
+                  const w = Array(X[0].length).fill(0);
+                  let bias = 0;
+                  for (let epoch = 0; epoch < epochs; epoch++) {
+                      for (let i = 0; i < n; i++) {
+                          let z = bias;
+                          for (let j = 0; j < w.length; j++) z += w[j] * X[i][j];
+                          const pred = z > 0 ? 1 : -1;
+                          const target = y_signed[i];
+                          if (pred !== target) {
+                              bias += lr * target;
+                              for (let j = 0; j < w.length; j++) w[j] += lr * target * X[i][j];
+                          }
+                      }
+                  }
+                  state.ml_models.perceptron = { w, bias, trained_at: nowTs, n_samples: n };
+              }
+
+              // Tree Helper Function
+              const buildTree = (X_subset, y_subset, task_type = 'classification', depth = 0, max_depth = 5, feature_indices = null) => {
+                  if (depth >= max_depth || y_subset.length < 5 || std(y_subset) < 1e-6) {
+                      const leaf_value = (task_type === 'classification') ? mean(y_subset.map(v => v === 1 ? 1 : -1)) : mean(y_subset);
+                      return { type: 'leaf', value: leaf_value || 0 };
+                  }
+
+                  let best_gain = Infinity, best_feature = -1, best_threshold = 0;
+                  const features_to_try = feature_indices || Array.from({length: X_subset[0].length}, (_, i) => i);
+
+                  for (const f of features_to_try) {
+                      const values = [...new Set(X_subset.map(x => x[f]))].sort((a,b)=>a-b);
+                      for(let i=0; i < values.length -1; i++){
+                          const threshold = (values[i] + values[i+1])/2;
+                          const left_indices = X_subset.map((x,idx)=>x[f] < threshold ? idx : -1).filter(idx => idx !== -1);
+                          const right_indices = X_subset.map((x,idx)=>x[f] >= threshold ? idx : -1).filter(idx => idx !== -1);
+
+                          if (left_indices.length < 3 || right_indices.length < 3) continue;
+
+                          const left_y = left_indices.map(i => y_subset[i]);
+                          const right_y = right_indices.map(i => y_subset[i]);
+                          const gain = (left_y.length / y_subset.length) * (std(left_y)**2) + (right_y.length / y_subset.length) * (std(right_y)**2);
+                          
+                          if (gain < best_gain) {
+                              best_gain = gain; best_feature = f; best_threshold = threshold;
+                          }
+                      }
+                  }
+                  
+                  if (best_feature === -1) {
+                      const leaf_value = (task_type === 'classification') ? mean(y_subset.map(v => v === 1 ? 1 : -1)) : mean(y_subset);
+                      return { type: 'leaf', value: leaf_value || 0 };
+                  }
+                  
+                  const left_indices = X_subset.map((x,idx)=>x[best_feature] < best_threshold ? idx : -1).filter(idx => idx !== -1);
+                  const right_indices = X_subset.map((x,idx)=>x[best_feature] >= best_threshold ? idx : -1).filter(idx => idx !== -1);
+                  return {
+                      type: 'split', feature: best_feature, threshold: best_threshold,
+                      left: buildTree(left_indices.map(i => X_subset[i]), left_indices.map(i => y_subset[i]), task_type, depth + 1, max_depth, feature_indices),
+                      right: buildTree(right_indices.map(i => X_subset[i]), right_indices.map(i => y_subset[i]), task_type, depth + 1, max_depth, feature_indices)
+                  };
               };
-            }
-            
-            log(`✅ All 12 models trained successfully`);
+              
+              // 5. Decision Tree
+              state.ml_models.decisiontree = { root: buildTree(X, y, 'classification', 0, 5), trained_at: nowTs, n_samples: n };
+
+              // 6. Random Forest
+              {
+                  const trees = [];
+                  for (let t = 0; t < 3; t++) {
+                      const indices = Array(n).fill(0).map(() => Math.floor(Math.random() * n));
+                      const X_boot = indices.map(i => X[i]);
+                      const y_boot = indices.map(i => y[i]);
+                      trees.push({ root: buildTree(X_boot, y_boot, 'classification', 0, 5) });
+                  }
+                  state.ml_models.randomforest = { trees, trained_at: nowTs, n_samples: n };
+              }
+
+              // 7. Gradient Boosting
+              {
+                  const trees = [];
+                  let predictions = Array(n).fill(0);
+                  const learning_rate = 0.15;
+                  for (let stage = 0; stage < 5; stage++) {
+                      const residuals = y_signed.map((target, i) => target - predictions[i]);
+                      const tree_root = buildTree(X, residuals, 'regression', 0, 3);
+                      trees.push({ root: tree_root });
+                      for (let i = 0; i < n; i++) {
+                          let node = tree_root;
+                          while (node.type === 'split') node = X[i][node.feature] < node.threshold ? node.left : node.right;
+                          predictions[i] += learning_rate * node.value;
+                      }
+                  }
+                  state.ml_models.gradientboosting = { trees, learning_rate, initial_pred: 0, trained_at: nowTs, n_samples: n };
+              }
+
+              // 8. XGBoost-lite
+              {
+                  const trees = [];
+                  let predictions = Array(n).fill(0);
+                  const learning_rate = 0.1;
+                  for (let stage = 0; stage < 7; stage++) {
+                      const feature_indices = Array.from({length: X[0].length}, (_, i) => i).sort(() => 0.5 - Math.random()).slice(0, Math.floor(X[0].length * 0.8));
+                      const gradients = y_signed.map((target, i) => target - predictions[i]);
+                      const tree_root = buildTree(X, gradients, 'regression', 0, 4, feature_indices);
+                      trees.push({ root: tree_root, features: feature_indices });
+                      for (let i = 0; i < n; i++) {
+                          let node = tree_root;
+                          while (node.type === 'split') node = X[i][node.feature] < node.threshold ? node.left : node.right;
+                          predictions[i] += learning_rate * node.value;
+                      }
+                  }
+                  state.ml_models.xgboost = { trees, learning_rate, initial_pred: 0, trained_at: nowTs, n_samples: n };
+              }
+
+              // 9. Neural Net
+              {
+                  const hidden_size = 10, lr = 0.01, epochs = 50;
+                  const w1 = Array(X[0].length).fill(0).map(() => Array(hidden_size).fill(0).map(() => (Math.random() - 0.5) * 0.2));
+                  const b1 = Array(hidden_size).fill(0);
+                  const w2 = Array(hidden_size).fill(0).map(() => (Math.random() - 0.5) * 0.2);
+                  let b2 = 0;
+                  for (let epoch = 0; epoch < epochs; epoch++) {
+                      for (let i = 0; i < n; i++) {
+                          const hidden = b1.map((bias, h) => {
+                              let sum = bias;
+                              for (let j = 0; j < X[i].length; j++) sum += X[i][j] * w1[j][h];
+                              return Math.max(0, sum);
+                          });
+                          let output = b2;
+                          for (let h = 0; h < hidden_size; h++) output += hidden[h] * w2[h];
+                          const err = y_signed[i] - output;
+                          b2 += lr * err;
+                          for (let h = 0; h < hidden_size; h++) {
+                              if (hidden[h] > 0) {
+                                  const delta_h = err * w2[h];
+                                  b1[h] += lr * delta_h;
+                                  for (let j = 0; j < X[i].length; j++) w1[j][h] += lr * delta_h * X[i][j];
+                              }
+                              w2[h] += lr * err * hidden[h];
+                          }
+                      }
+                  }
+                  state.ml_models.neuralnet = { w1, b1, w2, b2, trained_at: nowTs, n_samples: n };
+              }
+
+              // 10-11. Rule-based models
+              state.ml_models.meanreversion = { trained_at: nowTs, n_samples: n };
+              state.ml_models.momentum = { trained_at: nowTs, n_samples: n };
+
+              // 12. HMM
+              {
+                  const transition = [[0.7, 0.3], [0.3, 0.7]];
+                  state.ml_models.hmm = { transition, emission: [0.5, 0.5], trained_at: nowTs, n_samples: n };
+              }
+
+              log(`✅ All 12 models trained successfully`);
           }
 
           async function mlEnsembleVote(symbol, features, originalSide, state) {
@@ -1487,7 +1453,7 @@ jobs:
             const majoritySide = longScore >= shortScore ? 'long' : 'short';
             const confidenceBoost = Math.round(Math.abs(longScore - shortScore) / 10); // scale down
             const totalWeight = longScore + shortScore;
-            const agreement = (Math.max(longScore, shortScore) / totalWeight).toFixed(2);
+            const agreement = totalWeight > 0 ? (Math.max(longScore, shortScore) / totalWeight).toFixed(2) : '0.50';
             
             log(`✅ DECISION: ${majoritySide.toUpperCase()} (${(agreement*100).toFixed(1)}% weighted agreement)`);
             if (majoritySide !== originalSide) {
@@ -1648,7 +1614,7 @@ jobs:
                 const wrong = [];
                 
                 for (const [model, votedSide] of Object.entries(votes)) {
-                  if (!state.model_weights[model]) {
+                  if (state.model_weights[model] == null) {
                     state.model_weights[model] = 10; // initialize if missing
                   }
                   
