@@ -4,6 +4,7 @@ on:
   repository_dispatch:
     types: [run_B]
   workflow_dispatch: {}
+ 
 
 permissions:
   contents: read
@@ -1058,8 +1059,8 @@ jobs:
             
             return score >= 0 ? "long" : "short";
           };
-// 11. Momentum (Rule-based)
-          const predictMomentum = (model, feat) => {
+            // 11. Momentum (Rule-based)
+            const predictMomentum = (model, feat) => {
             // feat indices: [roc1, roc3, atr_bps, rsi, adx, z_vwap, ...]
             const roc1 = feat[0] || 0;
             const roc3 = feat[1] || 0;
@@ -1119,49 +1120,49 @@ jobs:
             log(`🎓 Training 12 ML models with ${n} samples...`);
             const nowTs = Date.now();
             
-// Shared tree builder for all tree-based models
-const buildTree = (X_subset, y_subset, depth = 0, max_depth = 5) => {
-  if (depth >= max_depth || X_subset.length < 5) {
-    return { type: 'leaf', value: mean(y_subset.map(v => v === 1 ? 1 : -1)) };
-  }
+            // Shared tree builder for all tree-based models
+            const buildTree = (X_subset, y_subset, depth = 0, max_depth = 5) => {
+              if (depth >= max_depth || X_subset.length < 5) {
+                return { type: 'leaf', value: mean(y_subset.map(v => v === 1 ? 1 : -1)) };
+              }
   
-  // Find best split (minimize impurity)
-  let best_gain = Infinity, best_feature = 0, best_threshold = 0;
+              // Find best split (minimize impurity)
+              let best_gain = Infinity, best_feature = 0, best_threshold = 0;
   
-  for (let f = 0; f < X_subset[0].length; f++) {
-    const values = X_subset.map(x => x[f]).sort((a, b) => a - b);
-    const threshold = values[Math.floor(values.length / 2)];
+              for (let f = 0; f < X_subset[0].length; f++) {
+                const values = X_subset.map(x => x[f]).sort((a, b) => a - b);
+                const threshold = values[Math.floor(values.length / 2)];
     
-    const left_y = y_subset.filter((_, i) => X_subset[i][f] < threshold);
-    const right_y = y_subset.filter((_, i) => X_subset[i][f] >= threshold);
+                const left_y = y_subset.filter((_, i) => X_subset[i][f] < threshold);
+                const right_y = y_subset.filter((_, i) => X_subset[i][f] >= threshold);
     
-    if (left_y.length === 0 || right_y.length === 0) continue;
+                if (left_y.length === 0 || right_y.length === 0) continue;
     
-    const gain = left_y.length * std(left_y) + right_y.length * std(right_y);
-    if (gain < best_gain) {
-      best_gain = gain;
-      best_feature = f;
-      best_threshold = threshold;
-    }
-  }
+                const gain = left_y.length * std(left_y) + right_y.length * std(right_y);
+                if (gain < best_gain) {
+                  best_gain = gain;
+                  best_feature = f;
+                  best_threshold = threshold;
+                }
+              }
   
-  if (best_gain === Infinity) {
-    return { type: 'leaf', value: mean(y_subset.map(v => v === 1 ? 1 : -1)) };
-  }
+              if (best_gain === Infinity) {
+                return { type: 'leaf', value: mean(y_subset.map(v => v === 1 ? 1 : -1)) };
+              }
   
-  const left_X = X_subset.filter((x) => x[best_feature] < best_threshold);
-  const left_y = y_subset.filter((_, i) => X_subset[i][best_feature] < best_threshold);
-  const right_X = X_subset.filter((x) => x[best_feature] >= best_threshold);
-  const right_y = y_subset.filter((_, i) => X_subset[i][best_feature] >= best_threshold);
+              const left_X = X_subset.filter((x) => x[best_feature] < best_threshold);
+              const left_y = y_subset.filter((_, i) => X_subset[i][best_feature] < best_threshold);
+              const right_X = X_subset.filter((x) => x[best_feature] >= best_threshold);
+              const right_y = y_subset.filter((_, i) => X_subset[i][best_feature] >= best_threshold);
   
-  return {
-    type: 'split',
-    feature: best_feature,
-    threshold: best_threshold,
-    left: buildTree(left_X, left_y, depth + 1, max_depth),
-    right: buildTree(right_X, right_y, depth + 1, max_depth)
-  };
-};
+              return {
+                type: 'split',
+                feature: best_feature,
+                threshold: best_threshold,
+                left: buildTree(left_X, left_y, depth + 1, max_depth),
+                right: buildTree(right_X, right_y, depth + 1, max_depth)
+              };
+            };
             // Prepare X (features) and y (labels: 1 for long/win, 0 for short/loss)
             const X = data.map(d => d.features);
             const y = data.map(d => d.label); // 1 or 0
