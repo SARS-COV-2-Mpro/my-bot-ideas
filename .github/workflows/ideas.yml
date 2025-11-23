@@ -1,7 +1,8 @@
 name: Ideas Pusher (MEXC Ultimate 7.7.7)
 
 on:
- 
+  schedule:
+    - cron: "0 */2 * * *"
   repository_dispatch:
     types: [run_B]
   workflow_dispatch: {}
@@ -1325,27 +1326,6 @@ jobs:
           try{
             const { state, persist } = await loadState();
 
-            // ============================================================
-            // 🔥 WIPE EVERYTHING EVERY 3 RUNS
-            // ============================================================
-            state.run_counter = (state.run_counter || 0) + 1;
-            log(`🔄 Run ${state.run_counter}/3`);
-
-            if (state.run_counter >= 3) {
-              log("🧹 3RD RUN → FULL GIST WIPE");
-              Object.keys(state).forEach(k => delete state[k]);
-              Object.assign(state, {
-                v: "mexc-ultimate-6.4-audit-mtf",
-                run_counter: 0,
-                cooldown: {}, cooldown_side: {}, pending: [], equity: [], closed: [],
-                mr_lockout: {}, sym_stats: {}, sym_stats_real: {}, calibCoeffs: {},
-                lastReconcileTs: 0, calibration_holdout: [],
-                learned_trade_keys: [], calib_symbol_counts: {},
-                calib_last_version: CALIB_VERSION
-              });
-            }
-            // ============================================================
-
             // 📚 Learn from ALL closed trades FIRST
             learnFromGistRealFills(state);
 
@@ -1635,7 +1615,7 @@ jobs:
                   btc_corr: +(+btcCorr||0).toFixed(3),
                   trend5m: p.trend5m
                 });
-              }catch{ return null; } }));
+              }catch(e){ log("heavy refine warn",e?.message||e); }
             }
 
             // Uniqueness adjustment
